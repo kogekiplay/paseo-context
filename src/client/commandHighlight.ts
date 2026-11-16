@@ -1,6 +1,6 @@
 import { commandTool } from '../shared/commands'
 import { makeRetentionCache, registerRetentionCleanup } from './retention'
-import type { CodeHighlighter, HighlightSpan } from '@deepseek-ai/dsh-client-ui-primitives'
+import type { CodeHighlighter, HighlightSpan } from '../../web/vendor/ui/index.js'
 
 type ShellGrammar = 'bash' | 'powershell'
 

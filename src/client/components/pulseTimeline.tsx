@@ -3,7 +3,7 @@ import {
   IconChecklistOutlineRegular,
   IconRightUpOutlineRegular,
   IconWorkspaceTreeOutlineRegular,
-} from '@deepseek-ai/dsh-client-ui-primitives'
+} from '../../../web/vendor/ui/index.js'
 import {
   fromPartyOf,
   previewOf,

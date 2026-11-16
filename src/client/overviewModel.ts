@@ -1,4 +1,4 @@
-import { workspaceTitleOf } from '@deepseek-ai/dsh-util-workspace-path'
+import { workspaceTitleOf } from '../../web/vendor/workspace-path/index.js'
 import { seatOf } from './seats'
 import { asRecord } from './wire'
 
@@ -6,7 +6,7 @@ type SnapshotSeat = (selector: (snapshot: unknown) => unknown) => unknown
 
 const NO_SNAPSHOT: SnapshotSeat = () => null
 
-const CURRENT_SESSION_KEY = 'dsh.sessions.current'
+const CURRENT_SESSION_KEY = 'paseo-context.sessions.current'
 
 export interface CurrentSession {
   id: string

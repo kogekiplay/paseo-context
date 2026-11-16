@@ -1,10 +1,10 @@
 import type { ReactElement } from 'react'
-import * as primitives from '@deepseek-ai/dsh-client-ui-primitives'
-import type { IconProps } from '@deepseek-ai/dsh-client-ui-primitives'
+import { IconBranchOutlineRegular, IconPlusOutlineRegular, IconCheckOutlineRegular, IconCopyOutlineRegular, IconCloseOutlineRegular, IconSettingsOutlineMedium, IconChevronDownOutlineMedium, IconChevronUpOutlineMedium, IconSearchOutlineRegular, IconShareOutlineRegular, IconDataOutlineRegular, IconDatabaseOutlineRegular, IconClockOutlineRegular, IconGaugeOutlineRegular, IconCompareSplitOutlineRegular, IconBrowseOutlineRegular, IconContextInjectionOutlineRegular, IconFolderOpenOutlineRegular, IconApiOutlineRegular, IconInspectOutlineRegular, IconPluginPinwheelOutlineRegular, IconSkillOutlineRegular, FileTypeIcon } from '../../web/vendor/ui/index.js'
+import type { IconProps } from '../../web/vendor/ui/index.js'
 
 export type IconComponent = (props: IconProps) => ReactElement | null
 
-const ns = primitives as unknown as Record<string, unknown>
+const ns = { IconBranchOutlineRegular, IconPlusOutlineRegular, IconCheckOutlineRegular, IconCopyOutlineRegular, IconCloseOutlineRegular, IconSettingsOutlineMedium, IconChevronDownOutlineMedium, IconChevronUpOutlineMedium, IconSearchOutlineRegular, IconShareOutlineRegular, IconDataOutlineRegular, IconDatabaseOutlineRegular, IconClockOutlineRegular, IconGaugeOutlineRegular, IconCompareSplitOutlineRegular, IconBrowseOutlineRegular, IconContextInjectionOutlineRegular, IconFolderOpenOutlineRegular, IconApiOutlineRegular, IconInspectOutlineRegular, IconPluginPinwheelOutlineRegular, IconSkillOutlineRegular, FileTypeIcon } as unknown as Record<string, unknown>
 
 function exportOf(name: string, source: Record<string, unknown>): unknown {
   try {

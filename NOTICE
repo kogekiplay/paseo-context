@@ -1,0 +1,12 @@
+Paseo Context
+Copyright 2026 kogekiplay
+
+Derived from dsh-context by bowenliang123, licensed under Apache License 2.0.
+https://github.com/bowenliang123/dsh-context
+
+This fork replaces the original host integration with Paseo plugin contributions.
+It reuses the upstream user interface, styles, context analysis algorithms and translations.
+Modified host seams and new Paseo adapters are maintained by kogekiplay.
+
+The bundled UI primitives and theme are derived from DeepSeek's MIT-licensed packages.
+Their license is preserved in web/vendor/LICENSE and THIRD_PARTY_NOTICES.md.

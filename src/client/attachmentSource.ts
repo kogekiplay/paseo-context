@@ -40,6 +40,10 @@ export function makeAttachmentOpener(
   const openPreview = openResourceVia(ctx)
   if (locate === undefined || openPreview === undefined) return undefined
   return async (attachment: AttachmentRef) => {
+    if (attachment.kind === 'image' && attachment.attachmentId.startsWith('paseo-context-image:')) {
+      const face = ctx.get('uiConversation') as { openImage?: (sessionId: string, attachment: AttachmentRef) => Promise<boolean> } | undefined
+      if (face?.openImage !== undefined) return face.openImage(sessionId!, attachment)
+    }
     const path = await locate(attachment)
     if (path === null) return false
     const address = previewAddressOf(path, 'text', false, sessionId, workspace)

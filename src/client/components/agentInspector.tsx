@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactElement } from 'react'
-import { StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
+import { StateDot } from '../../../web/vendor/ui/index.js'
 import type { AgentNode } from '../agentTree'
 import { fmtDurationCompact, modelLabelOf } from '../agentTree'
 import { type CommsRow } from '../fleetDetail'

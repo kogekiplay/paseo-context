@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactElement } from 'react'
-import { useDismissOnOutsidePointer } from '@deepseek-ai/dsh-client-ui-primitives'
+import { useDismissOnOutsidePointer } from '../../../web/vendor/ui/index.js'
 import { IconCheck, IconChevronDown } from '../primitives'
 import type { StepPickOption } from './browserHelpers'
 import { ClearableInput } from './clearableInput'

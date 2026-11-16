@@ -4,7 +4,7 @@ import {
   IconPanelLeftOutlineRegular,
   IconRightUpOutlineRegular,
   StateDot,
-} from '@deepseek-ai/dsh-client-ui-primitives'
+} from '../../../web/vendor/ui/index.js'
 import type { AgentForest } from '../agentTree'
 import {
   fromPartyOf,

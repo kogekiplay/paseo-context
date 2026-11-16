@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactElement, type RefObject } from 'react'
-import { JsonTree, MarkdownText, writeClipboard } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { JsonTreeLabels } from '@deepseek-ai/dsh-client-ui-primitives'
+import { JsonTree, MarkdownText, writeClipboard } from '../../../web/vendor/ui/index.js'
+import type { JsonTreeLabels } from '../../../web/vendor/ui/index.js'
 import { IconCheck, IconChevronDown, IconChevronUp, IconClose, IconCopy, IconSearch } from '../primitives'
 import type { ViewKit } from '../viewkit'
 import { ClearableInput, isBareEscape } from './clearableInput'
@@ -45,7 +45,7 @@ export interface RichFind {
   button: ReactElement
   bar: ReactElement | null
   bodyKey: string
-  bodyRef: RefObject<HTMLDivElement>
+  bodyRef: RefObject<HTMLDivElement | null>
 }
 
 const FIND_DEBOUNCE_MS = 150

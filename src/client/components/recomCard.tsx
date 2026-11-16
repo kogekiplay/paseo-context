@@ -4,6 +4,7 @@ import { RECOM_ROUTE } from '../apiRoutes'
 import { IconShare } from '../primitives'
 import type { ClientCtx, LocaleService } from '../services'
 import type { ViewKit } from '../viewkit'
+import { postRoute } from '../route'
 
 const UNCACHED_STATE: RecomRead = { recom: DEFAULT_RECOM, degraded: false }
 
@@ -35,15 +36,8 @@ function nextCachedState(): RecomRead | null {
 
 async function requestRecoms(): Promise<RecomsRead | null> {
   try {
-    const response = await fetch(RECOM_ROUTE, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: '{}',
-    })
-    if (!response.ok) return null
-    const payload = await response.json() as { value?: unknown; degraded?: unknown } | null
-    const recoms = recomsOfPayload(payload?.value)
-    return recoms.length === 0 ? null : { recoms, degraded: payload?.degraded === true }
+    const recoms = await postRoute(RECOM_ROUTE, {}, recomsOfPayload)
+    return recoms === null || recoms.length === 0 ? null : { recoms, degraded: false }
   } catch {
     return null
   }

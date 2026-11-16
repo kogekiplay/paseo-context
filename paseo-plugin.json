@@ -1,0 +1,26 @@
+{
+  "id": "paseo-context",
+  "name": "Paseo Context",
+  "description": "Context composition, request history, usage insights and agent fleets.",
+  "translations": {
+    "zh-CN": {
+      "name": "上下文洞察",
+      "description": "上下文组成、逐请求浏览、用量分析与 Agent 网络。"
+    }
+  },
+  "requirements": {
+    "paseo": ">=0.15.4"
+  },
+  "build": [
+    [
+      "npm",
+      "ci",
+      "--ignore-scripts"
+    ],
+    [
+      "npm",
+      "run",
+      "build"
+    ]
+  ]
+}

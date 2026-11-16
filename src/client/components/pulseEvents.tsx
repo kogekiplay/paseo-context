@@ -3,7 +3,7 @@ import {
   IconPanelLeftOutlineRegular,
   IconRightUpOutlineRegular,
   IconSendOutlineRegular,
-} from '@deepseek-ai/dsh-client-ui-primitives'
+} from '../../../web/vendor/ui/index.js'
 import { previewOf, type CommsAgent, type CommsKindFilter } from '../commsModel'
 import type { CommsRow, FleetDelegationRow } from '../fleetDetail'
 import { agentPromptOf, type FleetDetailState } from '../fleetModel'

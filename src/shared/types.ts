@@ -1,22 +1,3 @@
-import type { ActivityState } from '../host/activity'
-import type { HeadersState } from '../host/headers'
-import type { TimelineState } from '../host/foldState'
-import type {} from '@deepseek-ai/dsh-session-projection'
-import type {} from '@deepseek-ai/dsh-session-projection/types'
-
-declare module '@deepseek-ai/dsh-session-projection/types' {
-  interface SessionProjectionMap {
-    contextTimeline: ContextTimeline
-    contextHeaders: ContextHeaders
-    contextActivity: ContextActivity
-  }
-  interface SessionProjectionStateMap {
-    contextTimeline: TimelineState
-    contextHeaders: HeadersState
-    contextActivity: ActivityState
-  }
-}
-
 export type Category = 'user' | 'inject' | 'skill' | 'assistant' | 'tool'
 
 export interface SystemPromptNode {

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactElement, type ReactNode } from 'react'
-import { Menu } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Menu } from '../../../web/vendor/ui/index.js'
 import { IconChevronDown } from '../primitives'
 import { seatKeyOf, seatOf } from '../services'
 import { ClearButton, clearOnEscape } from './clearableInput'

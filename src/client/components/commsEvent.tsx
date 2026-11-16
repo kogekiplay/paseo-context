@@ -1,6 +1,6 @@
 import { type ReactElement, type ReactNode } from 'react'
-import { StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
-import { IconPanelLeftOutlineRegular, IconRightUpOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
+import { StateDot } from '../../../web/vendor/ui/index.js'
+import { IconPanelLeftOutlineRegular, IconRightUpOutlineRegular } from '../../../web/vendor/ui/index.js'
 import { fromPartyOf, previewOf, settledToneOf, type CommsAgent } from '../commsModel'
 import { settledVariantOf, type CommsRow, type FleetDelegationRow } from '../fleetDetail'
 import { fmtDateTime, fmtTime } from '../format'

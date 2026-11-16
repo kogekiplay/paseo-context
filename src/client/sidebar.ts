@@ -2,9 +2,9 @@ import { ContextIcon, makeContextTabTitle } from './icon'
 import type { ClientCtx, ContextViewProps, SidebarTabsFace } from './services'
 import type { Translate } from './i18n'
 
-export const SIDEBAR_CONTEXT_ID = 'dsh-context'
+export const SIDEBAR_CONTEXT_ID = 'paseo-context'
 
-export const SIDEBAR_CONTEXT_KIND = 'dsh-context'
+export const SIDEBAR_CONTEXT_KIND = 'paseo-context'
 
 const GUIDE_ORDER = 20
 

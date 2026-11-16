@@ -1,6 +1,6 @@
 import { memo, Fragment, useCallback, useEffect, useId, useMemo, useRef, useState, type ComponentType, type ReactElement, type ReactNode } from 'react'
-import { useCodeHighlighter } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { HighlightSpan } from '@deepseek-ai/dsh-client-ui-primitives'
+import { useCodeHighlighter } from '../../../web/vendor/ui/index.js'
+import type { HighlightSpan } from '../../../web/vendor/ui/index.js'
 import { attentionOf, byLatest, bySlowest, durationOf, matchesFilter, matchesQuery, previewTextOf, programsOf, resultTextOf, surfaceSeqOf, tallyOfCommands, viewsOf } from '../commands'
 import type { Command, CommandFilter, CommandSort, CommandView } from '../commands'
 import { grammarOfTool, highlightRuns } from '../commandHighlight'

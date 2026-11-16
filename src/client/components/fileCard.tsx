@@ -1,4 +1,4 @@
-import { pathPartsOf } from '@deepseek-ai/dsh-util-workspace-path'
+import { pathPartsOf } from '../../../web/vendor/workspace-path/index.js'
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, type ComponentType, type ReactElement } from 'react'
 import { absPathOf, baseNameOf, displayPathOf, displayStyleOf, glyphOf, mergeByDisplay, surfaceSeqOf, totalsOf } from '../fileActivity'
 import type { FileActivity, FileEntry, FileOp, FileOpKind } from '../fileActivity'

@@ -403,7 +403,7 @@ export function useOverviewSummary(scope: OverviewScope | null, enabled: boolean
     const delay = Math.min(BACKFILL_RETRY_MS * 2 ** attempts.current, BACKFILL_RETRY_MAX_MS)
     attempts.current += 1
     const timer = setTimeout(() => {
-      void fetch(BACKFILL_ROUTE, { method: 'POST' }).catch(() => {})
+      void postRoute(BACKFILL_ROUTE, {}, (value) => value).catch(() => {})
     }, delay)
     return () => { clearTimeout(timer) }
   }, [enabled, coverageKey, fold])

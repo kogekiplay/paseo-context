@@ -10,7 +10,7 @@ export interface ClearableInputProps {
   clearLabel: string
   type?: 'search' | 'text'
   onKeyDown?: (ev: KeyboardEvent<HTMLInputElement>) => void
-  inputRef?: RefObject<HTMLInputElement>
+  inputRef?: RefObject<HTMLInputElement | null>
   combobox?: { controls: string; active?: string | undefined }
 }
 

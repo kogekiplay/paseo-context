@@ -1,7 +1,7 @@
 import type { FileOpRecord, RequestRecord, SurfaceNode } from '../shared/types'
 import { isImageFileOp, opsOfCall, parseCallArgs } from '../shared/fileOps'
 import { leafNameOf } from '../shared/attachment'
-import { fileAddressFor, isAbsoluteWorkspacePath, resolveWorkspacePath } from '@deepseek-ai/dsh-util-workspace-path'
+import { fileAddressFor, isAbsoluteWorkspacePath, resolveWorkspacePath } from '../../web/vendor/workspace-path/index.js'
 import type { ConversationNodeLike } from './services'
 
 export type FileOp = FileOpRecord

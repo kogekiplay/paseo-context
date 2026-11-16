@@ -1,5 +1,5 @@
 import { useSyncExternalStore, type ReactElement } from 'react'
-import { Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Tooltip } from '../../../web/vendor/ui/index.js'
 import type { ClientCtx, ConversationNodeLike, UseChatLike } from '../services'
 import { conversationNodesOf, seatKeyOf } from '../services'
 import { activateViewTab, openContextSidebar, requestContextFocus } from '../viewFocus'

@@ -5,7 +5,7 @@ import type { ContextSettings } from './settings'
 import type { ClientCtx } from './services'
 import { watchGate } from './toggleGate'
 
-export const INSIGHT_PANEL_ID = 'dsh-context'
+export const INSIGHT_PANEL_ID = 'paseo-context'
 
 export const INSIGHT_PANEL_ORDER = 20
 

@@ -1,6 +1,7 @@
 import { Component, useRef, type ComponentType, type ReactNode } from 'react'
 import type { Translate } from '../i18n'
 import { useConversationSurface } from './useConversationSurface'
+import { call } from '../../../web/bridge'
 
 export function makeErrorBoundary(t: Translate): ComponentType<{ children?: ReactNode }> {
   function ErrorCard(props: { error: Error; retry: () => void }): ReactNode {
@@ -29,6 +30,11 @@ export function makeErrorBoundary(t: Translate): ComponentType<{ children?: Reac
 
     static getDerivedStateFromError(error: unknown): { error: Error | null } {
       return { error: error instanceof Error ? error : new Error(String(error)) }
+    }
+
+    componentDidCatch(error: Error): void {
+      console.error(error.stack ?? error.message)
+      void call('ui.error', { message: error.stack ?? error.message }).catch(() => {})
     }
 
     render(): ReactNode {

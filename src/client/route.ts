@@ -1,5 +1,6 @@
 import { PLUGIN_NAME } from './meta'
 import { asRecord } from './wire'
+import { call } from '../../web/bridge'
 
 export class RouteError extends Error {
   constructor(message: string, readonly status?: number) {
@@ -23,19 +24,7 @@ export interface RouteEnvelope<T> {
 
 async function readEnvelope(route: string, body: unknown, options: RouteOptions): Promise<Record<string, unknown>> {
   const label = options.label ?? route
-  const response = await fetch(route, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-    ...(options.signal === undefined ? {} : { signal: options.signal }),
-  })
-  if (!response.ok) throw new RouteError(`${PLUGIN_NAME}: ${label} route HTTP ${response.status}`, response.status)
-  let parsed: unknown
-  try {
-    parsed = await response.json()
-  } catch {
-    throw new RouteError(`${PLUGIN_NAME}: ${label} read failed`)
-  }
+  const parsed = await call(route, body, options)
   const envelope = asRecord(parsed)
   if (envelope === null || envelope.ok !== true) throw new RouteError(`${PLUGIN_NAME}: ${label} read failed`)
   return envelope
