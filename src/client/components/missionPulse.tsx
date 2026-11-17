@@ -244,6 +244,8 @@ const PulseTasks = memo(function PulseTasks(props: PulseTasksProps): ReactElemen
     in_progress: 0,
     pending: 0,
     completed: 0,
+    failed: 0,
+    canceled: 0,
   }
   for (const item of props.visibleItems) counts[pulseWorkPhaseOf(item)] += 1
   useEffect(() => {

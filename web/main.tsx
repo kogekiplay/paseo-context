@@ -18,6 +18,7 @@ import type { ClientCtx } from "../src/client/services";
 import { action, call, send } from "./bridge";
 import { makeStatisticsView } from "./statistics";
 import { reportedUsageOf } from "../shared/usage";
+import { hostMessage } from "./host-messages";
 import "../web/vendor/theme/theme.css";
 import "../.tmp/web/tailwind.css";
 import "../src/client/styles/base.css";
@@ -58,7 +59,7 @@ const subscribe = (listener: () => void) => { listeners.add(listener); return ()
 const publish = (next: Partial<State>) => { state = { ...state, ...next }; for (const listener of listeners) listener(); };
 const t = (key: string, params: Record<string, string | number> = {}) => {
   const dict = DICTS[state.locale.split("-")[0] as keyof typeof DICTS] ?? DICTS.en;
-  let value = (dict as Record<string, string>)[key] ?? (DICTS.en as Record<string, string>)[key] ?? key;
+  let value = hostMessage(state.locale, key) ?? (dict as Record<string, string>)[key] ?? (DICTS.en as Record<string, string>)[key] ?? key;
   for (const [name, content] of Object.entries(params)) value = value.replaceAll(`{${name}}`, String(content));
   return value;
 };
@@ -139,7 +140,7 @@ function App() {
   if (s.mode === "settings") return <div className="pc-settings"><Config useContextSettings={(selector) => useSyncExternalStore(settings.store.subscribe, () => selector(settings.store.getSnapshot()))} set={(field, value) => settings.set(field, value)} /></div>;
   if (!s.current) return <div className="pc-status">{t("trend.empty")}</div>;
   const props = { sessionId: s.current, useProjection };
-  if (s.mode === "statistics") return <Statistics key={s.current} {...props} locale={s.locale} notices={s.selected?.notices ?? []} />;
+  if (s.mode === "statistics") return <Statistics key={s.current} {...props} locale={s.locale} snapshot={s.selected?.statistics ?? null} />;
   if (s.mode === "modal") return <ContextModal {...props} useContextModal={(selector) => useSyncExternalStore(modalStoreOf(s.current).subscribe, () => selector(modalStoreOf(s.current).getSnapshot()))} />;
   return s.mode === "fleet" ? <FleetView {...props} /> : <ContextView {...props} />;
 }
@@ -158,9 +159,9 @@ function ImagePreview() {
   </div>;
 }
 async function refresh() {
-  const current = state.current;
-  const result = await call("bootstrap", { agentId: current });
-  if (stopped || current !== state.current) return;
+  const current = state.current, mode = state.mode;
+  const result = await call("bootstrap", { agentId: current, mode });
+  if (stopped || current !== state.current || mode !== state.mode) return;
   const byId = { ...state.byId, ...Object.fromEntries(result.sessions.map((row: any) => [row.id, row])) };
   const selected = result.selected;
   if (selected && state.current) {

@@ -218,6 +218,13 @@ export function pulseLaneVisibility(
 }
 
 export function pulseTaskBadgeOf(id: string): string {
+  // Paseo identities include their owning agent; keep that namespace in keys
+  // and tooltips, while using the original compact badge in the table.
+  const local = id.split(/:(?:subtask|task):/).at(-1) ?? id
+  if (local !== id) {
+    const label = local.replace(/^(?:task-|call_)/, '')
+    return label.length > 12 ? `${label.slice(0, 6)}…${label.slice(-4)}` : label
+  }
   return /^task-\d+$/.test(id) ? id.slice(5) : id
 }
 
@@ -264,7 +271,7 @@ export interface PulseWorkItem {
   id: string
   kind: 'team' | 'agent'
   subject: string
-  status: 'pending' | 'in_progress' | 'completed' | 'idle' | 'latest_complete'
+  status: 'pending' | 'in_progress' | 'completed' | 'idle' | 'latest_complete' | 'failed' | 'canceled'
   ownerId?: string
   ownerName?: string
   ownerState?: PulseWorkAgentState
@@ -329,7 +336,7 @@ export function pulseWorkItemsOf(forest: AgentForest | null, team: FleetTeam | n
       ready: false,
     }
   })
-  const order: Record<PulseWorkItem['status'], number> = { in_progress: 0, pending: 1, idle: 2, latest_complete: 3, completed: 4 }
+  const order: Record<PulseWorkItem['status'], number> = { in_progress: 0, pending: 1, failed: 2, canceled: 3, idle: 4, latest_complete: 5, completed: 6 }
   return [...teamRows, ...agentRows].sort((a, b) => order[a.status] - order[b.status])
 }
 
@@ -360,7 +367,7 @@ export function pulseWorkGroupsOf(items: readonly PulseWorkItem[]): PulseWorkGro
   return [...groups.values()]
 }
 
-export type PulseWorkPhase = 'pending' | 'in_progress' | 'completed'
+export type PulseWorkPhase = 'pending' | 'in_progress' | 'completed' | 'failed' | 'canceled'
 
 export function pulseWorkPhaseOf(item: PulseWorkItem): PulseWorkPhase {
   if (item.kind === 'team') return item.status as PulseWorkPhase

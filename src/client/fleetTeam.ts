@@ -15,7 +15,7 @@ export interface FleetTeamTask {
   id: string
   subject: string
   description: string
-  status: 'pending' | 'in_progress' | 'completed'
+  status: 'pending' | 'in_progress' | 'completed' | 'failed' | 'canceled'
   ownerId?: string
   ownerName?: string
   blockedBy: string[]
@@ -56,7 +56,7 @@ function taskOf(value: unknown): FleetTeamTask | null {
   if (rec === null) return null
   if (typeof rec.id !== 'string' || rec.id === '') return null
   if (typeof rec.subject !== 'string' || rec.subject === '') return null
-  if (rec.status !== 'pending' && rec.status !== 'in_progress' && rec.status !== 'completed') return null
+  if (rec.status !== 'pending' && rec.status !== 'in_progress' && rec.status !== 'completed' && rec.status !== 'failed' && rec.status !== 'canceled') return null
   return {
     id: rec.id,
     subject: rec.subject,

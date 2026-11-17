@@ -1,66 +1,109 @@
 import { act, create } from "react-test-renderer";
 import { createElement } from "react";
 import { afterEach, expect, test, vi } from "vitest";
-import { fmt, fmtDuration, fmtShare } from "../src/client/format";
+import { aggregateTurn } from "../shared/core/stats-aggregate";
+import type { StatsSnapshot, StatsStepMetrics } from "../shared/core/stats-contract";
 import type { ViewKit } from "../src/client/viewkit";
 
-const mocks = vi.hoisted(() => ({ session: { data: null, usage: null, breakdown: null } as any }));
-vi.mock("../src/client/sessionData", () => ({ useContextSession: () => mocks.session }));
-vi.mock("../src/client/components/statsTiming", () => ({ makeStatsTiming: () => () => null }));
+vi.mock("../web/vendor/ui/index.js", () => ({
+  HoverCard: ({ anchor }: any) => anchor, ImageLightbox: () => null,
+  MarkdownText: ({ text }: any) => text,
+  SegmentedControl: "SegmentedControl", Switch: "Switch",
+}));
+vi.mock("../web/bridge", () => ({ call: vi.fn(async () => null) }));
 import { makeStatisticsView } from "../web/statistics";
+import { call } from "../web/bridge";
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-const Statistics = makeStatisticsView({ t: (key: string) => key, fmt, fmtDuration, fmtShare, catLabel: (key: string) => key } as ViewKit);
+const Statistics = makeStatisticsView({} as ViewKit);
 let renderer: ReturnType<typeof create> | null = null;
 afterEach(async () => {
   if (renderer) await act(async () => renderer!.unmount());
-  renderer = null; mocks.session = { data: null, usage: null, breakdown: null };
+  renderer = null;
 });
-async function mount() {
+function fixture(total: number, usage: number | null = null): StatsSnapshot {
+  const steps: StatsStepMetrics[] = Array.from({ length: total }, (_, index) => ({
+    turn: 1, step: index + 1, startTime: 1000 + index * 2000, endTime: 2000 + index * 2000,
+    context: usage, output: usage, cacheRead: usage, cacheWrite: usage, cacheHit: null,
+    ttft: null, decode: null, tps: null, model: 1000,
+    tool: 0, toolWall: null, toolPending: 0, tools: [], calls: [], toolOutput: null,
+    retries: 0, toolErrors: 0, answer: "Fixture answer", answerBody: "Fixture answer", answerTruncated: false,
+    wall: 1000, running: false, interrupted: false, aborted: false,
+  }));
+  return { turns: total ? [{ ...aggregateTurn(1, steps), prompt: "Fixture prompt", promptSource: "user" }] : [], stepCount: total };
+}
+async function mount(snapshot: StatsSnapshot) {
   await act(async () => { renderer = create(createElement(Statistics,
-    { sessionId: "agent-a", locale: "zh-CN", notices: ["Only captured provider fields are available."] })); });
+    { sessionId: "agent-a", locale: "zh-CN", snapshot })); });
   return renderer!.root;
 }
-function fixture(total = 0) {
-  mocks.session.data = { provider: "codex", model: "test",
-    current: { system: 0, tools: 0, user: 0, inject: 0, skill: 0, assistant: 0, tool: 0, total: 0 }, counts: { turns: 2, steps: total },
-    requests: Array.from({ length: total }, (_, seq) => ({ seq, turn: 2, step: seq + 1, prompt: seq, output: seq, cacheRead: seq, activeMs: seq * 1000 })) };
-}
-test("request statistics page through the complete history without omitting the final partial page", async () => {
-  fixture(103); const root = await mount(), seen: number[] = [];
-  for (let page = 0; page < 3; page++) {
-    const rows = root.findByType("tbody").findAllByType("tr");
-    seen.push(...rows.map((row) => Number(row.findAllByType("td")[1].children.join(""))));
-    if (page < 2) await act(async () => root.findAllByType("button")[1].props.onClick());
-    else expect(root.findAllByType("button")[1].props.disabled).toBe(true);
-  }
-  expect(seen).toEqual(Array.from({ length: 103 }, (_, index) => 102 - index));
-  expect(new Set(seen).size).toBe(103);
+const textOf = (node: any): string => typeof node === "string" ? node : node.children.map(textOf).join("");
+test("uses the original eleven-column table and all original footer controls", async () => {
+  const root = await mount(fixture(3));
+  expect(root.findByType("thead").findAllByType("th").map((cell) => cell.children.join(""))).toEqual([
+    "轮次 / 步骤", "触发", "执行内容", "上下文", "输出", "缓存命中", "首 token", "模型用时", "输出速度", "工具用时", "总用时",
+  ]);
+  expect(root.findAllByType("Switch" as any).map((control) => control.props.label)).toEqual(["显示合计行", "显示事件行（含压缩）", "显示上下文增量"]);
+  expect(root.findByType("SegmentedControl" as any).props.options.map((option: any) => option.value)).toEqual(["latest", "cumulative"]);
+  expect(JSON.stringify(renderer!.toJSON())).toContain("Fixture prompt");
 });
-test("missing provider usage, request fields and prices stay unavailable rather than becoming zero", async () => {
-  fixture();
-  mocks.session.data.requests = [{ seq: 1, turn: 1, step: 1 }];
-  const root = await mount();
-  expect(root.findByType("tbody").findAllByType("td").slice(1).map((cell) => cell.children.join(""))).toEqual(["—", "—", "—", "—"]);
-  expect(root.findAllByType("strong").slice(2).map((cell) => cell.children.join(""))).toEqual(["—", "—"]);
-  const notes = root.findAllByType("p").map((node) => node.children.join(""));
-  expect(notes.some((note) => note.includes("组成、价格和可观测耗时为估算"))).toBe(true);
-  expect(notes).toContain("Only captured provider fields are available.");
-  expect(JSON.stringify(renderer!.toJSON())).not.toContain("≈0");
-  expect(root.findAllByType("svg")).toHaveLength(0);
+test("the original show-all action exposes every captured step without losing a partial page", async () => {
+  const root = await mount(fixture(103));
+  const showAll = root.findAllByType("button").find((button) => button.children.some((child) => typeof child === "string" && child.includes("103")))!;
+  expect(showAll).toBeDefined();
+  await act(async () => showAll.props.onClick());
+  const stepButtons = root.findAllByType("button").filter((button) => /^展开或折叠第 \d+ 步/.test(button.props["aria-label"] ?? ""));
+  expect(stepButtons).toHaveLength(103);
 });
-test("a genuine provider zero report still renders the original token chart", async () => {
-  fixture();
-  mocks.session.usage = { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0 };
-  const root = await mount();
-  expect(root.findAllByType("svg").length).toBeGreaterThan(0);
-  expect(root.findAllByType("strong")[2].children.join("")).toBe("0");
+test("missing provider fields stay unavailable while a real zero remains visible", async () => {
+  const root = await mount(fixture(1));
+  const cells = root.findByType("tbody").findAllByType("tr").at(-1)!.findAllByType("td");
+  expect(textOf(cells[3])).toBe("—");
+  expect(textOf(cells[4])).toBe("—");
+  expect(cells.at(-1)!.props.title).toContain("首 token —");
+  expect(cells.at(-1)!.props.title).toContain("生成 —");
+  await act(async () => renderer!.update(createElement(Statistics, { sessionId: "agent-a", locale: "zh-CN", snapshot: fixture(1, 0) })));
+  expect(textOf(root.findByType("tbody").findAllByType("tr").at(-1)!.findAllByType("td")[3])).toBe("0.00K");
 });
-test("an empty history keeps one disabled page and a genuine zero price is displayed", async () => {
-  fixture();
-  mocks.session.data.costRead = { ready: true, usd: 0 };
-  const root = await mount();
-  expect(root.findByType("tbody").findAllByType("tr")).toHaveLength(0);
-  expect(root.findAllByType("button").every((button) => button.props.disabled)).toBe(true);
-  expect(root.findAllByType("strong").at(-1)!.children.join("")).toBe("$0.0000");
+test("empty sessions use the original empty state and disable expand-all", async () => {
+  const root = await mount(fixture(0));
+  expect(root.findAllByType("table")).toHaveLength(0);
+  expect(root.findAllByType("button").at(-1)!.props.disabled).toBe(true);
+});
+test("cache tooltip preserves an unreported write bucket at step and turn level", async () => {
+  const source = fixture(1, 100);
+  const steps = source.turns[0].steps.map((step) => ({ ...step, cacheRead: 10, cacheWrite: null, cacheHit: 0.1 }));
+  const root = await mount({ turns: [aggregateTurn(1, steps)], stepCount: 1 });
+  const tooltips = root.findAllByType("td").map((cell) => cell.props.title).filter((title): title is string => typeof title === "string" && title.includes("缓存读"));
+  expect(tooltips.length).toBeGreaterThan(0);
+  expect(tooltips.every((title) => title.includes("缓存写 —"))).toBe(true);
+});
+test("expanded details refresh on content revision changes and ignore an old late response", async () => {
+  const snapshot = (revision: string): StatsSnapshot => {
+    const source = fixture(1);
+    const steps = source.turns[0].steps.map((step) => ({
+      ...step, sourceId: "step:one", contentRevision: revision, detailsState: "unloaded" as const,
+    }));
+    return { turns: [{ ...source.turns[0], steps }], stepCount: 1 };
+  };
+  const requests: Array<{ resolve: (value: unknown) => void; signal: AbortSignal }> = [];
+  vi.mocked(call).mockImplementation((_route, _input, options) => new Promise((resolve) => requests.push({ resolve, signal: options!.signal! })));
+  const root = await mount(snapshot("a"));
+  const target = { closest: () => ({ getAttribute: () => "step:one" }) };
+  await act(async () => root.findByProps({ className: "pc-statistics" }).props.onClickCapture({ target }));
+  expect(requests).toHaveLength(1);
+  await act(async () => renderer!.update(createElement(Statistics, { sessionId: "agent-a", locale: "zh-CN", snapshot: snapshot("b") })));
+  expect(requests).toHaveLength(2);
+  expect(requests[0].signal.aborted).toBe(true);
+  await act(async () => requests[1].resolve({ requestId: "step:one", contentRevision: "b", calls: [], answerBody: "current body", answerTruncated: false }));
+  await act(async () => requests[0].resolve({ requestId: "step:one", contentRevision: "a", calls: [], answerBody: "stale body", answerTruncated: false }));
+  const expand = root.findAllByType("button").find((button) => button.props["aria-label"] === "展开或折叠第 1 步的工具详情")!;
+  await act(async () => expand.props.onClick({ stopPropagation() {} }));
+  expect(JSON.stringify(renderer!.toJSON())).toContain("current body");
+  expect(JSON.stringify(renderer!.toJSON())).not.toContain("stale body");
+  await act(async () => renderer!.update(createElement(Statistics, { sessionId: "agent-a", locale: "zh-CN", snapshot: snapshot("c") })));
+  expect(requests).toHaveLength(3);
+  await act(async () => renderer!.unmount());
+  renderer = null;
+  expect(requests[2].signal.aborted).toBe(true);
 });

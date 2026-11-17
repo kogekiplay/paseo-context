@@ -19,6 +19,12 @@ When upstream shared algorithms change, update their copies under `shared/core` 
 
 The native adapter uses Paseo's already registered RNCWebView component. Verify native registration and commands when updating Paseo. Android uses acknowledged same-document history events rather than replacing the host's global WebView emitter.
 
+The separate Statistics tab reuses the MIT `packages/experimental/client-ui-stats` view from `deepseek-ai/deepseek-harness` at `39163dd30f703a79079e2d2446545cff3c453738` (package 0.2.2-rc.3). Static table, view, CSS and translations live in `web/vendor/statistics`; pure contracts and aggregation live in `shared/core/stats-*`. Host imports and type seats are local, with no DSH/Cordis runtime. Preserve its CSS and visual components, and adapt captured facts in `server/statistics.ts`. The original composer overlay spacing is disabled through the wrapper's CSS variable.
+
+Paseo Subtasks come from the public agent timeline's `tool_call` items with `detail.type: "sub_agent"`. `server/subtasks.ts` reads every history page and keeps the latest version of each call ID; the fleet adapter associates it with an existing child instead of inventing a second agent.
+
+Native usage and timestamp boundary handling also reference the MIT CC Switch implementation at `ed6d51e590ff8a34431ca60eacfc78e12704075b`, `src-tauri/src/services/session_usage{,_codex}.rs`. The TypeScript adapter preserves missing-field provenance instead of inheriting that implementation's database zero defaults. Codex uses exact `last_token_usage` when present, cache-read aliases, and cumulative deltas as a fallback. Timing is a session timestamp estimate; delayed usage flushes must not charge tool waiting to model latency. Lazy Statistics details share the step ledger and content revision with the summary; neither live nor interrupted steps depend on usage being present.
+
 Adapt changes in the upstream DTO contract at `server/upstream.ts`, `server/ui-routes.ts` and the fleet adapter, rather than modifying visual components to fit incomplete data. Native record adaptation lives in `server/fold.ts`, `server/normalize.ts` and `server/reader.ts`.
 
 ```sh

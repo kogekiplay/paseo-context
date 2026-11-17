@@ -19,6 +19,7 @@ export const nodeSchema = z.object({
   seq: z.number().optional(), goneSeq: z.number().optional(), images: z.number().optional(),
   category: categorySchema, time: z.number(), tokens: z.number(),
   title: z.string(), preview: z.string(), callId: z.string().optional(),
+  error: z.boolean().optional(),
   tool: z.string().optional(), source: z.string().optional(), gone: z.number().optional(),
 });
 export type ContextNode = z.infer<typeof nodeSchema>;
@@ -26,6 +27,9 @@ export const requestSchema = z.object({
   id: z.string(), index: z.number(), turn: z.number(), time: z.number(), boundary: z.number(), seq: z.number().optional(),
   parts: partsSchema, usage: usageSchema, model: z.string(), duration: z.number().nullable(),
   prompt: z.string(), response: z.string(), costUsd: z.number().nullable(),
+  usageFields: z.array(z.enum(["input", "cacheRead", "cacheWrite", "output", "reasoning"])).optional(),
+  estimatedModelMs: z.number().nonnegative().optional(), estimatedTtftMs: z.number().nonnegative().optional(),
+  estimatedModelStart: z.number().optional(), estimatedModelEnd: z.number().optional(),
 });
 export type Request = z.infer<typeof requestSchema>;
 export const eventSchema = z.object({

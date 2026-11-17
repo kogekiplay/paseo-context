@@ -60,7 +60,7 @@ function harness(fixtures: Session[], unread: string[] = []) {
       return content;
     }),
   };
-  const paseo = { agents: { list: vi.fn(async () => ({
+  const paseo = { agents: { ref: () => ({ timeline: { refetch: async () => ({ entries: [], hasOlder: false, epoch: "test" }) } }), list: vi.fn(async () => ({
     entries: fixtures.map((s) => ({ agent: raw(s) })), pageInfo: { hasMore: false },
   })) } } as unknown as PaseoApi;
   return { service: service as unknown as ContextService, paseo, content: service.content, fleet: new UiFleet(service as unknown as ContextService) };

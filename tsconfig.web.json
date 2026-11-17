@@ -22,6 +22,7 @@
     "web/main.tsx",
     "web/context.ts",
     "web/bridge.ts",
+    "web/**/*.d.ts",
     "src/client/**/*.ts",
     "src/client/**/*.tsx",
     "src/shared/**/*.ts",

@@ -5,17 +5,19 @@ import { agentReportsOf, delegationTextOf, type CapturedTask, type FleetRecord }
 import type { ContextService } from "./service";
 import { nodeSeq, rowOf, upstreamOf } from "./upstream";
 import { parseArgs, text } from "./value";
+import { PaseoSubtasks, type PaseoSubtask } from "./subtasks";
 
 type Loaded = Awaited<ReturnType<ContextService["load"]>>;
 type Mode = "preview" | "history" | "full";
 interface MessageSource { data: Loaded; record: FleetRecord; from: string }
 export interface FleetTask {
-  id: string; subject: string; description: string; status: CapturedTask["status"];
+  id: string; subject: string; description: string; status: CapturedTask["status"] | "failed" | "canceled";
   ownerId?: string; ownerName?: string; blockedBy: string[]; writeScopes: string[]; ready: boolean; warnings: string[];
 }
 export interface AgentTeam { tasks: FleetTask[]; failure?: string }
 export interface FleetRead {
   rootId: string; agents: Agent[]; loaded: Map<string, Loaded>; failed: number; total: number;
+  subtasks?: Map<string, PaseoSubtask[]>; subtaskFailures?: number;
 }
 const PREVIEW_MESSAGES = 80;
 const PREVIEW_TEXT = 400;
@@ -95,7 +97,17 @@ export function teamOfFleet(family: FleetRead): AgentTeam {
     task.ready = task.status === "pending" && task.blockedBy.every((id) => byId.get(id)?.status === "completed");
     for (const id of task.blockedBy) if (!byId.has(id)) task.warnings.push(`Dependency ${id} has not been captured.`);
   }
-  return { tasks, ...(family.failed ? { failure: "Some fleet sessions could not be read; captured task state may be incomplete." } : {}) };
+  for (const [agentId, subtasks] of family.subtasks ?? []) for (const task of subtasks) {
+    const provider = family.agents.find((agent) => agent.id === agentId)?.provider ?? "";
+    const source = family.loaded.get(agentId);
+    const assignment = source?.fold.collaboration.records.find((row) => source.fold.nodes[row.nodeId]?.callId === task.callId);
+    const childId = task.childId || assignment?.to;
+    const owner = childId ? resolve(childId, provider) : undefined;
+    tasks.push({ id: `${agentId}:subtask:${task.callId}`, subject: task.subject, description: task.description,
+      status: task.status, blockedBy: [], writeScopes: [], ready: false, warnings: [],
+      ...(owner && family.agents.some((agent) => agent.id === owner) ? { ownerId: owner } : owner ? { ownerName: owner } : {}) });
+  }
+  return { tasks, ...(family.failed || family.subtaskFailures ? { failure: "Some fleet sessions or Paseo subtask timelines could not be read; captured task state may be incomplete." } : {}) };
 }
 
 /** Adds only captured task data; no provider membership/ownership is invented. */
@@ -105,7 +117,9 @@ export function fleetRow(agent: Agent, team: AgentTeam, head?: ContextTimeline) 
 }
 
 export class UiFleet {
+  private subtasks = new PaseoSubtasks();
   constructor(private service: Pick<ContextService, "agent" | "load" | "fleet" | "content">) {}
+  clear() { this.subtasks.clear(); }
 
   async read(id: string, paseo: PaseoApi, seed?: Loaded): Promise<FleetRead> {
     const family = await this.service.fleet(id, paseo), candidates = family.members.map((s) => s.agent);
@@ -126,7 +140,13 @@ export class UiFleet {
         loaded.set(agent.id, data);
       } catch { failed.add(agent.id); }
     });
-    return { rootId, agents, loaded, failed: family.failed + failed.size, total: agents.length + family.failed };
+    const subtasks = new Map<string, PaseoSubtask[]>();
+    let subtaskFailures = 0;
+    await mapBounded(agents.filter((agent) => !agent.id.startsWith("native:")), async (agent) => {
+      try { subtasks.set(agent.id, await this.subtasks.read(agent.id, agent.updatedAt, paseo)); }
+      catch { subtaskFailures++; }
+    });
+    return { rootId, agents, loaded, subtasks, subtaskFailures, failed: family.failed + failed.size, total: agents.length + family.failed };
   }
   rows(family: FleetRead) {
     const team = teamOfFleet(family);

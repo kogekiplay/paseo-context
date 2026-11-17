@@ -7,9 +7,13 @@ import { CollaborationLedger } from "./collaboration";
 import { messagesOf, toolKind, type Message } from "./normalize";
 import { count, parseArgs, printable, record, text, timestamp, type RecordValue } from "./value";
 import { unionMs } from "./timing";
+import { usageFields } from "./usage-fields";
+import { StatisticsSpans } from "./statistics-spans";
+import { createHash, randomUUID } from "node:crypto";
 
 export class ContextFold {
   readonly nodes: ContextNode[] = [];
+  readonly contentHashes: string[] = [];
   readonly requests: Request[] = [];
   readonly events: ContextEvent[] = [];
   readonly files: FileActivity[] = [];
@@ -20,6 +24,7 @@ export class ContextFold {
   readonly toolEpochs: Array<{ seq: number; time: number; nodeIds: number[] }> = [];
   readonly meter: SessionFold;
   readonly collaboration = new CollaborationLedger();
+  readonly statistics = new StatisticsSpans();
   contextTokens: number | null = null;
   contextWindow: number | null = null;
   maxOutput: number | null = null;
@@ -44,7 +49,7 @@ export class ContextFold {
   private toolIntervals = new Map<string, { start: number; end: number; kind: "tools" }>();
   get revision() { return this.line; }
 
-  constructor(readonly provider: string) {
+  constructor(readonly provider: string, readonly epoch: string = randomUUID()) {
     this.meter = new SessionFold(provider === "claude" ? "claude" : "codex");
   }
   private tally(map: Map<string, Tally>, name: string, at: number) {
@@ -80,6 +85,8 @@ export class ContextFold {
           if (node.gone === undefined) this.active[node.category] += tokens - node.tokens;
           node.tokens = tokens; node.preview = message.text.replace(/\s+/g, " ").slice(0, 180);
           node.line = this.line; node.block = message.block;
+          node.error = message.error;
+          this.contentHashes[previous] = createHash("sha256").update(message.text).digest("hex");
           return;
         }
         seen.set(signature, this.nodes.length);
@@ -98,6 +105,7 @@ export class ContextFold {
       tokens, title: message.title || message.category, preview: message.text.replace(/\s+/g, " ").slice(0, 180),
       ...(message.images ? { images: message.images } : {}),
       ...(message.callId ? { callId: message.callId } : {}), ...(message.tool ? { tool: message.tool, source: this.toolSource(message.tool) } : {}),
+      ...(message.error === undefined ? {} : { error: message.error }),
     };
     let loadedSkill: string | undefined;
     if (message.category === "tool" && message.callId) {
@@ -128,6 +136,7 @@ export class ContextFold {
     }
     this.images += message.images ?? 0;
     this.nodes.push(node);
+    this.contentHashes[node.id] = createHash("sha256").update(message.text).digest("hex");
     this.nodeTurns.push(this.turn);
     this.active[message.category] += tokens;
     this.collaboration.apply(message, node.id, at);
@@ -180,11 +189,13 @@ export class ContextFold {
     const skill = skillPath ? skillPath.replace(/[/\\]SKILL\.md$/i, "").split(/[/\\]/).at(-1) : /(?:^|[._])skill$/i.test(name) ? text(args.name) || "skill" : undefined;
     if (message.callId) this.calls.set(message.callId, { node, command, files, skill });
   }
-  private request(id: string, usage: Usage, at: number, model: string) {
+  private request(id: string, usage: Usage, at: number, model: string, fields: (keyof Usage)[], timing: Partial<Pick<Request, "estimatedModelMs" | "estimatedTtftMs" | "estimatedModelStart" | "estimatedModelEnd">> = {}) {
     const previousIndex = this.requestIds.get(id);
     if (previousIndex !== undefined) {
       const previous = this.requests[previousIndex];
       previous.usage = usage;
+      previous.usageFields = fields;
+      Object.assign(previous, timing);
       if (this.provider === "claude") {
         previous.response = this.nodes.slice(previous.boundary).filter((n) => ["assistant", "calls"].includes(n.category)).map((n) => n.preview).join(" · ").slice(0, 240);
         previous.duration = at > previous.time ? at - previous.time : null;
@@ -197,9 +208,9 @@ export class ContextFold {
     const duration = at > pending.start ? at - pending.start : null;
     this.requests.push({ id, index: this.requests.length + 1, turn: Math.max(1, this.turn), time: pending.start || at,
       boundary: pending.boundary, seq: pending.seq, parts: pending.parts, usage, model: model || this.model,
-      duration, prompt: this.lastPrompt, response, costUsd: null });
+      duration, prompt: this.lastPrompt, response, costUsd: null, usageFields: fields, ...timing });
     this.requestIds.set(id, this.requests.length - 1);
-    this.contextTokens = usage.input || this.contextTokens;
+    if (fields.includes("input")) this.contextTokens = usage.input;
     this.pending = null;
   }
   apply(value: unknown) {
@@ -267,27 +278,42 @@ export class ContextFold {
     if (messages.some((message) => message.category === "user" || message.category === "tool")) this.boundaryAt = at;
     const stats = this.meter.stats;
     this.modelMs = stats.modelMs;
+    const measured = this.meter.lastTiming;
+    const timing = measured ? { estimatedModelMs: measured.modelMs, estimatedModelStart: measured.start,
+      estimatedModelEnd: measured.end, ...(measured.ttftMs === undefined ? {} : { estimatedTtftMs: measured.ttftMs }) } : {};
+    let usageId: string | undefined;
     if (this.provider === "claude" && row.type === "assistant" && record(row.message).usage) {
       const msg = record(row.message), raw = record(msg.usage), model = text(msg.model);
       if (model) this.model = model;
-      this.request(text(msg.id) || String(this.line), {
+      usageId = text(msg.id) || String(this.line);
+      this.request(usageId, {
         input: count(raw.input_tokens) + count(raw.cache_read_input_tokens) + count(raw.cache_creation_input_tokens),
         cacheRead: count(raw.cache_read_input_tokens), cacheWrite: count(raw.cache_creation_input_tokens),
         output: count(raw.output_tokens), reasoning: count(raw.reasoning_tokens),
-      }, at, model);
+      }, at, model, usageFields(raw, "claude"), timing);
     } else if (row.type === "token_usage_record") {
       const u = record(p.usage);
-      this.request(text(p.response_id) || String(row.ordinal ?? row.timestamp), {
-        input: count(u.input_tokens), cacheRead: count(u.cached_input_tokens), cacheWrite: count(u.cache_write_input_tokens),
+      usageId = text(p.response_id) || String(row.ordinal ?? row.timestamp);
+      this.request(usageId, {
+        input: count(u.input_tokens), cacheRead: count(u.cached_input_tokens ?? u.cache_read_input_tokens), cacheWrite: count(u.cache_write_input_tokens),
         output: count(u.output_tokens), reasoning: count(u.reasoning_output_tokens),
-      }, at, text(p.model));
+      }, at, text(p.model), usageFields(u, "codex"), timing);
     } else if (row.type === "event_msg" && p.type === "token_count" && stats.steps > before.steps) {
-      this.request(`legacy:${this.line}`, {
+      usageId = `legacy:${this.line}`;
+      this.request(usageId, {
         input: Math.max(0, stats.inputTokens - before.inputTokens), cacheRead: Math.max(0, stats.cachedTokens - before.cachedTokens),
         cacheWrite: Math.max(0, stats.cacheWriteTokens - before.cacheWriteTokens), output: Math.max(0, stats.outputTokens - before.outputTokens),
         reasoning: count(record(info.last_token_usage).reasoning_output_tokens),
-      }, at, this.model);
+      }, at, this.model, usageFields(this.meter.lastUsageRecord, "codex"), timing);
     }
+    if (row.type === "event_msg" && p.type === "thread_settings_applied" && text(p.model)) this.model = text(p.model);
+    const close = row.type === "event_msg" && ["task_complete", "task_completed", "turn_aborted"].includes(text(p.type))
+      ? p.type === "turn_aborted" ? "abort" : "complete"
+      : row.type === "system" && row.subtype === "turn_duration" ? "complete" : undefined;
+    this.statistics.observe({ line: this.line, at, turn: this.turn, firstNode,
+      nodes: this.nodes.slice(firstNode), requestId: usageId,
+      responseKey: this.provider === "claude" && row.type === "assistant" ? text(record(row.message).id) || undefined : undefined,
+      turnStart: row.type === "turn_context" || row.type === "event_msg" && p.type === "task_started", close });
   }
   summary(agent: Agent, source: Summary["source"] = "native"): Summary {
     const s = this.meter.stats, usage = emptyUsage();
@@ -295,7 +321,8 @@ export class ContextFold {
     usage.reasoning = this.requests.reduce((n, r) => n + r.usage.reasoning, 0);
     const sorted = (map: Map<string, Tally>) => [...map.values()].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
     const intervals: NonNullable<Summary["intervals"]> = [...this.toolIntervals.values(),
-      ...this.requests.filter((r) => r.duration !== null).map((r) => ({ start: r.time, end: r.time + r.duration!, kind: "model" as const }))];
+      ...this.requests.filter((r) => r.estimatedModelStart !== undefined && r.estimatedModelEnd !== undefined)
+        .map((r) => ({ start: r.estimatedModelStart!, end: r.estimatedModelEnd!, kind: "model" as const }))];
     return { agent: { ...agent, model: this.model || agent.model }, source, usage,
       turns: s.turns || this.turn || this.humanInputs, steps: s.steps || this.requests.length, humanInputs: this.humanInputs,
       toolCalls: [...this.tools.values()].reduce((n, t) => n + t.count, 0), images: this.images,

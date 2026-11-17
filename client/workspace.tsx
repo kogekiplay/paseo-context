@@ -1,8 +1,8 @@
 import { useEffect, useSyncExternalStore } from "react";
 import { Text, View } from "react-native";
 import { useAgent, useTabState, useTranslation, type PluginWorkspacePanelProps } from "@getpaseo/plugin/client";
-import { SettingsSelect } from "@getpaseo/plugin/client/ui";
 import { z } from "zod";
+import { AgentPicker } from "./agent-picker";
 import { FrameSurface } from "./frame";
 import { messages } from "./messages";
 
@@ -69,11 +69,8 @@ export function WorkspaceSurface(props: PluginWorkspacePanelProps & {
     if (saved.agentId !== agentId) save({ agentId });
   }, [agentId, workspaceId, saved.agentId]);
   return <View style={{ flex: 1, minHeight: 0 }}>
-    <View style={{ paddingHorizontal: 12, paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: theme.colors.border, backgroundColor: theme.colors.surface0 }}>
-      <SettingsSelect label={t("agent")} value={agentId ?? ""}
-        options={agents.map((a) => ({ value: a.id, label: a.title || a.id }))}
-        onValueChange={(value) => controller.select(workspaceId, value)} />
-    </View>
+    <AgentPicker agents={agents} agentId={agentId} theme={theme}
+      onSelect={(value) => controller.select(workspaceId, value)} />
     {agentId ? <FrameSurface {...props} agentId={agentId} />
       : <Text style={{ padding: 24, color: theme.colors.foregroundMuted }}>{t("selectAgent")}</Text>}
   </View>;

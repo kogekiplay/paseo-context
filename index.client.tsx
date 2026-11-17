@@ -10,6 +10,7 @@ export default function contribute(client: PluginClientContext) {
   const lifetime = new AbortController(), pills = new Map<string, PluginButtonRegistration>();
   const controller = new WorkspacePanels(), agents = controller.agents;
   let options: Preferences | null = null, generation = 0;
+  let navigation: PluginSurfaceProps["navigation"];
   let panelRemovers: Array<() => void> = [], panelKey = "";
   const touched = new Set<string>();
   const openModal = (id: string) => client.openScreen({ screenId: "context", params: { agentId: id, mode: "modal" } });
@@ -32,19 +33,21 @@ export default function contribute(client: PluginClientContext) {
     useEffect(() => { if (settings.status === "ready") updatePanels(settings.values); }, [settings.status === "ready" ? settings.revision : ""]);
     return settings;
   }
-  function Context(props: PluginAgentPanelProps) { usePreferences(); return <FrameSurface {...props} {...common} mode="context" agentId={props.params.agentId} />; }
-  function Fleet(props: PluginAgentPanelProps) { usePreferences(); return <FrameSurface {...props} {...common} mode="fleet" agentId={props.params.agentId} />; }
-  function WorkspaceContext(props: PluginWorkspacePanelProps) { usePreferences(); return <WorkspaceSurface {...props} {...common} controller={controller} mode="context" />; }
-  function WorkspaceFleet(props: PluginWorkspacePanelProps) { usePreferences(); return <WorkspaceSurface {...props} {...common} controller={controller} mode="fleet" />; }
-  function WorkspaceStatistics(props: PluginWorkspacePanelProps) { usePreferences(); return <WorkspaceSurface {...props} {...common} controller={controller} mode="statistics" />; }
+  function rememberNavigation(props: PluginSurfaceProps) { if (props.navigation) navigation = props.navigation; }
+  function Context(props: PluginAgentPanelProps) { rememberNavigation(props); usePreferences(); return <FrameSurface {...props} {...common} mode="context" agentId={props.params.agentId} />; }
+  function Fleet(props: PluginAgentPanelProps) { rememberNavigation(props); usePreferences(); return <FrameSurface {...props} {...common} mode="fleet" agentId={props.params.agentId} />; }
+  function WorkspaceContext(props: PluginWorkspacePanelProps) { rememberNavigation(props); usePreferences(); return <WorkspaceSurface {...props} {...common} controller={controller} mode="context" />; }
+  function WorkspaceFleet(props: PluginWorkspacePanelProps) { rememberNavigation(props); usePreferences(); return <WorkspaceSurface {...props} {...common} controller={controller} mode="fleet" />; }
+  function WorkspaceStatistics(props: PluginWorkspacePanelProps) { rememberNavigation(props); usePreferences(); return <WorkspaceSurface {...props} {...common} controller={controller} mode="statistics" />; }
   function Screen(props: PluginScreenProps) {
+    rememberNavigation(props);
     usePreferences();
     const modal = props.params.mode === "modal", id = props.params.agentId;
     return <FrameSurface {...props} {...common} mode={modal ? "modal" : props.params.mode === "fleet" ? "fleet" : props.params.mode === "statistics" ? "statistics" : "context"} agentId={id} overlay={modal}
       onClose={() => id && (id.startsWith("native:") || !props.navigation ? openContext(id) : props.navigation.openAgent({ agentId: id }))} />;
   }
-  function Insights(props: PluginScreenProps) { usePreferences(); return <FrameSurface {...props} {...common} mode="insights" />; }
-  function Settings(props: PluginSurfaceProps) { usePreferences(); return <FrameSurface {...props} {...common} mode="settings" />; }
+  function Insights(props: PluginScreenProps) { rememberNavigation(props); usePreferences(); return <FrameSurface {...props} {...common} mode="insights" />; }
+  function Settings(props: PluginSurfaceProps) { rememberNavigation(props); usePreferences(); return <FrameSurface {...props} {...common} mode="settings" />; }
   function updatePanels(next: Preferences) {
     options = next;
     const key = `${next.defaultPlacement}:${next.fleetTab}`;
@@ -103,10 +106,13 @@ export default function contribute(client: PluginClientContext) {
     controller.select(workspaceId, agentId);
     try {
       for (const mode of modes) client.openPanel(`workspace-${mode}`, { workspaceId, location: "workspace" });
-      if (modes[0] !== modes.at(-1)) client.openPanel(`workspace-${modes[0]}`, { workspaceId, location: "workspace" });
-      controller.complete(agentId);
-      pills.get(agentId)?.remove(); pills.delete(agentId);
     } catch (error) { controller.fail(agentId); throw error; }
+    controller.complete(agentId);
+    pills.get(agentId)?.remove(); pills.delete(agentId);
+    // Return during this initialization, never from a panel's later mount.
+    // A refused input focus must not cause the tabs to be created again.
+    if (navigation) navigation.openAgent({ agentId });
+    else await source.focus();
   }
   function InitializeTabs(props: PluginButtonIconProps) {
     const focused = useComposers({ focused: true })[0];
@@ -161,5 +167,6 @@ export default function contribute(client: PluginClientContext) {
     lifetime.abort();
     for (const remove of panelRemovers) remove(); panelRemovers = [];
     for (const pill of pills.values()) pill.remove(); pills.clear(); controller.clear(); touched.clear();
+    navigation = undefined;
   };
 }

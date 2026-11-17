@@ -40,14 +40,16 @@ After editing, build again and run `paseo plugin reload paseo-context`.
 - Context panels in workspace tabs and Explorer: composition, usage, timing, trends, steps/turns, full/incremental views and comparison against the previous step or turn.
 - Original context browser: DNA, grouped rows, treemap, filtering, content expansion, system prompts and captured tool schemas.
 - File activity and commands: reads, writes, searches, counts, line changes, failures, duration and background process state.
-- Fleet: agent network, communication timeline, delegations, captured tasks/dependencies, prompts and replies.
+- Fleet: agent network, communication timeline, delegations, captured tasks/dependencies, Paseo Subtasks, prompts and replies. Subtasks come directly from Paseo's timeline, retain running/completed/failed/canceled status and link to existing children.
 - Context Insights: session usage, date ranges, heatmap, skill/tool/program rankings, search, archive and directory filters.
-- Context, Fleet and Statistics workspace tabs are added automatically when an agent conversation is opened. Context becomes active and the conversation tab remains available. The Context composer button is removed. All three entries are available in the workspace tab bar's **+** menu.
-- Statistics shows the selected agent's turns, steps, usage, estimated cost, original token/timing charts and paginated request details.
+- Context, Fleet and Statistics workspace tabs are added automatically when an agent conversation is opened, then focus returns to that conversation. The Context composer button is removed. All three entries are available in the workspace tab bar's **+** menu.
+
+Initialization returns immediately through a mounted surface's public navigator. On a fresh installation before any plugin surface has mounted, only Paseo's composer focus fallback is available. A Paseo 0.16.0 visibility race can leave that first initialization on the last tab; selecting the Agent tab returns to the conversation. The plugin does not perform a delayed focus jump.
+- Statistics reuses the original turn/step table, tool details, time bars, totals, event rows, context deltas, latest/cumulative context and expand controls. It covers the complete session; unrecorded first-token and decode-speed fields remain unknown.
 - `/context`, `/context fleet` and `/context stats` open the corresponding tabs. `/context insights` opens cross-session insights, and `/context modal` opens the modal.
 - Original preferences for placement, fleet/insights visibility, date range, granularity, comparison baseline and sorting.
 
-These native Paseo workspace tabs sit alongside agents, terminals and files. Each workspace has one of each; an agent selector shares the selection across the three panels and persists it in tab state. Each agent initializes its tabs once per client plugin lifetime, so ordinary session updates do not reopen manually closed tabs. Paseo exposes no equivalent to DSH's permanent tabs inside a conversation.
+These native Paseo workspace tabs sit alongside agents, terminals and files. Each workspace has one of each. A compact picker appears only for multiple available conversations; the shared selection persists in tab state. Each agent initializes its tabs once per client plugin lifetime, so ordinary session updates do not reopen manually closed tabs. Paseo has no plugin API for permanent conversation tabs or preventing a workspace tab from closing.
 
 Sidebar-only placement opens Context in Explorer and automatically adds only Fleet and Statistics. Hidden placement disables automatic tab creation. Disabling Fleet removes its menu entry and stops adding it automatically. Existing agent-specific tabs from earlier versions remain supported.
 
@@ -60,6 +62,8 @@ The daemon reads complete local Codex rollout and Claude Code JSONL records when
 Actual usage means provider-reported usage. Colored composition uses the upstream fixed-density text estimate. Unlogged system prompts, schemas, encrypted reasoning, server injections and internal timing phases cannot be reconstructed. Empty values are not evidence of zero usage. Timeline fallback exposes less information.
 
 Costs use public model pricing and remain unknown for unmatched models. Timing comes from observable request/tool intervals, distinguishing aggregate parallel tool work from elapsed busy time. Speed uses output samples with matching available timing. These are estimates, not account bills or complete provider traces.
+
+Native usage and timing reference [CC Switch](https://github.com/farion1231/cc-switch/tree/ed6d51e590ff8a34431ca60eacfc78e12704075b). Codex prefers exact `last_token_usage`, accepts cache-read aliases, and falls back to cumulative deltas when per-request data is absent. Codex input already includes cache. Model and first-token timing are estimates from session timestamps; a delayed usage flush excludes tool waiting. Without output-start evidence, first-token timing and generation speed remain unavailable. Statistics preserves missing fields separately from reported zero, including cache reads and writes. Live and interrupted steps remain visible without usage.
 
 Fleet relationships and task/communication fields reflect captured Paseo/native records. Unavailable provider team internals are left unavailable.
 

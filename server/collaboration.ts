@@ -116,7 +116,7 @@ export class CollaborationLedger {
         : /^(?:wait|wait_agent|wait_agents)$/.test(tool) ? "wait" : null;
       if (!kind) return;
       const title = text(args.message ?? args.content ?? args.prompt ?? args.description ?? args.subject ?? args.explanation) || tool;
-      const to = text(args.agent_id ?? args.recipient ?? args.to ?? args.id) || (args.type === "broadcast" ? "*" : "");
+      const to = text(args.agent_id ?? args.recipient ?? args.to ?? args.id ?? args.target) || (args.type === "broadcast" ? "*" : "");
       const pending: Pending = { nodeId, title: title.slice(0, 500), tool, kind,
         ...(kind === "task" ? this.tasksOf(args, tool, nodeId) : {}),
         ...(kind === "delegation" ? { mode: args.mode === "one-shot" || args.mode === "continuable" ? args.mode

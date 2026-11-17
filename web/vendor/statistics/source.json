@@ -1,0 +1,16 @@
+{
+  "repository": "deepseek-ai/deepseek-harness",
+  "commit": "39163dd30f703a79079e2d2446545cff3c453738",
+  "path": "packages/experimental/client-ui-stats",
+  "packageVersion": "0.2.2-rc.3",
+  "license": "MIT",
+  "adaptations": [
+    "Local static UI and type imports replace host packages and registrations.",
+    "Pure model and aggregation live in shared/core/stats-*.",
+    "The host supplies captured data, images, history availability and translations.",
+    "The wrapper disables spacing for the original host's composer overlay.",
+    "Missing timing and completed compaction states remain unknown rather than showing zero or running.",
+    "Stable step identity, content revision and bounded lazy details are supplied by Paseo.",
+    "Host translations describe timestamp estimates and canonical cache-inclusive input."
+  ]
+}

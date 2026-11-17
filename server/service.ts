@@ -48,19 +48,22 @@ export class ContextService {
     return result.agent;
   }
   private async timeline(agent: Agent, paseo: PaseoApi, targetNodeId?: number) {
-    const fold = new ContextFold("timeline");
     const pages: Array<Awaited<ReturnType<ReturnType<PaseoApi["agents"]["ref"]>["timeline"]["refetch"]>>> = [];
     let cursor;
+    let epoch: string | undefined;
     const seen = new Set<string>();
     do {
       const page = await paseo.agents.ref(agent.id).timeline.refetch({ direction: cursor ? "before" : "tail", limit: 200, ...(cursor ? { cursor } : {}) });
       if (page.error) throw new Error(page.error);
+      if (epoch !== undefined && page.epoch !== epoch) throw new Error("Timeline changed while reading history");
+      epoch = page.epoch;
       pages.push(page);
       cursor = page.hasOlder ? page.startCursor ?? undefined : undefined;
       const key = JSON.stringify(cursor);
       if (cursor && seen.has(key)) throw new Error("Timeline returned a repeated cursor");
       if (cursor) seen.add(key);
     } while (cursor);
+    const fold = new ContextFold("timeline", epoch ?? "timeline");
     let line = 0, content = "";
     for (const page of pages.reverse()) for (const entry of page.entries) {
       const item = record(entry.item);

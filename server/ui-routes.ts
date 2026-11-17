@@ -11,6 +11,8 @@ import { UiFleet } from "./ui-fleet";
 import { uiDocument } from "./assets";
 import { imageUrlOf } from "./images";
 import { previewFile } from "./files";
+import { statisticsOf } from "./statistics";
+import { statisticsDetails } from "./statistics-details";
 
 export class UiRoutes {
   private metadata = new Metadata();
@@ -19,7 +21,7 @@ export class UiRoutes {
     this.fleet = new UiFleet(service);
     void service.pricing.refresh();
   }
-  clear() { this.metadata.clear(); }
+  clear() { this.metadata.clear(); this.fleet.clear(); }
   private async load(id: string, paseo: PaseoApi) {
     const data = await this.service.load(await this.service.agent(id, paseo), paseo);
     return { ...data, ...upstreamOf(data) };
@@ -46,10 +48,15 @@ export class UiRoutes {
           if (index < 0) sessions.push(row); else sessions[index] = row;
         }
       }
-      return { sessions, selected: selected ? { head: selected.head, headers: selected.headers, notices: selected.summary.notices } : null };
+      return { sessions, selected: selected ? { head: selected.head, headers: selected.headers,
+        ...(body.mode === "statistics" ? { statistics: statisticsOf(selected) } : {}), notices: selected.summary.notices } : null };
     }
     if (route === "family") {
       return this.fleet.rows(await this.fleet.read(id, paseo));
+    }
+    if (route === "statistics.details") {
+      const data = await this.service.load(await this.service.agent(id, paseo), paseo);
+      return statisticsDetails(data, text(body.requestId), this.service.content.bind(this.service), paseo);
     }
     if (route === "history.page") {
       const data = await this.load(text(record(body.address).sessionId ?? record(body.address).childSessionId), paseo);

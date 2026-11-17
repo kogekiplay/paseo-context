@@ -5,7 +5,9 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import { preferenceSchema, type Preferences } from "../shared/contracts";
 
 const mocks = vi.hoisted(() => ({ settings: { status: "loading" } as any, frame: vi.fn(() => null), agents: {} as Record<string, any>,
-  focused: "agent-a" as string | null, composers: { "agent-a": {}, "agent-b": {} } as Record<string, unknown> }));
+  focused: "agent-a" as string | null, composers: {
+    "agent-a": { focus: vi.fn(async () => {}) }, "agent-b": { focus: vi.fn(async () => {}) },
+  } }));
 vi.mock("react-native", () => ({ View: "View", Text: "Text" }));
 vi.mock("@getpaseo/plugin/client", () => ({
   useSettings: () => mocks.settings,
@@ -13,9 +15,11 @@ vi.mock("@getpaseo/plugin/client", () => ({
   useTranslation: () => ({ t: (key: string) => key }),
   useAgent: (id: string, select: (agent: any) => unknown) => mocks.agents[id] ? select(mocks.agents[id]) : null,
   useTabState: (tab: any, _schema: unknown, defaults: unknown) => [tab.state ?? defaults, (value: unknown) => tab.setState(value)],
-  useComposers: () => mocks.focused ? [mocks.composers[mocks.focused]] : [],
+  useComposers: () => mocks.focused ? [mocks.composers[mocks.focused as keyof typeof mocks.composers]] : [],
 }));
-vi.mock("@getpaseo/plugin/client/ui", () => ({ SidebarRow: () => null, SettingsSelect: "SettingsSelect" }));
+vi.mock("@getpaseo/plugin/client/ui", () => ({
+  SidebarRow: () => null, Icon: () => null, Modal: Object.assign(() => null, { Content: () => null }),
+}));
 vi.mock("../client/frame", () => ({ FrameSurface: mocks.frame }));
 import contribute from "../index.client";
 
@@ -40,7 +44,7 @@ function setup(input: Partial<Preferences> = {}) {
     rpc: vi.fn(() => pending), openPanel: vi.fn(), openScreen: vi.fn(), openSettings: vi.fn(),
     composers: (selector: { agentId?: string; focused?: boolean }) => {
       const id = selector.agentId ?? mocks.focused;
-      return id && mocks.composers[id] ? [mocks.composers[id]] : [];
+      return id && id in mocks.composers ? [mocks.composers[id as keyof typeof mocks.composers]] : [];
     },
     addAgentPanel: vi.fn((panel: any) => {
       panels.set(panel.id, panel);
@@ -88,7 +92,7 @@ describe("Workspace tabs", () => {
     expect(h.pills.get("agent-a").id).toBe("initialize-tabs");
     expect(h.pills.get("agent-a").button.label).toBeUndefined();
   });
-  test("initializes all tabs for the focused agent, selects Context and removes its temporary registration", async () => {
+  test("initializes all tabs then returns to the source conversation and removes its temporary registration", async () => {
     const h = setup(); h.resolve(); await h.snapshot();
     let icon!: ReturnType<typeof create>;
     await act(async () => { icon = create(createElement(h.pills.get("agent-a").button.icon,
@@ -97,8 +101,10 @@ describe("Workspace tabs", () => {
       ["workspace-context", { workspaceId: "workspace-a", location: "workspace" }],
       ["workspace-fleet", { workspaceId: "workspace-a", location: "workspace" }],
       ["workspace-statistics", { workspaceId: "workspace-a", location: "workspace" }],
-      ["workspace-context", { workspaceId: "workspace-a", location: "workspace" }],
     ]);
+    expect(mocks.composers["agent-a"].focus).toHaveBeenCalledOnce();
+    expect(mocks.composers["agent-a"].focus.mock.invocationCallOrder[0]).toBeGreaterThan(h.client.openPanel.mock.invocationCallOrder.at(-1)!);
+    expect(mocks.composers["agent-b"].focus).not.toHaveBeenCalled();
     expect(h.pills.size).toBe(0);
     const navigation = { openAgent: vi.fn() }, tab = { state: undefined, setState: vi.fn() };
     let panel!: ReturnType<typeof create>;
@@ -127,6 +133,21 @@ describe("Workspace tabs", () => {
     ]);
     expect(h.client.openScreen).not.toHaveBeenCalled();
   });
+  test("uses a host-bound surface navigator synchronously when available instead of stale input visibility", async () => {
+    const h = setup(); h.resolve(); await h.snapshot();
+    const navigation = { openAgent: vi.fn() }, tab = { state: undefined, setState: vi.fn() };
+    let panel!: ReturnType<typeof create>;
+    await act(async () => { panel = create(createElement(h.workspacePanels.get("workspace-statistics").Component, {
+      workspaceId: "workspace-a", navigation, tab,
+      theme: { colors: { surface0: "white", foregroundMuted: "gray", border: "gray" } },
+    })); });
+    await h.pills.get("agent-a").button.behavior.onPress();
+    expect(h.client.openPanel).toHaveBeenCalledTimes(3);
+    expect(navigation.openAgent).toHaveBeenCalledExactlyOnceWith({ agentId: "agent-a" });
+    expect(navigation.openAgent.mock.invocationCallOrder[0]).toBeGreaterThan(h.client.openPanel.mock.invocationCallOrder.at(-1)!);
+    expect(mocks.composers["agent-a"].focus).not.toHaveBeenCalled();
+    await act(async () => panel.unmount());
+  });
   test("workspace tabs share the selected agent, persist it and reject agents from other workspaces", async () => {
     const h = setup(); h.resolve(); await h.snapshot();
     const navigation = { openAgent: vi.fn() }, tab = { state: { agentId: "other-workspace-agent" }, setState: vi.fn() };
@@ -147,6 +168,7 @@ describe("Workspace tabs", () => {
     const opening = h.pills.get("agent-a").button.behavior.onPress();
     h.dispose(); await opening;
     expect(h.client.openPanel).not.toHaveBeenCalled();
+    expect(mocks.composers["agent-a"].focus).not.toHaveBeenCalled();
   });
   test("retained background composers never create default tabs or change focus", async () => {
     const h = setup(); h.resolve(); await h.snapshot();
@@ -155,6 +177,8 @@ describe("Workspace tabs", () => {
     await act(async () => { icon = create(createElement(h.pills.get("agent-a").button.icon,
       { context: "agent", agentId: "agent-a", workspaceId: "workspace-a" })); });
     expect(h.client.openPanel).not.toHaveBeenCalled();
+    expect(mocks.composers["agent-a"].focus).not.toHaveBeenCalled();
+    expect(mocks.composers["agent-b"].focus).not.toHaveBeenCalled();
     expect(h.pills.size).toBe(1);
     await act(async () => icon.unmount());
   });
@@ -164,8 +188,20 @@ describe("Workspace tabs", () => {
     h.client.openPanel.mockImplementationOnce(() => { throw new Error("Workspace not ready"); });
     await expect(run()).rejects.toThrow("Workspace not ready");
     expect(h.pills.size).toBe(1);
+    expect(mocks.composers["agent-a"].focus).not.toHaveBeenCalled();
     await run();
-    expect(h.client.openPanel).toHaveBeenCalledTimes(5);
+    expect(h.client.openPanel).toHaveBeenCalledTimes(4);
+    expect(mocks.composers["agent-a"].focus).toHaveBeenCalledOnce();
+    expect(h.pills.size).toBe(0);
+  });
+  test("a refused input focus never retries completed tab creation", async () => {
+    const h = setup(); h.resolve(); await h.snapshot();
+    const run = h.pills.get("agent-a").button.behavior.onPress;
+    mocks.composers["agent-a"].focus.mockRejectedValueOnce(new Error("Input refused focus"));
+    await expect(run()).rejects.toThrow("Input refused focus");
+    await h.snapshot(); await run();
+    expect(h.client.openPanel).toHaveBeenCalledTimes(3);
+    expect(mocks.composers["agent-a"].focus).toHaveBeenCalledOnce();
     expect(h.pills.size).toBe(0);
   });
   test("panel mounting never schedules a delayed jump after the user leaves the source host", async () => {
