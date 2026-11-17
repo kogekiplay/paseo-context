@@ -19,6 +19,8 @@ When upstream shared algorithms change, update their copies under `shared/core` 
 
 The native adapter uses Paseo's already registered RNCWebView component. Verify native registration and commands when updating Paseo. Android uses acknowledged same-document history events rather than replacing the host's global WebView emitter.
 
+Native HTML is passed directly to `loadDataWithBaseURL` using a per-frame `https://paseo-context.invalid/<nonce>/` origin, never fetched. Android treats an `about:blank` base as a data URL on some versions, which breaks the history bridge and navigation guard. Permit only the exact frame URL and its hash history; keep external and cross-frame navigation blocked. Cold tab initialization obtains public navigation during the first panel's layout commit instead of relying on a retained input's stale visibility ref.
+
 The separate Statistics tab reuses the MIT `packages/experimental/client-ui-stats` view from `deepseek-ai/deepseek-harness` at `39163dd30f703a79079e2d2446545cff3c453738` (package 0.2.2-rc.3). Static table, view, CSS and translations live in `web/vendor/statistics`; pure contracts and aggregation live in `shared/core/stats-*`. Host imports and type seats are local, with no DSH/Cordis runtime. Preserve its CSS and visual components, and adapt captured facts in `server/statistics.ts`. The original composer overlay spacing is disabled through the wrapper's CSS variable.
 
 Paseo Subtasks come from the public agent timeline's `tool_call` items with `detail.type: "sub_agent"`. `server/subtasks.ts` reads every history page and keeps the latest version of each call ID; the fleet adapter associates it with an existing child instead of inventing a second agent.

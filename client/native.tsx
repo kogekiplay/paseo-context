@@ -8,6 +8,7 @@ import { preferences } from "../shared/contracts";
 import { messages } from "./messages";
 import { useQuery } from "@tanstack/react-query";
 import { uiRevision } from "../shared/generated/ui-revision";
+import { isNativeDocumentUrl, nativeDocumentUrl } from "./native-navigation";
 
 type Props = PluginSurfaceProps & {
   mode: "context" | "fleet" | "statistics" | "insights" | "settings" | "modal";
@@ -37,6 +38,7 @@ function NativeFrameBody(props: Props) {
   const latest = useRef({ props, settings, locale, rpc });
   latest.current = { props, settings, locale, rpc };
   const nonce = useMemo(() => `native${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`, []);
+  const baseUrl = useMemo(() => nativeDocumentUrl(nonce), [nonce]);
   const [html, setHtml] = useState(""), [error, setError] = useState("");
   // Paseo supplies a query client per installation/host. All three tabs reuse
   // the static document without sharing session data across connections.
@@ -119,7 +121,10 @@ function NativeFrameBody(props: Props) {
       } catch (error) { reply(null, error instanceof Error ? error.message : String(error)); }
     })();
   };
-  const source = useMemo(() => ({ html, baseUrl: "about:blank" }), [html]);
+  // Android's WebView may expose loadDataWithBaseURL("about:blank") as a
+  // data: URL; a unique HTTPS origin avoids that alias and also supports
+  // same-document replaceState. The HTML is still supplied locally, not fetched.
+  const source = useMemo(() => ({ html, baseUrl }), [html, baseUrl]);
   if (error) return <View style={{ padding: 24 }}><Text style={{ color: props.theme.colors.foreground }}>Paseo Context: {error}</Text></View>;
   if (!html) return <View style={{ padding: 24 }}><Text style={{ color: props.theme.colors.foregroundMuted }}>{locale.startsWith("zh") ? "正在加载原版界面…" : "Loading interface…"}</Text></View>;
   return createElement(RNCWebView, {
@@ -135,7 +140,7 @@ function NativeFrameBody(props: Props) {
     // plugins cannot subscribe to. Local same-document history events use the
     // native view's direct event channel and never load a network URL.
     onLoadingStart: (event: { nativeEvent: { url: string } }) => {
-      if (event.nativeEvent.url !== "about:blank" && !event.nativeEvent.url.startsWith("about:blank#")) {
+      if (!isNativeDocumentUrl(event.nativeEvent.url, baseUrl)) {
         const tag = findNodeHandle(ref.current);
         if (tag !== null) UIManager.dispatchViewManagerCommand(tag, "stopLoading", []);
         setError("Navigation outside the bundled interface was blocked.");
@@ -154,7 +159,7 @@ function NativeFrameBody(props: Props) {
     onLoadingError: (event: { nativeEvent: { description?: string } }) => setError(event.nativeEvent.description ?? "Could not load the UI"),
     onShouldStartLoadWithRequest: (event: { nativeEvent: { url: string; lockIdentifier: number } }) => {
       const { url, lockIdentifier } = event.nativeEvent;
-      TurboModuleRegistry.get<WebViewModule>("RNCWebViewModule")?.shouldStartLoadWithLockIdentifier(url === "about:blank" || url.startsWith("about:blank#"), lockIdentifier);
+      TurboModuleRegistry.get<WebViewModule>("RNCWebViewModule")?.shouldStartLoadWithLockIdentifier(isNativeDocumentUrl(url, baseUrl), lockIdentifier);
     },
     cacheEnabled: false, incognito: true, domStorageEnabled: false,
     thirdPartyCookiesEnabled: false, setSupportMultipleWindows: false,

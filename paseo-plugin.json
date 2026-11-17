@@ -2,6 +2,7 @@
   "id": "paseo-context",
   "name": "Paseo Context",
   "description": "Context composition, request history, usage insights and agent fleets.",
+  "icon": "assets/icon.png",
   "media": ["docs/screenshots/context.png", "docs/screenshots/fleet.png", "docs/screenshots/statistics.png"],
   "translations": {
     "zh-CN": {

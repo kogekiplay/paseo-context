@@ -74,6 +74,10 @@ function setup(input: Partial<Preferences> = {}) {
   return {
     client, commands, screens, panels, workspacePanels, pills, removers, dispose, invocation,
     resolve: () => resolve(values), submit: (args = "") => slash.onSubmit({ ...invocation, args }),
+    upsert: (agent: any) => {
+      mocks.agents[agent.id] = agent;
+      observer.update({ type: "agent_update", payload: { kind: "upsert", agent } });
+    },
     snapshot: async () => {
       await Promise.resolve();
       mocks.agents["agent-a"] = { id: "agent-a", workspaceId: "workspace-a", title: "Agent A" };
@@ -81,6 +85,16 @@ function setup(input: Partial<Preferences> = {}) {
       await Promise.resolve();
     },
   };
+}
+
+async function mountWorkspace(h: ReturnType<typeof setup>, mode = "context", navigation = { openAgent: vi.fn() }) {
+  const tab = { state: undefined, setState: vi.fn() };
+  let panel!: ReturnType<typeof create>;
+  await act(async () => { panel = create(createElement(h.workspacePanels.get(`workspace-${mode}`).Component, {
+    workspaceId: "workspace-a", navigation, tab,
+    theme: { colors: { surface0: "white", foregroundMuted: "gray", border: "gray" } },
+  })); });
+  return { panel, navigation, tab };
 }
 
 describe("Workspace tabs", () => {
@@ -92,29 +106,28 @@ describe("Workspace tabs", () => {
     expect(h.pills.get("agent-a").id).toBe("initialize-tabs");
     expect(h.pills.get("agent-a").button.label).toBeUndefined();
   });
-  test("initializes all tabs then returns to the source conversation and removes its temporary registration", async () => {
+  test("a cold native mount creates the first tab, uses its committed navigator, then returns to the conversation", async () => {
     const h = setup(); h.resolve(); await h.snapshot();
     let icon!: ReturnType<typeof create>;
     await act(async () => { icon = create(createElement(h.pills.get("agent-a").button.icon,
       { context: "agent", agentId: "agent-a", workspaceId: "workspace-a" })); });
     expect(h.client.openPanel.mock.calls).toEqual([
       ["workspace-context", { workspaceId: "workspace-a", location: "workspace" }],
+    ]);
+    expect(mocks.composers["agent-a"].focus).not.toHaveBeenCalled();
+    // The host switches away from the source tab before its surface commits.
+    mocks.focused = null;
+    const { panel, navigation, tab } = await mountWorkspace(h);
+    expect(h.client.openPanel.mock.calls).toEqual([
+      ["workspace-context", { workspaceId: "workspace-a", location: "workspace" }],
       ["workspace-fleet", { workspaceId: "workspace-a", location: "workspace" }],
       ["workspace-statistics", { workspaceId: "workspace-a", location: "workspace" }],
     ]);
-    expect(mocks.composers["agent-a"].focus).toHaveBeenCalledOnce();
-    expect(mocks.composers["agent-a"].focus.mock.invocationCallOrder[0]).toBeGreaterThan(h.client.openPanel.mock.invocationCallOrder.at(-1)!);
-    expect(mocks.composers["agent-b"].focus).not.toHaveBeenCalled();
-    expect(h.pills.size).toBe(0);
-    const navigation = { openAgent: vi.fn() }, tab = { state: undefined, setState: vi.fn() };
-    let panel!: ReturnType<typeof create>;
-    await act(async () => { panel = create(createElement(h.workspacePanels.get("workspace-statistics").Component, {
-      workspaceId: "workspace-a", navigation, tab,
-      theme: { colors: { surface0: "white", foregroundMuted: "gray", border: "gray" } },
-    })); });
-    expect(navigation.openAgent).not.toHaveBeenCalled();
-    expect(mocks.frame).toHaveBeenLastCalledWith(expect.objectContaining({ agentId: "agent-a", mode: "statistics" }), undefined);
+    expect(navigation.openAgent).toHaveBeenCalledExactlyOnceWith({ agentId: "agent-a" });
+    expect(navigation.openAgent.mock.invocationCallOrder[0]).toBeGreaterThan(h.client.openPanel.mock.invocationCallOrder.at(-1)!);
+    expect(mocks.composers["agent-a"].focus).not.toHaveBeenCalled();
     expect(tab.setState).toHaveBeenCalledWith({ agentId: "agent-a" });
+    expect(h.pills.size).toBe(0);
     await h.snapshot();
     expect(h.pills.size).toBe(0);
     await act(async () => { icon.unmount(); panel.unmount(); });
@@ -182,39 +195,117 @@ describe("Workspace tabs", () => {
     expect(h.pills.size).toBe(1);
     await act(async () => icon.unmount());
   });
-  test("a failed default tab opening rolls back its claim and supports retry", async () => {
+  test("a failed first opening rolls back its claim and supports a cold retry", async () => {
     const h = setup(); h.resolve(); await h.snapshot();
     const run = h.pills.get("agent-a").button.behavior.onPress;
     h.client.openPanel.mockImplementationOnce(() => { throw new Error("Workspace not ready"); });
     await expect(run()).rejects.toThrow("Workspace not ready");
     expect(h.pills.size).toBe(1);
-    expect(mocks.composers["agent-a"].focus).not.toHaveBeenCalled();
     await run();
+    const { panel, navigation } = await mountWorkspace(h);
     expect(h.client.openPanel).toHaveBeenCalledTimes(4);
-    expect(mocks.composers["agent-a"].focus).toHaveBeenCalledOnce();
+    expect(navigation.openAgent).toHaveBeenCalledOnce();
     expect(h.pills.size).toBe(0);
+    await act(async () => panel.unmount());
   });
-  test("a refused input focus never retries completed tab creation", async () => {
+  test("a failed explicit return never retries completed tab creation", async () => {
     const h = setup(); h.resolve(); await h.snapshot();
+    const navigation = { openAgent: vi.fn(() => { throw new Error("Navigation unavailable"); }) };
+    const { panel } = await mountWorkspace(h, "statistics", navigation);
     const run = h.pills.get("agent-a").button.behavior.onPress;
-    mocks.composers["agent-a"].focus.mockRejectedValueOnce(new Error("Input refused focus"));
-    await expect(run()).rejects.toThrow("Input refused focus");
+    await expect(run()).rejects.toThrow("Navigation unavailable");
     await h.snapshot(); await run();
     expect(h.client.openPanel).toHaveBeenCalledTimes(3);
-    expect(mocks.composers["agent-a"].focus).toHaveBeenCalledOnce();
     expect(h.pills.size).toBe(0);
+    await act(async () => panel.unmount());
   });
-  test("panel mounting never schedules a delayed jump after the user leaves the source host", async () => {
+  test("source unmount cancels a pending handoff and later panel mounts never jump", async () => {
+    const h = setup(); h.resolve(); await h.snapshot();
+    let icon!: ReturnType<typeof create>;
+    await act(async () => { icon = create(createElement(h.pills.get("agent-a").button.icon,
+      { context: "agent", agentId: "agent-a", workspaceId: "workspace-a" })); });
+    await act(async () => icon.unmount());
+    mocks.focused = null;
+    const { panel, navigation } = await mountWorkspace(h);
+    expect(h.client.openPanel).toHaveBeenCalledTimes(1);
+    expect(navigation.openAgent).not.toHaveBeenCalled();
+    await act(async () => panel.unmount());
+  });
+  test("a delayed panel mount after expiry never navigates", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = setup(); h.resolve(); await h.snapshot();
+      await h.pills.get("agent-a").button.behavior.onPress();
+      await vi.advanceTimersByTimeAsync(2001);
+      mocks.focused = null;
+      const { panel, navigation } = await mountWorkspace(h);
+      expect(h.client.openPanel).toHaveBeenCalledTimes(1);
+      expect(navigation.openAgent).not.toHaveBeenCalled();
+      await act(async () => panel.unmount());
+    } finally { vi.useRealTimers(); }
+  });
+  test("source unmount cancels before a first panel's layout effect in the same React commit", async () => {
+    const h = setup(); h.resolve(); await h.snapshot();
+    const Icon = h.pills.get("agent-a").button.icon;
+    let tree!: ReturnType<typeof create>;
+    await act(async () => { tree = create(createElement(Icon,
+      { context: "agent", agentId: "agent-a", workspaceId: "workspace-a" })); });
+    mocks.focused = null;
+    const navigation = { openAgent: vi.fn() };
+    await act(async () => tree.update(createElement(h.workspacePanels.get("workspace-context").Component, {
+      workspaceId: "workspace-a", navigation, tab: { state: undefined, setState: vi.fn() },
+      theme: { colors: { surface0: "white", foregroundMuted: "gray", border: "gray" } },
+    })));
+    expect(h.client.openPanel).toHaveBeenCalledTimes(1);
+    expect(navigation.openAgent).not.toHaveBeenCalled();
+    await act(async () => tree.unmount());
+  });
+  test("manual and automatic initialization share the source icon's lifetime", async () => {
+    const h = setup(); h.resolve(); await h.snapshot();
+    const pill = h.pills.get("agent-a");
+    await pill.button.behavior.onPress();
+    let icon!: ReturnType<typeof create>;
+    await act(async () => { icon = create(createElement(pill.button.icon,
+      { context: "agent", agentId: "agent-a", workspaceId: "workspace-a" })); });
+    await act(async () => icon.unmount());
+    mocks.focused = null;
+    const { panel, navigation } = await mountWorkspace(h);
+    expect(h.client.openPanel).toHaveBeenCalledTimes(1);
+    expect(navigation.openAgent).not.toHaveBeenCalled();
+    await act(async () => panel.unmount());
+  });
+  test("moving an agent replaces its workspace registration and cancels the old handoff", async () => {
+    const h = setup(); h.resolve(); await h.snapshot();
+    const first = h.pills.get("agent-a");
+    await first.button.behavior.onPress();
+    h.upsert({ ...mocks.agents["agent-a"], workspaceId: "workspace-b" });
+    const second = h.pills.get("agent-a");
+    expect(second).not.toBe(first);
+    expect(second.workspaceId).toBe("workspace-b");
+    const { panel, navigation } = await mountWorkspace(h);
+    expect(navigation.openAgent).not.toHaveBeenCalled();
+    await second.button.behavior.onPress();
+    expect(h.client.openPanel).toHaveBeenLastCalledWith("workspace-statistics", { workspaceId: "workspace-b", location: "workspace" });
+    expect(navigation.openAgent).toHaveBeenCalledExactlyOnceWith({ agentId: "agent-a" });
+    await act(async () => panel.unmount());
+  });
+  test("a different focused agent cancels a cold return, including a retained source icon", async () => {
     const h = setup(); h.resolve(); await h.snapshot();
     await h.pills.get("agent-a").button.behavior.onPress();
-    mocks.focused = null;
-    const navigation = { openAgent: vi.fn() }, tab = { state: undefined, setState: vi.fn() };
-    let panel!: ReturnType<typeof create>;
-    await act(async () => { panel = create(createElement(h.workspacePanels.get("workspace-statistics").Component, {
-      workspaceId: "workspace-a", navigation, tab,
-      theme: { colors: { surface0: "white", foregroundMuted: "gray", border: "gray" } },
-    })); });
+    mocks.focused = "agent-b";
+    const { panel, navigation } = await mountWorkspace(h);
+    expect(h.client.openPanel).toHaveBeenCalledTimes(1);
     expect(navigation.openAgent).not.toHaveBeenCalled();
+    await act(async () => panel.unmount());
+  });
+  test("live source updates keep the initialization registration mounted", async () => {
+    const h = setup(); h.resolve(); await h.snapshot();
+    const first = h.pills.get("agent-a");
+    await first.button.behavior.onPress();
+    await h.snapshot();
+    expect(h.pills.get("agent-a")).toBe(first);
+    const { panel, navigation } = await mountWorkspace(h);
+    expect(navigation.openAgent).toHaveBeenCalledOnce();
     await act(async () => panel.unmount());
   });
   test("waits for panel registration before opening a tab", async () => {

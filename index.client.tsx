@@ -1,5 +1,5 @@
-import { useEffect } from "react";
-import { useComposers, useSettings, type PluginAgentPanelProps, type PluginButtonIconProps, type PluginButtonRegistration, type PluginClientContext, type PluginScreenProps, type PluginSidebarItemProps, type PluginSurfaceProps, type PluginWorkspacePanelProps } from "@getpaseo/plugin/client";
+import { useEffect, useLayoutEffect } from "react";
+import { useComposers, useSettings, type PluginAgentPanelProps, type PluginButtonIconProps, type PluginButtonRegistration, type PluginClientContext, type PluginComposer, type PluginScreenProps, type PluginSidebarItemProps, type PluginSurfaceProps, type PluginWorkspacePanelProps } from "@getpaseo/plugin/client";
 import { SidebarRow } from "@getpaseo/plugin/client/ui";
 import { FrameSurface } from "./client/frame";
 import { messages } from "./client/messages";
@@ -9,8 +9,11 @@ import { preferences, preferencesRpc, type Preferences } from "./shared/contract
 export default function contribute(client: PluginClientContext) {
   const lifetime = new AbortController(), pills = new Map<string, PluginButtonRegistration>();
   const controller = new WorkspacePanels(), agents = controller.agents;
+  const pillOwners = new Map<string, { workspaceId: string; token: symbol }>();
   let options: Preferences | null = null, generation = 0;
   let navigation: PluginSurfaceProps["navigation"];
+  let pendingTabs: { agentId: string; workspaceId: string; first: PanelMode; rest: PanelMode[];
+    source: PluginComposer; owner?: symbol; timer: ReturnType<typeof setTimeout> } | undefined;
   let panelRemovers: Array<() => void> = [], panelKey = "";
   const touched = new Set<string>();
   const openModal = (id: string) => client.openScreen({ screenId: "context", params: { agentId: id, mode: "modal" } });
@@ -36,9 +39,25 @@ export default function contribute(client: PluginClientContext) {
   function rememberNavigation(props: PluginSurfaceProps) { if (props.navigation) navigation = props.navigation; }
   function Context(props: PluginAgentPanelProps) { rememberNavigation(props); usePreferences(); return <FrameSurface {...props} {...common} mode="context" agentId={props.params.agentId} />; }
   function Fleet(props: PluginAgentPanelProps) { rememberNavigation(props); usePreferences(); return <FrameSurface {...props} {...common} mode="fleet" agentId={props.params.agentId} />; }
-  function WorkspaceContext(props: PluginWorkspacePanelProps) { rememberNavigation(props); usePreferences(); return <WorkspaceSurface {...props} {...common} controller={controller} mode="context" />; }
-  function WorkspaceFleet(props: PluginWorkspacePanelProps) { rememberNavigation(props); usePreferences(); return <WorkspaceSurface {...props} {...common} controller={controller} mode="fleet" />; }
-  function WorkspaceStatistics(props: PluginWorkspacePanelProps) { rememberNavigation(props); usePreferences(); return <WorkspaceSurface {...props} {...common} controller={controller} mode="statistics" />; }
+  function useWorkspaceSurface(props: PluginWorkspacePanelProps, mode: PanelMode) {
+    rememberNavigation(props); usePreferences();
+    // The first surface's commit supplies public navigation even on a cold
+    // native client. Do not infer screen visibility from a composer's old ref.
+    useLayoutEffect(() => {
+      const pending = pendingTabs;
+      if (!pending || pending.workspaceId !== props.workspaceId || pending.first !== mode) return;
+      pendingTabs = undefined; clearTimeout(pending.timer);
+      const focused = client.composers({ focused: true })[0], agent = agents.get(pending.agentId);
+      if (lifetime.signal.aborted || !agent || agent.archivedAt || agent.workspaceId !== pending.workspaceId
+        || focused && focused !== client.composers({ agentId: pending.agentId })[0]) {
+        controller.fail(pending.agentId); return;
+      }
+      void finishTabs(pending.agentId, pending.workspaceId, pending.rest, pending.source, props.navigation).catch(report);
+    });
+  }
+  function WorkspaceContext(props: PluginWorkspacePanelProps) { useWorkspaceSurface(props, "context"); return <WorkspaceSurface {...props} {...common} controller={controller} mode="context" />; }
+  function WorkspaceFleet(props: PluginWorkspacePanelProps) { useWorkspaceSurface(props, "fleet"); return <WorkspaceSurface {...props} {...common} controller={controller} mode="fleet" />; }
+  function WorkspaceStatistics(props: PluginWorkspacePanelProps) { useWorkspaceSurface(props, "statistics"); return <WorkspaceSurface {...props} {...common} controller={controller} mode="statistics" />; }
   function Screen(props: PluginScreenProps) {
     rememberNavigation(props);
     usePreferences();
@@ -52,6 +71,7 @@ export default function contribute(client: PluginClientContext) {
     options = next;
     const key = `${next.defaultPlacement}:${next.fleetTab}`;
     if (key === panelKey) return;
+    cancelPendingTabs();
     panelKey = key;
     for (const remove of panelRemovers) remove(); panelRemovers = [];
     if (next.defaultPlacement !== "hide") panelRemovers.push(client.addAgentPanel({
@@ -94,7 +114,21 @@ export default function contribute(client: PluginClientContext) {
   const ready = client.rpc(preferencesRpc, {}).then((values) => { if (!lifetime.signal.aborted && !options) updatePanels(values); }).catch((error) => {
     if (!lifetime.signal.aborted) console.error("[paseo-context] Preferences could not be loaded", error);
   });
-  async function initializeTabs(agentId: string, workspaceId: string, active = () => true) {
+  function cancelPendingTabs(owner?: symbol) {
+    if (!pendingTabs || owner && pendingTabs.owner !== owner) return;
+    clearTimeout(pendingTabs.timer); controller.fail(pendingTabs.agentId); pendingTabs = undefined;
+  }
+  async function finishTabs(agentId: string, workspaceId: string, modes: PanelMode[], source: PluginComposer, nav: PluginSurfaceProps["navigation"]) {
+    try {
+      for (const mode of modes) client.openPanel(`workspace-${mode}`, { workspaceId, location: "workspace" });
+    } catch (error) { controller.fail(agentId); throw error; }
+    controller.complete(agentId);
+    pills.get(agentId)?.remove(); pills.delete(agentId);
+    pillOwners.delete(agentId);
+    if (nav) nav.openAgent({ agentId });
+    else await source.focus();
+  }
+  async function initializeTabs(agentId: string, workspaceId: string, active = () => true, owner?: symbol) {
     await ready;
     const current = agents.get(agentId);
     const source = client.composers({ agentId })[0];
@@ -104,34 +138,47 @@ export default function contribute(client: PluginClientContext) {
     const modes: PanelMode[] = [...(options.defaultPlacement !== "sidebar" ? ["context" as const] : []),
       ...(options.fleetTab ? ["fleet" as const] : []), "statistics"];
     controller.select(workspaceId, agentId);
+    if (navigation) return finishTabs(agentId, workspaceId, modes, source, navigation);
+    cancelPendingTabs();
+    const [first, ...rest] = modes;
+    pendingTabs = { agentId, workspaceId, first, rest, source, owner,
+      timer: setTimeout(() => cancelPendingTabs(), 2000) };
     try {
-      for (const mode of modes) client.openPanel(`workspace-${mode}`, { workspaceId, location: "workspace" });
-    } catch (error) { controller.fail(agentId); throw error; }
-    controller.complete(agentId);
-    pills.get(agentId)?.remove(); pills.delete(agentId);
-    // Return during this initialization, never from a panel's later mount.
-    // A refused input focus must not cause the tabs to be created again.
-    if (navigation) navigation.openAgent({ agentId });
-    else await source.focus();
+      client.openPanel(`workspace-${first}`, { workspaceId, location: "workspace" });
+    } catch (error) { cancelPendingTabs(); throw error; }
   }
   function InitializeTabs(props: PluginButtonIconProps) {
     const focused = useComposers({ focused: true })[0];
+    const owner = props.context === "agent" ? pillOwners.get(props.agentId)?.token : undefined;
+    // Layout cleanup runs before a newly mounted panel's layout effect, even
+    // when the source is removed in the very same React commit.
+    useLayoutEffect(() => () => { if (owner) cancelPendingTabs(owner); }, [owner]);
     // Native clients retain hidden conversations. Mounting alone is not an
     // activity signal; only the host's focused composer may create default tabs.
     useEffect(() => {
       let active = true;
-      if (props.context === "agent") void initializeTabs(props.agentId, props.workspaceId, () => active).catch(report);
+      if (pendingTabs && focused && focused !== client.composers({ agentId: pendingTabs.agentId })[0]) cancelPendingTabs();
+      if (props.context === "agent") void initializeTabs(props.agentId, props.workspaceId, () => active, owner).catch(report);
       return () => { active = false; };
     }, [props.context === "agent" ? props.agentId : "", props.workspaceId, focused]);
     return null;
   }
   function register(agent: { id: string; workspaceId?: string; title?: string | null; archivedAt?: string | null }) {
     controller.upsert(agent);
+    const eligible = agent.workspaceId && !agent.archivedAt && !lifetime.signal.aborted && options && options.defaultPlacement !== "hide";
+    // Live agent updates must not remount the initialization icon while its
+    // short-lived first-panel handoff is in progress.
+    const sameWorkspace = pillOwners.get(agent.id)?.workspaceId === agent.workspaceId;
+    if (eligible && sameWorkspace && pills.has(agent.id) && (!controller.hasInitialized(agent.id) || pendingTabs?.agentId === agent.id)) return;
+    if ((!eligible || !sameWorkspace) && pendingTabs?.agentId === agent.id) cancelPendingTabs();
     pills.get(agent.id)?.remove(); pills.delete(agent.id);
+    pillOwners.delete(agent.id);
     if (!agent.workspaceId || agent.archivedAt || lifetime.signal.aborted || !options || options.defaultPlacement === "hide" || controller.hasInitialized(agent.id)) return;
+    const token = Symbol("default-tabs");
+    pillOwners.set(agent.id, { workspaceId: agent.workspaceId, token });
     pills.set(agent.id, client.addComposerPill({ id: "initialize-tabs", workspaceId: agent.workspaceId, agentId: agent.id,
       button: { title: messages.message("preparing"), icon: InitializeTabs,
-        behavior: { kind: "action", onPress: () => initializeTabs(agent.id, agent.workspaceId!) } } }));
+        behavior: { kind: "action", onPress: () => initializeTabs(agent.id, agent.workspaceId!, () => pillOwners.get(agent.id)?.token === token, token) } } }));
   }
   async function reconcile(first: Awaited<ReturnType<typeof client.paseo.agents.list>>) {
     const version = ++generation;
@@ -147,7 +194,7 @@ export default function contribute(client: PluginClientContext) {
       cursor = page.pageInfo.hasMore ? page.pageInfo.nextCursor : null;
     }
     if (lifetime.signal.aborted || version !== generation) return;
-    for (const id of agents.keys()) if (!rows.has(id) && !touched.has(id)) { controller.remove(id); pills.get(id)?.remove(); pills.delete(id); }
+    for (const id of agents.keys()) if (!rows.has(id) && !touched.has(id)) { controller.remove(id); pills.get(id)?.remove(); pills.delete(id); pillOwners.delete(id); }
     for (const agent of rows.values()) if (!touched.has(agent.id)) register(agent);
   }
   const report = (error: unknown) => { if (!lifetime.signal.aborted) console.error("[paseo-context] Agent observation failed", error); };
@@ -159,14 +206,15 @@ export default function contribute(client: PluginClientContext) {
         if (lifetime.signal.aborted || message.type !== "agent_update") return;
         const update = message.payload, id = update.kind === "upsert" ? update.agent.id : update.agentId;
         touched.add(id);
-        if (update.kind === "upsert") register(update.agent); else { controller.remove(id); pills.get(id)?.remove(); pills.delete(id); }
+        if (update.kind === "upsert") register(update.agent); else { controller.remove(id); pills.get(id)?.remove(); pills.delete(id); pillOwners.delete(id); }
       },
     });
   }).catch(report);
   return () => {
     lifetime.abort();
+    cancelPendingTabs();
     for (const remove of panelRemovers) remove(); panelRemovers = [];
-    for (const pill of pills.values()) pill.remove(); pills.clear(); controller.clear(); touched.clear();
+    for (const pill of pills.values()) pill.remove(); pills.clear(); pillOwners.clear(); controller.clear(); touched.clear();
     navigation = undefined;
   };
 }

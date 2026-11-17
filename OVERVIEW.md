@@ -2,7 +2,7 @@ Paseo Context shows context composition, request history, usage trends, file and
 
 Opening an agent conversation automatically adds Context, Fleet and Statistics workspace tabs, then returns to that conversation. All three appear in the workspace tab bar's + menu; the old composer button is removed. A compact picker appears only for multiple available conversations and shares the selection across the three tabs. Manually closed tabs stay closed during ordinary session updates.
 
-On Paseo 0.16.0, the first initialization after a fresh install can remain on the last tab before a plugin navigator is available. Select the Agent tab to return. Subsequent initialization uses the mounted surface's public navigator without a delayed focus jump.
+On a cold client, initialization uses the first panel's public navigator to finish creating tabs and return to the conversation. Leaving the source or a slow panel cancels that short-lived return; manually opening a panel later does not jump to another tab. Mobile initialization does not need to open the keyboard.
 
 Statistics reuses the original turn/step table with expandable tool details, time bars, totals, event rows and context controls. Fleet also includes Paseo Subtasks and their recorded statuses. `/context`, `/context fleet` and `/context stats` open the corresponding tabs; `/context modal` opens the modal. Context Insights in the sidebar provides cross-session usage and date filters. These tabs sit alongside agents and files; Paseo has no plugin API for permanent conversation tabs or preventing a workspace tab from closing. Sidebar-only placement opens Context in Explorer; hidden placement disables automatic tab creation.
 

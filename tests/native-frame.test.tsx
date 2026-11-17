@@ -60,9 +60,13 @@ describe("Native upstream UI container", () => {
   });
   test("blocks navigation away from the bundled local document", async () => {
     const view = await mount();
+    expect(view.props.source.baseUrl).toMatch(/^https:\/\/paseo-context\.invalid\/native[^/]+\/$/);
     view.props.onShouldStartLoadWithRequest({ nativeEvent: { url: "https://example.invalid", lockIdentifier: 4 } });
     view.props.onShouldStartLoadWithRequest({ nativeEvent: { url: "about:blank", lockIdentifier: 5 } });
-    expect(mocks.module.shouldStartLoadWithLockIdentifier.mock.calls).toEqual([[false, 4], [true, 5]]);
+    view.props.onShouldStartLoadWithRequest({ nativeEvent: { url: view.props.source.baseUrl, lockIdentifier: 6 } });
+    expect(mocks.module.shouldStartLoadWithLockIdentifier.mock.calls).toEqual([[false, 4], [true, 5], [true, 6]]);
+    await act(async () => view.props.onLoadingStart({ nativeEvent: { url: view.props.source.baseUrl } }));
+    expect(mocks.dispatch).not.toHaveBeenCalledWith(7, "stopLoading", []);
     await act(async () => view.props.onLoadingStart({ nativeEvent: { url: "https://example.invalid" } }));
     expect(mocks.dispatch).toHaveBeenCalledWith(7, "stopLoading", []);
   });
@@ -88,6 +92,12 @@ describe("Native upstream UI container", () => {
     } }));
     expect(mocks.rpc).toHaveBeenCalledWith({ route: "bootstrap", payload: {} });
     expect(mocks.dispatch).toHaveBeenCalledWith(7, "injectJavaScript", [expect.stringContaining("__PASEO_CONTEXT_ACK__")]);
+    expect(mocks.dispatch).toHaveBeenCalledWith(7, "injectJavaScript", [expect.stringContaining('"type":"paseo-context:result"')]);
+    mocks.dispatch.mockClear();
+    await act(async () => view.props.onLoadingStart({ nativeEvent: {
+      url: `${view.props.source.baseUrl}#paseo-context=2:${encodeURIComponent(JSON.stringify(message))}`,
+    } }));
+    expect(mocks.dispatch).not.toHaveBeenCalledWith(7, "stopLoading", []);
     expect(mocks.dispatch).toHaveBeenCalledWith(7, "injectJavaScript", [expect.stringContaining('"type":"paseo-context:result"')]);
   });
 });
