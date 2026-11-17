@@ -1,0 +1,40 @@
+/* Paseo's WebView has no desktop table minimum or composer. Keep these host
+   adaptations separate from the original component styles. */
+.pc-statistics { container: pc-statistics / inline-size; }
+.pc-statistics [role="region"] { overflow: auto; overscroll-behavior-x: contain; }
+.pc-statistics table { min-width: 1280px; }
+.pc-statistics tbody > tr > td:first-child { overflow: hidden; text-overflow: ellipsis; }
+
+@container pc-statistics (max-width: 700px) {
+  .pc-statistics [role="region"] { padding-inline: 8px; }
+  /* StatsView's footer stays outside the table's horizontal scrollport. */
+  .pc-statistics > div > div:last-child {
+    flex-wrap: wrap;
+    margin-inline: 8px;
+    gap: 10px;
+  }
+  .pc-statistics > div > div:last-child > span { flex: 1 1 100%; margin-right: 0; white-space: nowrap; }
+  .pc-statistics > div > div:last-child > div {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    flex: 1 1 100%;
+    gap: 8px 12px;
+  }
+  .pc-statistics > div > div:last-child > div > span {
+    min-width: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .pc-statistics > div > div:last-child > div > :nth-child(even) { justify-self: end; }
+  .pc-statistics > div > div:last-child > button { flex: none; white-space: nowrap; }
+}
+
+@container lc-card (max-width: 520px) {
+  .lc-agents-main { width: 100%; min-width: 0; }
+  .lc-agents-stage { width: 100%; margin-inline: 0; overflow: auto; }
+  .lc-agents-legend { gap: 3px 9px; font-size: 10px; }
+  .lc-agents-legend-item { white-space: nowrap; }
+  /* Avoid WebKit retaining a clipped animation layer after the measured canvas
+     changes size. Cards still use the original layout, palette and selection. */
+  .lc-agents-compact .lc-agent-card { animation: none; }
+}

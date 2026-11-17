@@ -13,7 +13,7 @@ The following screenshots show the running plugin with generated sample records:
 
 ## Install
 
-Requires Paseo **0.16.0+** and Node.js 22+ on the daemon machine. The original interactive interface runs in Desktop, web and native iOS/iPadOS using Paseo's bundled WebView. The iPad client has completed a live rendering handshake. Android uses a separate message transport and remains experimental. Narrow layouts use the upstream responsive styles.
+Requires Paseo **0.16.0+** and Node.js 22+ on the daemon machine. The original interactive interface runs in Desktop, web and native iOS/iPadOS using Paseo's bundled WebView. The iPad client has completed a live rendering handshake. Android uses a separate message transport and remains experimental. Narrow layouts retain the upstream responsive styles with Paseo adaptations: Fleet fits the available width, Statistics keeps all columns in a horizontally scrollable table, and footer controls wrap independently.
 
 After enabling plugins in Paseo:
 

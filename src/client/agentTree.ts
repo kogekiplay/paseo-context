@@ -531,7 +531,7 @@ export function layoutForest(forest: AgentForest, stageWidth = 0, compact = fals
     }
   }
 
-  const slot = stageWidth > 0 && leafSlots > 1 ? Math.min(slotMax, stageWidth / leafSlots) : slotMax
+  const slot = stageWidth > 0 ? Math.min(slotMax, stageWidth / Math.max(1, leafSlots)) : slotMax
   const points: AgentPoint[] = forest.nodes.map(node => ({
     id: node.id,
     /* v8 ignore next 1 */

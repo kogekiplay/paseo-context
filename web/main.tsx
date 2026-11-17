@@ -43,6 +43,7 @@ import "../src/client/styles/overview.css";
 import "../src/client/styles/dateRange.css";
 import "../src/client/styles/recom.css";
 import "./shell.css";
+import "./mobile.css";
 
 Object.defineProperty(navigator, "clipboard", { configurable: true, value: {
   writeText: (text: string) => call("clipboard.write", { text }).then(() => undefined),

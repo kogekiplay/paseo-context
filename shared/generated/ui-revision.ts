@@ -1,1 +1,1 @@
-export const uiRevision = "42222eecd63d8d16ac223a7417abb4362e099693bdc47c7b152358f4c8f99b5c";
+export const uiRevision = "8cba61739813754e69ce3cead18f38f2e11efd49ac5e426ef292fd2a3d0bcc01";

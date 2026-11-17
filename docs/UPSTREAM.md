@@ -38,4 +38,6 @@ npm run build
 paseo plugin reload paseo-context
 ```
 
+Paseo narrow-screen overrides live in `web/mobile.css`, imported after the original styles. Keep the upstream component CSS intact. The forest layout also clamps single-leaf slots to measured width; retain that boundary fix on upstream merges. Check narrow cold startup, width changes, single-child chains, table horizontal scrolling and footer controls in WebKit and Chromium. Browser engine checks do not replace physical-device verification.
+
 Verify current and historical context, request selection while new data arrives, full content, compaction/rollback, date filters, paging, commands, fleet recipients/tasks, settings, dark styles and narrow browser layouts. Update both READMEs, overviews and the baseline in this file after accepting an upstream merge.

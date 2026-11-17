@@ -13,7 +13,7 @@ Paseo 的上下文洞察插件。基于 [bowenliang123/dsh-context](https://gith
 
 ## 安装
 
-需要 Paseo **0.16.0 或更新版本**，以及可运行 Node.js 22+ 的 daemon。完整交互界面直接运行于 Desktop、网页及 iOS/iPadOS 原生客户端；手机和平板使用上游响应式布局。原生端复用 Paseo 内置 WebView，iPad 客户端已完成真实运行握手。Android 提供独立消息桥，目前属于实验性支持。
+需要 Paseo **0.16.0 或更新版本**，以及可运行 Node.js 22+ 的 daemon。完整交互界面直接运行于 Desktop、网页及 iOS/iPadOS 原生客户端；手机和平板使用上游响应式布局，并补充 Paseo 窄屏适配：编队画布随可用宽度调整，统计表保留完整列并可横向滑动，底部控件独立换行。原生端复用 Paseo 内置 WebView，iPad 客户端已完成真实运行握手。Android 提供独立消息桥，目前属于实验性支持。
 
 在 Paseo 启用插件后安装：
 
