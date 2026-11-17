@@ -1,0 +1,1 @@
+export const uiRevision = "047cd8833a5abaf91c616d039d696d9372d4cfc7ea181275a6696ee9256eda79";

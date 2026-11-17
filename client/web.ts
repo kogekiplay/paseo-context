@@ -26,6 +26,14 @@ type Props = PluginSurfaceProps & {
 const originalPreferences = (values: Record<string, unknown>) => Object.fromEntries(Object.entries(values).map(([key, value]) =>
   [key, typeof value === "boolean" ? value ? "show" : "hide" : value]));
 const Iframe = "iframe" as unknown as ComponentType<any>;
+let documentPromise: Promise<string> | undefined;
+function readDocument() {
+  return documentPromise ??= (async () => {
+    const bytes = Uint8Array.from(atob(upstreamHtmlGzip), (c) => c.charCodeAt(0));
+    const stream = new Blob([bytes.buffer]).stream().pipeThrough(new DecompressionStream("gzip"));
+    return new Response(stream).text();
+  })().catch((error) => { documentPromise = undefined; throw error; });
+}
 export function WebFrame(props: Props) {
   return Platform.OS === "web" ? createElement(WebFrameBody, props) : null;
 }
@@ -39,9 +47,7 @@ function WebFrameBody(props: Props) {
   const [error, setError] = useState("");
   useEffect(() => {
     let active = true;
-    const bytes = Uint8Array.from(atob(upstreamHtmlGzip), (c) => c.charCodeAt(0));
-    const stream = new Blob([bytes.buffer]).stream().pipeThrough(new DecompressionStream("gzip"));
-    void new Response(stream).text().then((value) => { if (active) setHtml(value.replaceAll("%%PASEO_CONTEXT_NONCE%%", nonce)); })
+    void readDocument().then((value) => { if (active) setHtml(value.replaceAll("%%PASEO_CONTEXT_NONCE%%", nonce)); })
       .catch((error: unknown) => { if (active) setError(error instanceof Error ? error.message : String(error)); });
     return () => { active = false; };
   }, [nonce]);

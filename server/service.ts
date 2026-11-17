@@ -34,12 +34,20 @@ export class ContextService {
   constructor(readonly reader = new SessionReader()) {}
   readonly pricing = new Pricing();
   private summaries = new Map<string, { at: number; key: string; summary: Summary; requests: ContextFold["requests"] }>();
-  private corpus: { at: number; all: Summary[]; requests: Map<string, ContextFold["requests"]>; scanned: number; failed: number } | null = null;
+  private corpus: { at: number; pricingRevision: number; all: Summary[]; requests: Map<string, ContextFold["requests"]>; scanned: number; failed: number } | null = null;
   private corpusBusy: Promise<NonNullable<ContextService["corpus"]>> | null = null;
   private closed = false;
   private nativeMembers = new Map<string, PaseoAgent>();
   private revisions = new Map<string, { fingerprint: string; revision: number }>();
   private serial = 0;
+  private derived = new Map<string, { fold: ContextFold; foldRevision: number; key: string; at: number;
+    data: { agent: Agent; fold: ContextFold; summary: Summary; requests: ReturnType<Pricing["priceRequests"]>; revision: number } }>();
+  private loading = new Map<string, Promise<{ agent: Agent; fold: ContextFold; summary: Summary; requests: ReturnType<Pricing["priceRequests"]>; revision: number }>>();
+  async directory(paseo: PaseoApi) {
+    const agents = await listAgents(paseo);
+    const sessions = new Set(agents.map((raw) => `${raw.provider}:${agentOf(raw).sessionId}`));
+    return [...agents, ...[...this.nativeMembers.values()].filter((raw) => !sessions.has(`${raw.provider}:${agentOf(raw).sessionId}`))];
+  }
   async agent(id: string, paseo: PaseoApi) {
     const native = this.nativeMembers.get(id);
     if (native) return native;
@@ -76,9 +84,25 @@ export class ContextService {
     return { fold, content };
   }
   async load(raw: PaseoAgent, paseo: PaseoApi) {
+    // Simultaneous surfaces share a read. Different agent metadata must never
+    // inherit an in-flight result from an older snapshot.
+    const key = JSON.stringify([agentOf(raw), raw.lastUsage, this.pricing.revision]);
+    const busy = this.loading.get(key);
+    if (busy) return busy;
+    const pending = this.loadSession(raw, paseo, key);
+    this.loading.set(key, pending);
+    try { return await pending; } finally { if (this.loading.get(key) === pending) this.loading.delete(key); }
+  }
+  private async loadSession(raw: PaseoAgent, paseo: PaseoApi, key: string) {
+    if (this.closed) throw new Error("Plugin was stopped");
     const agent = agentOf(raw);
     const native = await this.reader.read(agent);
     const fold = native?.entry.fold ?? (await this.timeline(agent, paseo)).fold;
+    if (this.closed) throw new Error("Plugin was stopped");
+    const cached = this.derived.get(agent.id);
+    if (cached?.fold === fold && cached.foldRevision === fold.revision && cached.key === key) {
+      cached.at = Date.now(); return cached.data;
+    }
     for (const child of fold.collaboration.children.values()) {
       const id = `native:${raw.provider}:${child.sessionId}`;
       if (this.nativeMembers.size >= 512) this.nativeMembers.delete(this.nativeMembers.keys().next().value!);
@@ -100,14 +124,26 @@ export class ContextService {
       summary.costUsd = last.totalCostUsd;
       summary.notices.push("last-turn-cost");
     }
-    const fingerprint = createHash("sha256").update(JSON.stringify([summary, fold.revision, fold.nodes, fold.events, fold.commands, requests])).digest("hex");
+    const fingerprint = createHash("sha256").update(JSON.stringify([summary, fold.revision, fold.epoch,
+      fold.contentHashes, fold.statistics.rows, fold.nodes, fold.events, fold.commands, requests])).digest("hex");
     const previous = this.revisions.get(agent.id);
     const revision = previous?.fingerprint === fingerprint ? previous.revision : ++this.serial;
     if (!this.closed) {
       this.revisions.delete(agent.id); this.revisions.set(agent.id, { fingerprint, revision });
       if (this.revisions.size > 512) this.revisions.delete(this.revisions.keys().next().value!);
     }
-    return { agent, fold, summary, requests, revision };
+    const data = { agent, fold, summary, requests, revision };
+    if (!this.closed) {
+      this.derived.delete(agent.id);
+      this.derived.set(agent.id, { fold, foldRevision: fold.revision, key, at: Date.now(), data });
+      let weight = [...this.derived.values()].reduce((n, entry) => n + entry.fold.nodes.length + entry.data.requests.length, 0);
+      for (const [id, entry] of this.derived) {
+        if (this.derived.size > 8 || weight > 100000 || Date.now() - entry.at > 120000) {
+          this.derived.delete(id); weight -= entry.fold.nodes.length + entry.data.requests.length;
+        }
+      }
+    }
+    return data;
   }
   async snapshot(id: string, paseo: PaseoApi) {
     await this.pricing.refresh();
@@ -147,7 +183,7 @@ export class ContextService {
     return value;
   }
   async overview(scope: Scope, offset: number, paseo: PaseoApi) {
-    await this.pricing.refresh();
+    void this.pricing.refresh();
     const corpus = await this.readCorpus(paseo);
     return aggregate(corpus.all, corpus.requests, scope, offset, corpus.scanned, corpus.failed);
   }
@@ -158,12 +194,13 @@ export class ContextService {
       total: corpus.scanned, covered: corpus.scanned - corpus.failed, unsupported: 0 };
   }
   private async readCorpus(paseo: PaseoApi) {
-    if (this.corpus && Date.now() - this.corpus.at < 10_000) return this.corpus;
+    if (this.corpus && this.corpus.pricingRevision === this.pricing.revision && Date.now() - this.corpus.at < 10_000) return this.corpus;
     if (this.corpusBusy) return this.corpusBusy;
     this.corpusBusy = this.scanCorpus(paseo);
     try { return await this.corpusBusy; } finally { this.corpusBusy = null; }
   }
   private async scanCorpus(paseo: PaseoApi) {
+    const pricingRevision = this.pricing.revision;
     const agents = await listAgents(paseo);
     const all: Summary[] = [];
     const allRequests = new Map<string, Awaited<ReturnType<ContextService["load"]>>["requests"]>();
@@ -177,7 +214,7 @@ export class ContextService {
       }));
       for (const r of batch) if (r.status === "fulfilled") all.push(r.value); else failed++;
     }
-    const corpus = { at: Date.now(), all, requests: allRequests, scanned: agents.length, failed };
+    const corpus = { at: Date.now(), pricingRevision, all, requests: allRequests, scanned: agents.length, failed };
     if (!this.closed) this.corpus = corpus;
     return corpus;
   }
@@ -196,7 +233,7 @@ export class ContextService {
       for (const a of agents) if (a.labels["paseo.parent-agent-id"] && ids.has(a.labels["paseo.parent-agent-id"])) ids.add(a.id);
       if (before === ids.size) break;
     }
-    await this.pricing.refresh();
+    void this.pricing.refresh();
     const members: Summary[] = [];
     let failed = 0;
     const visitedSessions = new Set<string>();
@@ -223,7 +260,7 @@ export class ContextService {
     }
     return { records: records.sort((a, b) => a.time - b.time), failed };
   }
-  clear() { this.closed = true; this.reader.clear(); this.pricing.clear(); this.summaries.clear(); this.nativeMembers.clear(); this.revisions.clear(); this.corpus = null; }
+  clear() { this.closed = true; this.reader.clear(); this.pricing.clear(); this.summaries.clear(); this.nativeMembers.clear(); this.revisions.clear(); this.derived.clear(); this.loading.clear(); this.corpus = null; }
 }
 
 export function aggregate(all: Summary[], requests: Map<string, ContextFold["requests"]>, scope: Scope, offset: number, scanned: number, failed: number, now = Date.now()) {

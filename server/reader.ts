@@ -32,7 +32,7 @@ export class SessionReader {
     if (!sessionId || !/^[a-zA-Z0-9_-]+$/.test(sessionId)) return null;
     const key = `${provider}:${sessionId}`;
     const hit = this.paths.get(key);
-    if (hit && Date.now() - hit.at < 30_000 && await this.exists(hit.path)) return hit.path;
+    if (hit && await this.exists(hit.path)) return hit.path;
     let path: string | null = null;
     if (provider === "codex") {
       for (const folder of ["sessions", "archived_sessions"]) {

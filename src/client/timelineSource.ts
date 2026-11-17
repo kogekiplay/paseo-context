@@ -829,7 +829,9 @@ export function useTimelineSource(props: SessionStandardProps): TimelineSource {
   const head = projectionOf(props, 'contextTimeline', timelineOf)
   const sessionId = typeof props.sessionId === 'string' ? props.sessionId : ''
   const headRev = head !== null && typeof head.detailRev === 'number' ? head.detailRev : null
-  const slim = headRev !== null
+  // Paseo's isolated frame can supply the complete projection while retaining
+  // detailRev for delta invalidation.
+  const slim = headRev !== null && (head as ContextTimeline & { paseoComplete?: boolean }).paseoComplete !== true
   const cold = head === null
   const store = useMemo(
     () => (sessionId !== '' && (slim || cold) ? detailStoreOf(sessionId) : null),

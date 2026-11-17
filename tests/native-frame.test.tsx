@@ -1,6 +1,7 @@
 import { act, create } from "react-test-renderer";
 import { createElement } from "react";
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 const mocks = vi.hoisted(() => ({
   platform: { OS: "ios" }, dispatch: vi.fn(), navigation: vi.fn(),
@@ -28,15 +29,20 @@ import { NativeFrame } from "../client/native";
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 let renderer: ReturnType<typeof create> | null = null;
+let queryClient: QueryClient;
 afterEach(async () => {
   if (renderer) await act(async () => renderer?.unmount());
+  queryClient?.clear();
   renderer = null; vi.clearAllMocks(); mocks.platform.OS = "ios";
 });
 const props = { mode: "insights" as const, theme: { colors: { surface0: "#111111", foreground: "#ffffff", foregroundMuted: "#aaaaaa" } },
   host: { id: "host", label: "Host" }, layout: { compact: true, platform: "ios" as const },
   openSettings: vi.fn(), openContext: vi.fn() };
 async function mount() {
-  await act(async () => { renderer = create(createElement(NativeFrame, props as any)); });
+  queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  await act(async () => { renderer = create(createElement(QueryClientProvider, { client: queryClient },
+    createElement(NativeFrame, props as any))); });
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
   return renderer!.root.findByType("RNCWebView" as any);
 }
 describe("Native upstream UI container", () => {
@@ -59,6 +65,17 @@ describe("Native upstream UI container", () => {
     expect(mocks.module.shouldStartLoadWithLockIdentifier.mock.calls).toEqual([[false, 4], [true, 5]]);
     await act(async () => view.props.onLoadingStart({ nativeEvent: { url: "https://example.invalid" } }));
     expect(mocks.dispatch).toHaveBeenCalledWith(7, "stopLoading", []);
+  });
+  test("shares static markup across tabs while keeping separate bridge nonces", async () => {
+    queryClient = new QueryClient();
+    await act(async () => { renderer = create(createElement(QueryClientProvider, { client: queryClient },
+      createElement(NativeFrame, props as any),
+      createElement(NativeFrame, { ...props, mode: "statistics" } as any))); });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+    const views = renderer!.root.findAllByType("RNCWebView" as any);
+    expect(views).toHaveLength(2);
+    expect(mocks.rpc.mock.calls.filter(([request]) => request.route === "ui.document")).toHaveLength(1);
+    expect(views[0].props.source.html).not.toBe(views[1].props.source.html);
   });
   test("Android bridges local history events without replacing Paseo's global WebView emitter", async () => {
     mocks.platform.OS = "android";

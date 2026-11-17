@@ -3,32 +3,41 @@ import { scopeSchema } from "../shared/contracts";
 import { assemble } from "../shared/core/assemble";
 import { incrementOf } from "../shared/core/increment";
 import { contextDeltaOf } from "../shared/core/delta";
-import { ContextService, agentOf, listAgents } from "./service";
+import { ContextService, agentOf } from "./service";
 import { nodeSeq, rowOf, upstreamOf } from "./upstream";
 import { count, record, text } from "./value";
 import { Metadata } from "./metadata";
-import { UiFleet } from "./ui-fleet";
+import { UiFleet, graphHeadOf } from "./ui-fleet";
 import { uiDocument } from "./assets";
 import { imageUrlOf } from "./images";
 import { previewFile } from "./files";
 import { statisticsOf } from "./statistics";
 import { statisticsDetails } from "./statistics-details";
+import { grammarOf } from "./grammars";
+import { createHash } from "node:crypto";
 
 export class UiRoutes {
   private metadata = new Metadata();
   private fleet: UiFleet;
+  private projections = new WeakMap<Awaited<ReturnType<ContextService["load"]>>, ReturnType<typeof upstreamOf>>();
   constructor(private service: ContextService) {
     this.fleet = new UiFleet(service);
     void service.pricing.refresh();
   }
-  clear() { this.metadata.clear(); this.fleet.clear(); }
+  clear() { this.metadata.clear(); this.fleet.clear(); this.projections = new WeakMap(); }
+  private project(data: Awaited<ReturnType<ContextService["load"]>>) {
+    let projection = this.projections.get(data);
+    if (!projection) { projection = upstreamOf(data); this.projections.set(data, projection); }
+    return projection;
+  }
   private async load(id: string, paseo: PaseoApi) {
     const data = await this.service.load(await this.service.agent(id, paseo), paseo);
-    return { ...data, ...upstreamOf(data) };
+    return { ...data, ...this.project(data) };
   }
   async handle(route: string, input: unknown, paseo: PaseoApi): Promise<unknown> {
     const body = record(input), id = text(body.sessionId ?? body.agentId);
     if (route === "ui.document") return uiDocument();
+    if (route === "ui.grammar") return grammarOf(text(body.name));
     if (route === "ui.error") {
       console.error("[paseo-context] UI error:", text(body.message).slice(0, 16000));
       return true;
@@ -39,20 +48,30 @@ export class UiRoutes {
       return true;
     }
     if (route === "bootstrap") {
-      const sessions = (await listAgents(paseo)).map((a) => rowOf(agentOf(a)));
-      const selected = id ? await this.load(id, paseo) : null;
-      if (selected) {
-        const family = await this.fleet.read(id, paseo, selected);
-        for (const row of this.fleet.rows(family)) {
-          const index = sessions.findIndex((a) => a.id === row.id);
-          if (index < 0) sessions.push(row); else sessions[index] = row;
-        }
-      }
-      return { sessions, selected: selected ? { head: selected.head, headers: selected.headers,
-        ...(body.mode === "statistics" ? { statistics: statisticsOf(selected) } : {}), notices: selected.summary.notices } : null };
+      // Settings are local. Insights fetch their own corpus. Neither needs a
+      // selected session or a directory bootstrap.
+      if (body.mode === "settings" || body.mode === "insights") return { sessions: [], selected: null };
+      const data = id ? await this.service.load(await this.service.agent(id, paseo), paseo) : null;
+      if (!data) return { sessions: [], selected: null };
+      let sessions = body.mode === "fleet"
+        ? this.fleet.rows(await this.fleet.read(id, paseo, data))
+        : body.mode === "statistics" ? [rowOf(data.agent)] : (await this.service.directory(paseo)).map((raw) => rowOf(agentOf(raw)));
+      const familyRevision = createHash("sha256").update(JSON.stringify(sessions)).digest("hex");
+      if (familyRevision && body.familyRevision === familyRevision) sessions = [];
+      if (body.revision === data.revision) return { sessions, familyRevision, selected: { unchanged: true, revision: data.revision } };
+      if (body.mode === "statistics") return { sessions, familyRevision, selected: {
+        revision: data.revision, statistics: statisticsOf(data), notices: data.summary.notices,
+      } };
+      // Keep a version for delta invalidation while marking a complete
+      // projection so the upstream reader does not fetch the same facts again.
+      const { head, headers } = this.project(data);
+      const fullHead = { ...head, paseoComplete: true };
+      return { sessions, familyRevision, selected: { revision: data.revision,
+        head: body.mode === "fleet" ? graphHeadOf(head) : fullHead,
+        headers: body.mode === "fleet" ? { headers: [] } : headers, notices: data.summary.notices } };
     }
     if (route === "family") {
-      return this.fleet.rows(await this.fleet.read(id, paseo));
+      return this.fleet.rows(await this.fleet.read(id, paseo, undefined, body.tasks !== false));
     }
     if (route === "statistics.details") {
       const data = await this.service.load(await this.service.agent(id, paseo), paseo);
@@ -121,7 +140,7 @@ export class UiRoutes {
     if (name === "heads") {
       const out: Record<string, unknown> = {};
       for (const id of Array.isArray(body.ids) ? body.ids.filter((v): v is string => typeof v === "string").slice(0, 64) : []) {
-        try { out[id] = { head: (await this.load(id, paseo)).head }; } catch {}
+        try { out[id] = { head: graphHeadOf((await this.load(id, paseo)).head) }; } catch {}
       }
       return { ok: true, value: out };
     }
@@ -130,7 +149,7 @@ export class UiRoutes {
     const data = await this.load(id, paseo), { head, headers } = data;
     const rev = head.detailRev ?? 0;
     if (name === "snapshot") return { ok: true, value: head };
-    if (name === "detail") return { ok: true, value: { ...head, head, rev } };
+    if (name === "detail") return { ok: true, value: body.head === true ? { head: graphHeadOf(head), rev } : { ...head, head, rev } };
     if (name === "facts") {
       const wanted = Array.isArray(body.parts) ? body.parts : ["head", "series"];
       const parts: Record<string, unknown> = {};

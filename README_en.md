@@ -55,6 +55,8 @@ Sidebar-only placement opens Context in Explorer and automatically adds only Fle
 
 Prompt prefix/suffix settings apply to **new agents' systemPrompt**. They do not rewrite existing agents or dynamically modify each provider request; Paseo has no equivalent dynamic system-section hook.
 
+Pages fetch only their required data. Context paints the selected session before independently completing family costs; Fleet transfers graph summaries and reads full messages on demand; Statistics loads only its original table data. Unchanged sessions skip full retransmission and redraws, hidden documents pause page polling, and Settings does not poll sessions. Syntax grammars load through the local host on demand with all original languages retained. Public pricing requests do not block dashboard startup.
+
 ## Data and limits
 
 The daemon reads complete local Codex rollout and Claude Code JSONL records when available, preserving historical billed requests, compaction replacement history, rollbacks and tool results. Other providers and sessions without native logs use paginated Paseo timeline fallback.

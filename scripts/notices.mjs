@@ -2,10 +2,10 @@ import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 export async function writeNotices(metafile) {
-  const names = [...new Set(Object.keys(metafile.inputs).flatMap((path) => {
+  const names = [...new Set(["@shikijs/langs", ...Object.keys(metafile.inputs).flatMap((path) => {
     const match = /node_modules\/((?:@[^/]+\/)?[^/]+)/.exec(path);
     return match ? [match[1]] : [];
-  }))].sort();
+  })])].sort();
   const sections = [
     "# Third-party notices",
     "Paseo Context derives from bowenliang123/dsh-context under Apache-2.0. Its LICENSE and NOTICE are included in this distribution.",

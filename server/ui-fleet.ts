@@ -115,13 +115,50 @@ export function fleetRow(agent: Agent, team: AgentTeam, head?: ContextTimeline) 
   const row = rowOf(agent, head);
   return { ...row, projectionValues: { ...row.projectionValues, agentTeam: team } };
 }
+/** The graph consumes headline metrics and counts, not context item bodies. */
+export function graphHeadOf(head: ContextTimeline): ContextTimeline {
+  const { detailRev: _revision, ...rest } = head;
+  return { ...rest, nodes: [], archive: [], requests: [], events: [], systems: [], fileOps: [], commands: [], spans: [] };
+}
 
 export class UiFleet {
   private subtasks = new PaseoSubtasks();
+  private recent = new Map<string, { at: number; revision?: number; pending: Promise<FleetRead> }>();
+  private timers = new Set<ReturnType<typeof setTimeout>>();
+  private closed = false;
+  private heads = new WeakMap<Loaded, ContextTimeline>();
   constructor(private service: Pick<ContextService, "agent" | "load" | "fleet" | "content">) {}
-  clear() { this.subtasks.clear(); }
+  clear() {
+    this.closed = true; this.subtasks.clear(); this.recent.clear(); this.heads = new WeakMap();
+    for (const timer of this.timers) clearTimeout(timer);
+    this.timers.clear();
+  }
 
-  async read(id: string, paseo: PaseoApi, seed?: Loaded): Promise<FleetRead> {
+  async read(id: string, paseo: PaseoApi, seed?: Loaded, includeSubtasks = true): Promise<FleetRead> {
+    const key = `${id}:${includeSubtasks}`;
+    const known = this.recent.get(key);
+    if (known && Date.now() - known.at < 1000 && (!seed || known.revision === seed.revision)) return known.pending;
+    const entry = { at: Infinity, revision: seed?.revision, pending: this.readFamily(id, paseo, seed, includeSubtasks) };
+    if (!this.closed) {
+      for (const [key, value] of this.recent) if (Date.now() - value.at >= 1000) this.recent.delete(key);
+      this.recent.delete(key); this.recent.set(key, entry);
+      while (this.recent.size > 4) this.recent.delete(this.recent.keys().next().value!);
+    }
+    try { return await entry.pending; }
+    catch (error) { if (this.recent.get(key) === entry) this.recent.delete(key); throw error; }
+    finally {
+      // Retain only a brief burst of concurrent graph/summary/batch requests.
+      if (!this.closed && this.recent.get(key) === entry) {
+        entry.at = Date.now();
+        const timer = setTimeout(() => {
+          this.timers.delete(timer);
+          if (this.recent.get(key) === entry) this.recent.delete(key);
+        }, 1000);
+        this.timers.add(timer); timer.unref();
+      }
+    }
+  }
+  private async readFamily(id: string, paseo: PaseoApi, seed?: Loaded, includeSubtasks = true): Promise<FleetRead> {
     const family = await this.service.fleet(id, paseo), candidates = family.members.map((s) => s.agent);
     if (seed && !candidates.some((a) => a.id === seed.agent.id)) candidates.push(seed.agent);
     const bySession = new Map<string, Agent>();
@@ -135,14 +172,14 @@ export class UiFleet {
     const loaded = new Map<string, Loaded>(), failed = new Set<string>();
     await mapBounded(agents, async (agent) => {
       try {
-        const data = seed && identity(seed.agent) === identity(agent) ? { ...seed, agent }
+        const data = seed && identity(seed.agent) === identity(agent) ? seed.agent.id === agent.id ? seed : { ...seed, agent }
           : await this.service.load(await this.service.agent(agent.id, paseo), paseo);
         loaded.set(agent.id, data);
       } catch { failed.add(agent.id); }
     });
     const subtasks = new Map<string, PaseoSubtask[]>();
     let subtaskFailures = 0;
-    await mapBounded(agents.filter((agent) => !agent.id.startsWith("native:")), async (agent) => {
+    await mapBounded(includeSubtasks ? agents.filter((agent) => !agent.id.startsWith("native:")) : [], async (agent) => {
       try { subtasks.set(agent.id, await this.subtasks.read(agent.id, agent.updatedAt, paseo)); }
       catch { subtaskFailures++; }
     });
@@ -152,7 +189,8 @@ export class UiFleet {
     const team = teamOfFleet(family);
     return family.agents.map((agent) => {
       const data = family.loaded.get(agent.id);
-      return fleetRow(agent, team, data ? upstreamOf(data).head : undefined);
+      if (data && !this.heads.has(data)) this.heads.set(data, graphHeadOf(upstreamOf(data).head));
+      return fleetRow(agent, team, data ? this.heads.get(data) : undefined);
     });
   }
   private delegations(family: FleetRead, data: Loaded): FleetDelegation[] {

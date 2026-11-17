@@ -6,6 +6,8 @@ import { copyText, Modal } from "@getpaseo/plugin/client/ui";
 import { bridgeRpc } from "../shared/bridge";
 import { preferences } from "../shared/contracts";
 import { messages } from "./messages";
+import { useQuery } from "@tanstack/react-query";
+import { uiRevision } from "../shared/generated/ui-revision";
 
 type Props = PluginSurfaceProps & {
   mode: "context" | "fleet" | "statistics" | "insights" | "settings" | "modal";
@@ -36,6 +38,16 @@ function NativeFrameBody(props: Props) {
   latest.current = { props, settings, locale, rpc };
   const nonce = useMemo(() => `native${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`, []);
   const [html, setHtml] = useState(""), [error, setError] = useState("");
+  // Paseo supplies a query client per installation/host. All three tabs reuse
+  // the static document without sharing session data across connections.
+  const markupQuery = useQuery({
+    queryKey: ["paseo-context", "ui.document", uiRevision], staleTime: Infinity, gcTime: 120000,
+    queryFn: async () => {
+      const value = await rpc({ route: "ui.document", payload: {} });
+      if (typeof value !== "string") throw new Error("Invalid UI document");
+      return value;
+    },
+  });
   const report = (phase: string) => {
     if (reported.current.has(phase)) return;
     reported.current.add(phase);
@@ -59,15 +71,15 @@ function NativeFrameBody(props: Props) {
   useEffect(() => {
     mounted.current = true;
     report("mounted");
-    void rpc({ route: "ui.document", payload: {} }).then((value) => {
-      if (!mounted.current) return;
-      if (typeof value !== "string") throw new Error("Invalid UI document");
-      const markup = value.replaceAll("%%PASEO_CONTEXT_NONCE%%", nonce);
-      setHtml(Platform.OS === "android" ? markup.replace("globalThis.__PASEO_CONTEXT_NONCE__=",
-        'globalThis.__PASEO_CONTEXT_TRANSPORT__="history";globalThis.__PASEO_CONTEXT_NONCE__=') : markup);
-    }).catch((error: unknown) => { if (mounted.current) setError(error instanceof Error ? error.message : String(error)); });
     return () => { mounted.current = false; };
-  }, [rpc, nonce]);
+  }, []);
+  useEffect(() => {
+    if (markupQuery.error) setError(markupQuery.error.message);
+    if (!markupQuery.data) return;
+    const markup = markupQuery.data.replaceAll("%%PASEO_CONTEXT_NONCE%%", nonce);
+    setHtml(Platform.OS === "android" ? markup.replace("globalThis.__PASEO_CONTEXT_NONCE__=",
+      'globalThis.__PASEO_CONTEXT_TRANSPORT__="history";globalThis.__PASEO_CONTEXT_NONCE__=') : markup);
+  }, [markupQuery.data, markupQuery.error, nonce]);
   useEffect(initialize, [settings.status === "ready" ? settings.revision : "", locale, props.mode, props.agentId, props.theme.colors.surface0]);
   const receive = (event: { nativeEvent: { data: string } }) => {
     let data: any;

@@ -27,6 +27,8 @@ Native usage and timestamp boundary handling also reference the MIT CC Switch im
 
 Adapt changes in the upstream DTO contract at `server/upstream.ts`, `server/ui-routes.ts` and the fleet adapter, rather than modifying visual components to fit incomplete data. Native record adaptation lives in `server/fold.ts`, `server/normalize.ts` and `server/reader.ts`.
 
+The offline build rewrites the vendored primitive's grammar imports in `scripts/grammars.mjs`: all 60 grammar modules become compressed JSON in the server bundle and load through the nonce-bound data bridge only when requested. No language support or original CSS is removed. Check this seam when updating the vendored module. Complete Context projections retain `detailRev` for delta invalidation and carry `paseoComplete` so `timelineSource.ts` skips redundant fact reads. Graph projections intentionally omit body arrays; full detail/facts/history routes remain available. Context family costs refresh independently after the selected session, without reading Paseo subtasks on that path.
+
 ```sh
 npm ci --ignore-scripts
 npm run check

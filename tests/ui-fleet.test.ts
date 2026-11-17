@@ -46,6 +46,7 @@ function harness(fixtures: Session[], unread: string[] = []) {
       if (!fixture) throw new Error("Missing session");
       return raw(fixture);
     }),
+    directory: vi.fn(async () => fixtures.map(raw)),
     load: vi.fn(async (agent: PaseoAgent) => {
       if (unread.includes(agent.id)) throw new Error("Unread session");
       const fixture = byId.get(agent.id);
@@ -148,6 +149,25 @@ describe("Fleet communication contract", () => {
 });
 
 describe("Captured task projections", () => {
+  test("coalesces fleet bootstrap and detail bursts while retaining graph totals and live task changes", async () => {
+    const root = session("root", "root-native"), child = session("child", "child-native", "root");
+    root.message("user", "The graph does not need this body");
+    const { service, fleet, paseo } = harness([root, child]);
+    const [first, second] = await Promise.all([fleet.read("root", paseo), fleet.read("root", paseo)]);
+    expect(first).toBe(second);
+    expect(service.fleet).toHaveBeenCalledTimes(1);
+    const head = fleet.rows(first)[0].projectionValues.contextTimeline!;
+    expect(head.nodes).toEqual([]);
+    expect(head.requests).toEqual([]);
+    expect(head.current.total).toBeGreaterThan(0);
+    expect(head.counts?.turns).toBe(1);
+    const plan = root.call("update_plan", { plan: [{ step: "New live task", status: "in_progress" }] });
+    root.result(plan.callId, "Plan updated");
+    const updated = await fleet.read("root", paseo, root.data());
+    expect(teamOfFleet(updated).tasks[0].subject).toBe("New live task");
+    expect(service.fleet).toHaveBeenCalledTimes(2);
+    fleet.clear();
+  });
   test("reduces successful task updates and preserves subjects, ownership and dependencies", async () => {
     const root = session("root", "root-native"), child = session("child", "child-native", "root");
     const first = root.call("TaskCreate", { subject: "Inspect input", description: "Read the source" });
@@ -189,7 +209,7 @@ describe("Captured task projections", () => {
     const plan = root.call("update_plan", { plan: [{ step: "Captured work", status: "pending" }] });
     root.result(plan.callId, "Plan updated");
     const { service, paseo } = harness([root, child]), routes = new UiRoutes(service);
-    const bootstrap = await routes.handle("bootstrap", { agentId: "root" }, paseo) as {
+    const bootstrap = await routes.handle("bootstrap", { agentId: "root", mode: "fleet" }, paseo) as {
       sessions: Array<{ id: string; projectionValues: { agentTeam: { tasks: Array<{ subject: string }> } } }>;
     };
     expect(bootstrap.sessions.find((row) => row.id === "root")?.projectionValues.agentTeam.tasks[0].subject).toBe("Captured work");

@@ -3,7 +3,7 @@ import { recomsOfPayload } from "../shared/core/recoms";
 import { recommendations } from "../shared/recommendations";
 import { record, text } from "./value";
 
-export const VERSION = "0.2.1";
+export const VERSION = "0.2.2";
 export class Metadata {
   private cache = new Map<string, { at: number; value: unknown }>();
   private busy = new Map<string, Promise<unknown>>();

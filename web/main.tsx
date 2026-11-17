@@ -19,6 +19,7 @@ import { action, call, send } from "./bridge";
 import { makeStatisticsView } from "./statistics";
 import { reportedUsageOf } from "../shared/usage";
 import { hostMessage } from "./host-messages";
+import { PageLoader } from "./page-loader";
 import "../web/vendor/theme/theme.css";
 import "../.tmp/web/tailwind.css";
 import "../src/client/styles/base.css";
@@ -52,7 +53,7 @@ document.addEventListener("click", (event) => {
   if (/^https?:\/\//.test(url)) { event.preventDefault(); action("openExternal", { url }); }
 });
 
-type State = { byId: Record<string, any>; selected: any; current: string; locale: string; mode: string; preferences: Record<string, unknown>; image: { src: string; name: string; text?: string; note?: string } | null };
+type State = { byId: Record<string, any>; selected: any; familyRevision?: string; current: string; locale: string; mode: string; preferences: Record<string, unknown>; image: { src: string; name: string; text?: string; note?: string } | null };
 let state: State = { byId: {}, selected: null, current: "", locale: "en", mode: "context", preferences: {}, image: null };
 const listeners = new Set<() => void>(), cleanups: Array<() => void> = [];
 const subscribe = (listener: () => void) => { listeners.add(listener); return () => { listeners.delete(listener); }; };
@@ -64,15 +65,33 @@ const t = (key: string, params: Record<string, string | number> = {}) => {
   return value;
 };
 const locale = { bind: () => t, register: () => () => {}, getLocale: () => ({ active: state.locale.split("-")[0] }), subscribe };
+let familyRead: AbortController | null = null;
 const sessions = {
   list: { getSnapshot: () => state, subscribe },
-  getSnapshot: () => state, subscribe, refresh: async () => refresh(),
-  scope: () => ({ bail: (_subject: unknown, _event: string, payload: any) => { if (payload?.view) publish({ mode: payload.view === "context-fleet" ? "fleet" : "context" }); } }),
+  getSnapshot: () => state, subscribe, refresh: async () => loader.refresh(),
+  scope: () => ({ bail: (_subject: unknown, _event: string, payload: any) => {
+    if (!payload?.view) return;
+    const mode = payload.view === "context-fleet" ? "fleet" : "context";
+    familyRead?.abort(); familyRead = null;
+    publish({ mode, selected: null, familyRevision: undefined });
+    loader.configure({ agentId: state.current, mode });
+  } }),
   refreshSubagents: async (sessionId: string) => {
-    const family = await call("family", { agentId: sessionId });
-    publish({ byId: { ...state.byId, ...Object.fromEntries(family.map((row: any) => [row.id, row])) } });
+    if (familyRead || document.hidden) return;
+    const controller = new AbortController(), mode = state.mode;
+    familyRead = controller;
+    try {
+      const family = await call("family", { agentId: sessionId, tasks: mode === "fleet" }, { signal: controller.signal });
+      if (controller.signal.aborted || sessionId !== state.current || mode !== state.mode || stopped) return;
+      const stamp = JSON.stringify(family);
+      if (stamp === familyStamp) return;
+      familyStamp = stamp;
+      publish({ byId: { ...state.byId, ...Object.fromEntries(family.map((row: any) => [row.id, row])) } });
+    } catch {}
+    finally { if (familyRead === controller) familyRead = null; }
   },
 };
+let familyStamp = "";
 const scope = {
   getSnapshot: () => ({ status: "ready", value: state.preferences, writable: true }),
   subscribe,
@@ -139,6 +158,7 @@ function App() {
   if (s.mode === "insights") return <Overview useSessions={useSessions} />;
   if (s.mode === "settings") return <div className="pc-settings"><Config useContextSettings={(selector) => useSyncExternalStore(settings.store.subscribe, () => selector(settings.store.getSnapshot()))} set={(field, value) => settings.set(field, value)} /></div>;
   if (!s.current) return <div className="pc-status">{t("trend.empty")}</div>;
+  if (!s.selected) return <div className="pc-status" role="status">{s.locale.startsWith("zh") ? "正在加载…" : "Loading…"}</div>;
   const props = { sessionId: s.current, useProjection };
   if (s.mode === "statistics") return <Statistics key={s.current} {...props} locale={s.locale} snapshot={s.selected?.statistics ?? null} />;
   if (s.mode === "modal") return <ContextModal {...props} useContextModal={(selector) => useSyncExternalStore(modalStoreOf(s.current).subscribe, () => selector(modalStoreOf(s.current).getSnapshot()))} />;
@@ -158,39 +178,56 @@ function ImagePreview() {
     </div>
   </div>;
 }
-async function refresh() {
-  const current = state.current, mode = state.mode;
-  const result = await call("bootstrap", { agentId: current, mode });
-  if (stopped || current !== state.current || mode !== state.mode) return;
-  const byId = { ...state.byId, ...Object.fromEntries(result.sessions.map((row: any) => [row.id, row])) };
-  const selected = result.selected;
-  if (selected && state.current) {
-    const head = selected.head;
-    byId[state.current] = { ...byId[state.current], projectionValues: {
-      ...byId[state.current]?.projectionValues,
-      contextTimeline: head, contextHeaders: selected.headers,
-      contextPressure: { pressureTokens: head.last?.prompt, contextWindow: head.contextWindow },
-      tokenUsage: reportedUsageOf(head),
-    } };
-  }
-  publish({ byId, selected });
-  send({ type: "paseo-context:status", nonce: (globalThis as any).__PASEO_CONTEXT_NONCE__, phase: "rendered" });
-  const error = document.getElementById("pc-error");
-  if (error) error.textContent = "";
-}
-let timer: ReturnType<typeof setTimeout> | null = null, stopped = false, started = false;
-let modalSession: string | null = null, modalOff: (() => void) | null = null;
-async function poll() {
-  try { await refresh(); }
-  catch (error) {
+let stopped = false, rendered = false;
+const loader = new PageLoader({
+  read: ({ agentId, mode }, signal) => call("bootstrap", {
+    agentId, mode, revision: state.selected?.revision, familyRevision: state.familyRevision,
+  }, { signal }),
+  accept: (_target, result) => {
+    const selected = result.selected?.unchanged ? state.selected : result.selected;
+    // No state publication means no chart/table reconstruction for an idle session.
+    if (selected !== state.selected || result.familyRevision !== state.familyRevision) {
+      const byId = { ...state.byId, ...Object.fromEntries(result.sessions.map((row: any) => [row.id, {
+        ...row, projectionValues: { ...state.byId[row.id]?.projectionValues, ...row.projectionValues },
+      }])) };
+      if (selected?.head && state.current) {
+        const head = selected.head;
+        byId[state.current] = { ...byId[state.current], projectionValues: {
+          ...byId[state.current]?.projectionValues,
+          contextTimeline: head, contextHeaders: selected.headers,
+          contextPressure: { pressureTokens: head.last?.prompt, contextWindow: head.contextWindow },
+          tokenUsage: reportedUsageOf(head),
+        } };
+      }
+      publish({ byId, selected, familyRevision: result.familyRevision });
+    }
+    if (!rendered) {
+      rendered = true;
+      send({ type: "paseo-context:status", nonce: (globalThis as any).__PASEO_CONTEXT_NONCE__, phase: "rendered" });
+    }
+    const error = document.getElementById("pc-error");
+    if (error) error.textContent = "";
+    if (state.mode === "context" || state.mode === "modal") {
+      // Headline and browser paint first; family costs follow independently.
+      requestAnimationFrame(() => {
+        if (!stopped && (state.mode === "context" || state.mode === "modal")) void sessions.refreshSubagents(state.current);
+      });
+    }
+  },
+  error: (error) => {
     const root = document.getElementById("pc-error");
     if (root) root.textContent = error instanceof Error ? error.message : String(error);
-  } finally { if (!stopped) timer = setTimeout(poll, 5000); }
-}
+  },
+});
+let modalSession: string | null = null, modalOff: (() => void) | null = null;
 window.addEventListener("message", (event) => {
   if (event.source !== parent || event.data?.type !== "paseo-context:init" || event.data?.nonce !== (globalThis as any).__PASEO_CONTEXT_NONCE__) return;
   const current = event.data.agentId || "";
-  publish({ current, ...(current !== state.current ? { selected: null, image: null } : {}), locale: event.data.locale || "en", mode: event.data.mode || "context", preferences: event.data.preferences || {} });
+  const mode = event.data.mode || "context";
+  if (current !== state.current || mode !== state.mode) {
+    familyRead?.abort(); familyRead = null; familyStamp = "";
+  }
+  publish({ current, ...(current !== state.current || mode !== state.mode ? { selected: null, image: null, byId: {}, familyRevision: undefined } : {}), locale: event.data.locale || "en", mode, preferences: event.data.preferences || {} });
   const modalTarget = state.mode === "modal" ? state.current : null;
   if (modalTarget !== modalSession) {
     modalOff?.(); modalOff = null;
@@ -205,10 +242,20 @@ window.addEventListener("message", (event) => {
   }
   if (state.mode !== "modal") document.body.style.background = "";
   if (event.data.dark) document.body.setAttribute("data-ds-dark-theme", ""); else document.body.removeAttribute("data-ds-dark-theme");
-  if (!started) { started = true; void poll(); }
+  loader.configure({ agentId: current, mode });
+  if ((mode === "settings" || mode === "insights") && !rendered) {
+    rendered = true;
+    send({ type: "paseo-context:status", nonce: (globalThis as any).__PASEO_CONTEXT_NONCE__, phase: "rendered" });
+  }
+});
+loader.visibility(!document.hidden);
+document.addEventListener("visibilitychange", () => {
+  loader.visibility(!document.hidden);
+  if (document.hidden) { familyRead?.abort(); familyRead = null; }
 });
 window.addEventListener("pagehide", () => {
-  stopped = true; if (timer) clearTimeout(timer);
+  stopped = true; loader.dispose();
+  familyRead?.abort(); familyRead = null;
   modalOff?.(); modalOff = null;
   if (modalSession) modalStoreOf(modalSession).set(false);
   for (const cleanup of cleanups.splice(0)) cleanup();
