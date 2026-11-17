@@ -1,6 +1,6 @@
 Paseo Context shows context composition, request history, usage trends, file and command activity, and agent collaboration. It reuses the current dsh-context interface and its multicolor palette, with light/dark styles and eight UI languages.
 
-Open Context or Fleet from an agent panel, use the Context composer button or `/context`, or open Context Insights from the sidebar for cross-session usage and date filters.
+The Context composer button and `/context` open a native workspace tab bound to the current agent. `/context fleet` opens Fleet, `/context modal` opens the modal, and Context Insights in the sidebar provides cross-session usage and date filters. Desktop's workspace tab menu also offers Context and Fleet. These tabs sit alongside agents and files; Paseo has no plugin slot for permanent tabs inside a conversation. Sidebar-only placement opens Explorer instead.
 
 Requires Paseo 0.15.4 or newer and Node.js 22+ on the daemon. The original interactive UI supports Desktop, web and native iOS/iPadOS, including narrow layouts. Android's separate message bridge is experimental.
 

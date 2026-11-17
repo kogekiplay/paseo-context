@@ -13,7 +13,17 @@ export default function contribute(client: PluginClientContext) {
   const touched = new Set<string>();
   const openModal = (id: string) => client.openScreen({ screenId: "context", params: { agentId: id, mode: "modal" } });
   const openSettings = () => client.openSettings("preferences");
-  const openContext = (agentId: string) => client.openScreen({ screenId: "context", params: { agentId } });
+  async function openAgentPanel(panel: "context" | "fleet", agentId: string, workspaceId?: string) {
+    await ready;
+    if (lifetime.signal.aborted) return;
+    const workspace = workspaceId ?? agents.get(agentId)?.workspaceId;
+    const available = panel === "context" ? options && options.defaultPlacement !== "hide" : options?.fleetTab;
+    if (workspace && available && !agentId.startsWith("native:")) {
+      client.openPanel(panel, { workspaceId: workspace, agentId,
+        location: panel === "context" && options?.defaultPlacement === "sidebar" ? "explorer" : "workspace" });
+    } else client.openScreen({ screenId: "context", params: { agentId, mode: panel } });
+  }
+  const openContext = (agentId: string, workspaceId?: string) => openAgentPanel("context", agentId, workspaceId);
   const common = { openSettings, openContext };
   function usePreferences() {
     const settings = useSettings(preferences);
@@ -25,7 +35,7 @@ export default function contribute(client: PluginClientContext) {
   function Screen(props: PluginScreenProps) {
     usePreferences();
     const modal = props.params.mode === "modal", id = props.params.agentId;
-    return <FrameSurface {...props} {...common} mode={modal ? "modal" : "context"} agentId={id} overlay={modal}
+    return <FrameSurface {...props} {...common} mode={modal ? "modal" : props.params.mode === "fleet" ? "fleet" : "context"} agentId={id} overlay={modal}
       onClose={() => id && (id.startsWith("native:") || !props.navigation ? openContext(id) : props.navigation.openAgent({ agentId: id }))} />;
   }
   function Insights(props: PluginScreenProps) { usePreferences(); return <FrameSurface {...props} {...common} mode="insights" />; }
@@ -56,14 +66,17 @@ export default function contribute(client: PluginClientContext) {
   client.addSettingsScreen({ id: "preferences", title: messages.message("settings"), icon: "Settings", Component: Settings });
   client.addCommandCenterItem({ id: "insights", title: messages.message("insights"), icon: "ChartNoAxesCombined", context: "global",
     onSelect: ({ openScreen }) => openScreen({ screenId: "insights" }) });
-  client.addCommandCenterItem({ id: "context", title: messages.message("context"), icon: "ChartNoAxesCombined", context: "agent", onSelect: ({ agent }) => openContext(agent.id) });
-  client.addCommandCenterItem({ id: "fleet", title: messages.message("fleet"), icon: "Network", context: "agent", onSelect: ({ openPanel }) => openPanel("fleet") });
+  client.addCommandCenterItem({ id: "context", title: messages.message("context"), icon: "ChartNoAxesCombined", context: "agent", onSelect: ({ agent, workspace }) => openContext(agent.id, workspace.id) });
+  client.addCommandCenterItem({ id: "fleet", title: messages.message("fleet"), icon: "Network", context: "agent", onSelect: ({ agent, workspace }) => openAgentPanel("fleet", agent.id, workspace.id) });
   client.addCommandCenterItem({ id: "preferences", title: messages.message("settings"), icon: "Settings", context: "global", onSelect: ({ openSettings }) => openSettings("preferences") });
-  client.addSlashCommand({ name: "context", description: messages.message("context"), argumentHint: "[current | fleet | insights]", context: "agent",
-    onSubmit: ({ args, agent, openPanel, openScreen }) => {
-      if (args === "fleet") openPanel("fleet"); else if (args === "insights") openScreen({ screenId: "insights" }); else openModal(agent.id);
+  client.addSlashCommand({ name: "context", description: messages.message("context"), argumentHint: "[current | fleet | insights | modal]", context: "agent",
+    onSubmit: ({ args, agent, workspace, openScreen }) => {
+      if (args === "fleet") return openAgentPanel("fleet", agent.id, workspace.id);
+      if (args === "insights") openScreen({ screenId: "insights" });
+      else if (args === "modal") openModal(agent.id);
+      else return openContext(agent.id, workspace.id);
     } });
-  void client.rpc(preferencesRpc, {}).then((values) => { if (!lifetime.signal.aborted) updatePanels(values); }).catch((error) => {
+  const ready = client.rpc(preferencesRpc, {}).then((values) => { if (!lifetime.signal.aborted && !options) updatePanels(values); }).catch((error) => {
     if (!lifetime.signal.aborted) console.error("[paseo-context] Preferences could not be loaded", error);
   });
   function register(agent: { id: string; workspaceId?: string; archivedAt?: string | null }) {
@@ -72,7 +85,7 @@ export default function contribute(client: PluginClientContext) {
     if (!agent.workspaceId || agent.archivedAt || lifetime.signal.aborted || options?.defaultPlacement === "hide") return;
     pills.set(agent.id, client.addComposerPill({ id: "context", workspaceId: agent.workspaceId, agentId: agent.id,
       button: { title: messages.message("context"), label: messages.message("context"), icon: "ChartNoAxesCombined",
-        behavior: { kind: "action", onPress: () => openModal(agent.id) } } }));
+        behavior: { kind: "action", onPress: () => openContext(agent.id) } } }));
   }
   async function reconcile(first: Awaited<ReturnType<typeof client.paseo.agents.list>>) {
     const version = ++generation;

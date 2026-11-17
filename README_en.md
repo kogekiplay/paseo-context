@@ -42,8 +42,10 @@ After editing, build again and run `paseo plugin reload paseo-context`.
 - File activity and commands: reads, writes, searches, counts, line changes, failures, duration and background process state.
 - Fleet: agent network, communication timeline, delegations, captured tasks/dependencies, prompts and replies.
 - Context Insights: session usage, date ranges, heatmap, skill/tool/program rankings, search, archive and directory filters.
-- Composer context button, `/context`, `/context fleet`, `/context insights`, and Command Center entries.
+- The Context composer button, `/context` and the Context Command Center entry open a workspace tab bound to the current agent. `/context fleet` opens a Fleet tab, `/context insights` opens cross-session insights, and `/context modal` opens the modal.
 - Original preferences for placement, fleet/insights visibility, date range, granularity, comparison baseline and sorting.
+
+On desktop, the workspace tab bar's **+** menu also offers Context and Fleet. These are native Paseo workspace tabs alongside agents, terminals and files, bound to the agent they were opened for. Paseo currently exposes no equivalent to DSH's permanent tabs inside a conversation. Sidebar-only placement opens Context in Explorer; explicit commands fall back to a standalone page when the corresponding panel is hidden.
 
 Prompt prefix/suffix settings apply to **new agents' systemPrompt**. They do not rewrite existing agents or dynamically modify each provider request; Paseo has no equivalent dynamic system-section hook.
 
