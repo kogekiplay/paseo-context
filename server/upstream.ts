@@ -4,6 +4,7 @@ import type { ContextService } from "./service";
 import { toolKind } from "./normalize";
 import type { ContextFold } from "./fold";
 import { spansOf, timingOf } from "./timing";
+import { reportedUsageOf } from "../shared/usage";
 export { timingOf } from "./timing";
 
 export const seqOf = (id: number) => id * 10 + 2;
@@ -24,23 +25,14 @@ export function costOf(s: Summary): SessionCostUsage {
 export function rowOf(a: Agent, head?: ContextTimeline) {
   return { id: a.id, title: a.title, displayTitle: a.title, cwd: a.cwd, createdAt: a.createdAt, updatedAt: a.updatedAt,
     running: a.running, blank: false, archived: a.archived, ...(a.parentId ? { parentId: a.parentId, origin: "subagent" } : {}),
-    projectionValues: head ? { contextTimeline: head, tokenUsage: usageOf(head), contextPressure: {
+    projectionValues: head ? { contextTimeline: head, tokenUsage: reportedUsageOf(head), contextPressure: {
       pressureTokens: head.last?.prompt, contextWindow: head.contextWindow,
     }, subagentTiming: { settledMs: head.timing?.wallMs ?? 0 } } : {} };
-}
-export function usageOf(head: ContextTimeline) {
-  let uncachedInputTokens = 0, outputTokens = 0, cacheReadTokens = 0, cacheWriteTokens = 0;
-  for (const models of Object.values(head.cost ?? {})) for (const model of Object.values(models)) {
-    for (const u of [model.off, model.peak]) {
-      if (!u) continue;
-      uncachedInputTokens += u.uncached; outputTokens += u.output; cacheReadTokens += u.cacheRead; cacheWriteTokens += u.cacheWrite;
-    }
-  }
-  return { uncachedInputTokens, outputTokens, cacheReadTokens, cacheWriteTokens };
 }
 export type Loaded = Awaited<ReturnType<ContextService["load"]>>;
 export function upstreamOf(data: Loaded): { head: ContextTimeline; headers: ContextHeaders } {
   const { summary: s, fold } = data;
+  const hasUsage = data.requests.length > 0 && !s.notices.includes("usage-unavailable") && s.source !== "unavailable";
   const all: SurfaceNode[] = fold.nodes.filter((n) => n.category !== "system" && n.category !== "tools").map((n) => ({
     seq: nodeSeq(fold, n.id), time: n.time, cat: n.category === "reasoning" || n.category === "calls" ? "assistant" : n.category as SurfaceNode["cat"],
     tokens: n.tokens, ...(n.category === "reasoning" ? { reasoning: n.tokens } : {}),
@@ -64,8 +56,8 @@ export function upstreamOf(data: Loaded): { head: ContextTimeline; headers: Cont
     turnSteps.set(r.turn, step);
     return {
     ...currentOf(r.parts), seq: r.seq ?? r.boundary * 10 + 1 - 1 / (r.index + 1),
-    time: r.time, total: Object.values(r.parts).reduce((a, b) => a + b, 0), prompt: r.usage.input,
-    output: r.usage.output, cacheRead: r.usage.cacheRead, turn: r.turn, step,
+    time: r.time, total: Object.values(r.parts).reduce((a, b) => a + b, 0),
+    ...(hasUsage ? { prompt: r.usage.input, output: r.usage.output, cacheRead: r.usage.cacheRead } : {}), turn: r.turn, step,
     ...(r.duration === null ? {} : { activeMs: r.duration }),
   }; });
   const head: ContextTimeline = {
@@ -102,7 +94,7 @@ export function upstreamOf(data: Loaded): { head: ContextTimeline; headers: Cont
     commandStats: { runs: fold.commands.length, failed: fold.commands.filter((c) => c.status === "failed").length,
       ms: fold.commands.reduce((n, c) => n + (c.duration ?? 0), 0), bg: fold.commands.filter((c) => c.status === "running").length },
     timing: timingOf(s), spans: spansOf(s.intervals ?? []),
-    cost: costOf(s), costRead: { usd: s.costUsd, ready: true }, detailRev: data.revision,
+    ...(hasUsage ? { cost: costOf(s) } : {}), costRead: { usd: s.costUsd, ready: true }, detailRev: data.revision,
   };
   return { head, headers };
 }

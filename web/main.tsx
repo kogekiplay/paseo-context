@@ -16,6 +16,8 @@ import { makeRichText } from "../src/client/components/richText";
 import { parseFileAddress } from "./vendor/workspace-path/index.js";
 import type { ClientCtx } from "../src/client/services";
 import { action, call, send } from "./bridge";
+import { makeStatisticsView } from "./statistics";
+import { reportedUsageOf } from "../shared/usage";
 import "../web/vendor/theme/theme.css";
 import "../.tmp/web/tailwind.css";
 import "../src/client/styles/base.css";
@@ -122,6 +124,7 @@ const FleetView = makeFleetView(context, kit, heads);
 const Overview = makeOverviewPanel(context, kit, settings);
 const Config = makePluginConfigCard(kit);
 const ContextModal = makeContextModal(context, kit, settings);
+const Statistics = makeStatisticsView(kit);
 // App subscribes once to the projection snapshot. The upstream host supplies a
 // read function here; several consumers read optional projections conditionally.
 const useProjection = (key: string) => {
@@ -136,6 +139,7 @@ function App() {
   if (s.mode === "settings") return <div className="pc-settings"><Config useContextSettings={(selector) => useSyncExternalStore(settings.store.subscribe, () => selector(settings.store.getSnapshot()))} set={(field, value) => settings.set(field, value)} /></div>;
   if (!s.current) return <div className="pc-status">{t("trend.empty")}</div>;
   const props = { sessionId: s.current, useProjection };
+  if (s.mode === "statistics") return <Statistics key={s.current} {...props} locale={s.locale} notices={s.selected?.notices ?? []} />;
   if (s.mode === "modal") return <ContextModal {...props} useContextModal={(selector) => useSyncExternalStore(modalStoreOf(s.current).subscribe, () => selector(modalStoreOf(s.current).getSnapshot()))} />;
   return s.mode === "fleet" ? <FleetView {...props} /> : <ContextView {...props} />;
 }
@@ -165,13 +169,7 @@ async function refresh() {
       ...byId[state.current]?.projectionValues,
       contextTimeline: head, contextHeaders: selected.headers,
       contextPressure: { pressureTokens: head.last?.prompt, contextWindow: head.contextWindow },
-      tokenUsage: Object.values(head.cost ?? {}).reduce((total: any, models: any) => {
-        for (const periods of Object.values(models) as any[]) for (const bucket of Object.values(periods) as any[]) {
-          total.uncachedInputTokens += bucket.uncached; total.cacheReadTokens += bucket.cacheRead;
-          total.cacheWriteTokens += bucket.cacheWrite; total.outputTokens += bucket.output;
-        }
-        return total;
-      }, { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0 }),
+      tokenUsage: reportedUsageOf(head),
     } };
   }
   publish({ byId, selected });

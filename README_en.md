@@ -13,7 +13,7 @@ The following screenshots show the running plugin with generated sample records:
 
 ## Install
 
-Requires Paseo **0.15.4+** and Node.js 22+ on the daemon machine. The original interactive interface runs in Desktop, web and native iOS/iPadOS using Paseo's bundled WebView. The iPad client has completed a live rendering handshake. Android uses a separate message transport and remains experimental. Narrow layouts use the upstream responsive styles.
+Requires Paseo **0.16.0+** and Node.js 22+ on the daemon machine. The original interactive interface runs in Desktop, web and native iOS/iPadOS using Paseo's bundled WebView. The iPad client has completed a live rendering handshake. Android uses a separate message transport and remains experimental. Narrow layouts use the upstream responsive styles.
 
 After enabling plugins in Paseo:
 
@@ -42,10 +42,14 @@ After editing, build again and run `paseo plugin reload paseo-context`.
 - File activity and commands: reads, writes, searches, counts, line changes, failures, duration and background process state.
 - Fleet: agent network, communication timeline, delegations, captured tasks/dependencies, prompts and replies.
 - Context Insights: session usage, date ranges, heatmap, skill/tool/program rankings, search, archive and directory filters.
-- The Context composer button, `/context` and the Context Command Center entry open a workspace tab bound to the current agent. `/context fleet` opens a Fleet tab, `/context insights` opens cross-session insights, and `/context modal` opens the modal.
+- Context, Fleet and Statistics workspace tabs are added automatically when an agent conversation is opened. Context becomes active and the conversation tab remains available. The Context composer button is removed. All three entries are available in the workspace tab bar's **+** menu.
+- Statistics shows the selected agent's turns, steps, usage, estimated cost, original token/timing charts and paginated request details.
+- `/context`, `/context fleet` and `/context stats` open the corresponding tabs. `/context insights` opens cross-session insights, and `/context modal` opens the modal.
 - Original preferences for placement, fleet/insights visibility, date range, granularity, comparison baseline and sorting.
 
-On desktop, the workspace tab bar's **+** menu also offers Context and Fleet. These are native Paseo workspace tabs alongside agents, terminals and files, bound to the agent they were opened for. Paseo currently exposes no equivalent to DSH's permanent tabs inside a conversation. Sidebar-only placement opens Context in Explorer; explicit commands fall back to a standalone page when the corresponding panel is hidden.
+These native Paseo workspace tabs sit alongside agents, terminals and files. Each workspace has one of each; an agent selector shares the selection across the three panels and persists it in tab state. Each agent initializes its tabs once per client plugin lifetime, so ordinary session updates do not reopen manually closed tabs. Paseo exposes no equivalent to DSH's permanent tabs inside a conversation.
+
+Sidebar-only placement opens Context in Explorer and automatically adds only Fleet and Statistics. Hidden placement disables automatic tab creation. Disabling Fleet removes its menu entry and stops adding it automatically. Existing agent-specific tabs from earlier versions remain supported.
 
 Prompt prefix/suffix settings apply to **new agents' systemPrompt**. They do not rewrite existing agents or dynamically modify each provider request; Paseo has no equivalent dynamic system-section hook.
 

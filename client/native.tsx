@@ -8,7 +8,7 @@ import { preferences } from "../shared/contracts";
 import { messages } from "./messages";
 
 type Props = PluginSurfaceProps & {
-  mode: "context" | "fleet" | "insights" | "settings" | "modal";
+  mode: "context" | "fleet" | "statistics" | "insights" | "settings" | "modal";
   agentId?: string; overlay?: boolean; onClose?: () => void;
   openSettings: () => void; openContext: (agentId: string) => void;
 };

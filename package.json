@@ -1,6 +1,6 @@
 {
   "name": "paseo-context",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Context insights, request browser, usage analytics and agent fleet for Paseo.",
   "type": "module",
   "license": "Apache-2.0",
@@ -41,7 +41,7 @@
     "check": "npm run lint && npm run typecheck && npm test"
   },
   "devDependencies": {
-    "@getpaseo/plugin": "0.15.4",
+    "@getpaseo/plugin": "0.16.0",
     "@shikijs/langs": "^4.6.0",
     "@tailwindcss/node": "^4.3.5",
     "@tailwindcss/oxide": "^4.3.5",

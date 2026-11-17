@@ -19,7 +19,7 @@ declare const Blob: { new(parts: ArrayBuffer[]): { stream(): { pipeThrough(trans
 declare const DecompressionStream: { new(format: "gzip"): unknown };
 declare const Response: { new(body: unknown): { text(): Promise<string> } };
 type Props = PluginSurfaceProps & {
-  mode: "context" | "fleet" | "insights" | "settings" | "modal";
+  mode: "context" | "fleet" | "statistics" | "insights" | "settings" | "modal";
   agentId?: string; overlay?: boolean; onClose?: () => void;
   openSettings: () => void; openContext: (agentId: string) => void;
 };

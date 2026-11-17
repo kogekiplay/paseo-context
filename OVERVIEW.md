@@ -1,8 +1,10 @@
 Paseo Context shows context composition, request history, usage trends, file and command activity, and agent collaboration. It reuses the current dsh-context interface and its multicolor palette, with light/dark styles and eight UI languages.
 
-The Context composer button and `/context` open a native workspace tab bound to the current agent. `/context fleet` opens Fleet, `/context modal` opens the modal, and Context Insights in the sidebar provides cross-session usage and date filters. Desktop's workspace tab menu also offers Context and Fleet. These tabs sit alongside agents and files; Paseo has no plugin slot for permanent tabs inside a conversation. Sidebar-only placement opens Explorer instead.
+Opening an agent conversation automatically adds Context, Fleet and Statistics workspace tabs and displays Context, keeping the conversation tab available. All three appear in the workspace tab bar's + menu; the old composer button is removed. Each panel offers an agent selector shared across the three tabs. Manually closed tabs stay closed during ordinary session updates.
 
-Requires Paseo 0.15.4 or newer and Node.js 22+ on the daemon. The original interactive UI supports Desktop, web and native iOS/iPadOS, including narrow layouts. Android's separate message bridge is experimental.
+Statistics includes per-agent usage, estimated cost, token/timing charts and request details. `/context`, `/context fleet` and `/context stats` open the corresponding tabs; `/context modal` opens the modal. Context Insights in the sidebar provides cross-session usage and date filters. These tabs sit alongside agents and files; Paseo has no plugin slot for permanent tabs inside a conversation. Sidebar-only placement opens Context in Explorer; hidden placement disables automatic tab creation.
+
+Requires Paseo 0.16.0 or newer and Node.js 22+ on the daemon. The original interactive UI supports Desktop, web and native iOS/iPadOS, including narrow layouts. Android's separate message bridge is experimental.
 
 The daemon reads local Codex and Claude Code JSONL logs, falling back to Paseo timeline for other sessions. Actual token usage is provider reported; composition, cost and observable timing are estimates. Unlogged schemas, system prompts, provider internals and missing attachment data cannot be reconstructed.
 

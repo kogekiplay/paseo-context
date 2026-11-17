@@ -24,6 +24,7 @@
     "web/bridge.ts",
     "src/client/**/*.ts",
     "src/client/**/*.tsx",
-    "src/shared/**/*.ts"
+    "src/shared/**/*.ts",
+    "tests/**/*.web.test.tsx"
   ]
 }

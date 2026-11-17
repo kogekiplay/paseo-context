@@ -17,6 +17,7 @@
     "esModuleInterop": true,
     "allowSyntheticDefaultImports": true
   },
+  "exclude": ["tests/**/*.web.test.tsx"],
   "include": [
     "index.*.ts",
     "index.*.tsx",

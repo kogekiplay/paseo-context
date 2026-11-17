@@ -9,7 +9,7 @@
     }
   },
   "requirements": {
-    "paseo": ">=0.15.4"
+    "paseo": ">=0.16.0"
   },
   "build": [
     [

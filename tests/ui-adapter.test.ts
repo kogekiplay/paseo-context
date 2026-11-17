@@ -6,6 +6,7 @@ import { aggregate, ContextService } from "../server/service";
 import { spansOf, timingOf } from "../server/timing";
 import { assemble } from "../shared/core/assemble";
 import { scopeSchema, type Agent } from "../shared/contracts";
+import { reportedUsageOf } from "../shared/usage";
 
 const agent: Agent = { id: "agent-a", workspaceId: null, parentId: null, title: "Fixture", cwd: "/project",
   provider: "codex", model: "test", sessionId: null, createdAt: 1000, updatedAt: 20000, running: false, archived: false };
@@ -17,6 +18,22 @@ const usage = (id: string, time: number) => row("token_usage_record", { response
 const adapt = (fold: ContextFold) => upstreamOf({ fold, requests: fold.requests, summary: fold.summary(agent), agent, revision: fold.revision });
 
 describe("Original UI data contracts", () => {
+  test("unknown usage survives the real adapter while provider-reported zero remains zero", () => {
+    const fold = new ContextFold("codex");
+    fold.apply(user("hello"));
+    const empty = adapt(fold).head;
+    expect(reportedUsageOf(empty)).toBeNull();
+    fold.apply(row("token_usage_record", { response_id: "zero", turn_id: "one",
+      usage: { input_tokens: 0, output_tokens: 0 } }, 3000));
+    const zero = adapt(fold).head;
+    expect(reportedUsageOf(zero)).toEqual({ uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0 });
+    const data = { fold, requests: fold.requests, summary: fold.summary(agent), agent, revision: fold.revision };
+    data.summary.notices.push("usage-unavailable");
+    const unknown = upstreamOf(data).head;
+    expect(reportedUsageOf(unknown)).toBeNull();
+    expect(unknown.requests[0].prompt).toBeUndefined();
+    expect(unknown.requests[0].output).toBeUndefined();
+  });
   test("keeps selected request identities immutable and resets per-turn step labels", () => {
     const fold = new ContextFold("codex");
     fold.apply(row("turn_context", { turn_id: "one" }, 1000));
