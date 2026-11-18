@@ -9,6 +9,20 @@ import { createHash } from "node:crypto";
 import { messagesOf } from "./normalize";
 import { scopedIntervals, sumTiming, unionMs } from "./timing";
 
+const CORPUS_TTL_MS = 10_000;
+const FIRST_PAINT_BUDGET_MS = 400;
+const SCAN_CONCURRENCY = 4;
+interface Corpus {
+  at: number;
+  pricingRevision: number;
+  all: Summary[];
+  requests: Map<string, ContextFold["requests"]>;
+  scanned: number;
+  failed: number;
+  running: boolean;
+  revision: number;
+}
+
 export function agentOf(a: PaseoAgent): Agent {
   return { id: a.id, workspaceId: a.workspaceId ?? null, parentId: a.labels["paseo.parent-agent-id"] ?? null,
     title: a.title || a.id, cwd: a.cwd, provider: a.provider, model: a.runtimeInfo?.model ?? a.model ?? "",
@@ -16,13 +30,14 @@ export function agentOf(a: PaseoAgent): Agent {
     createdAt: timestamp(a.createdAt), updatedAt: timestamp(a.updatedAt),
     archived: !!a.archivedAt, running: a.status === "running" || a.status === "initializing" };
 }
-export async function listAgents(paseo: PaseoApi) {
+export async function listAgents(paseo: PaseoApi, signal?: AbortSignal) {
   const agents: PaseoAgent[] = [];
   let cursor: string | undefined;
   const seen = new Set<string>();
   do {
+    if (signal?.aborted) throw new Error("Plugin was stopped");
     const page = await paseo.agents.list({ filter: { includeArchived: true, includeBackground: true },
-      includeBackground: true, page: { limit: 200, ...(cursor ? { cursor } : {}) } });
+      includeBackground: true, signal, page: { limit: 200, ...(cursor ? { cursor } : {}) } });
     agents.push(...page.entries.map((e) => e.agent));
     cursor = page.pageInfo.hasMore ? page.pageInfo.nextCursor ?? undefined : undefined;
     if (cursor && seen.has(cursor)) throw new Error("Agent directory returned a repeated cursor");
@@ -34,8 +49,14 @@ export class ContextService {
   constructor(readonly reader = new SessionReader()) {}
   readonly pricing = new Pricing();
   private summaries = new Map<string, { at: number; key: string; summary: Summary; requests: ContextFold["requests"] }>();
-  private corpus: { at: number; pricingRevision: number; all: Summary[]; requests: Map<string, ContextFold["requests"]>; scanned: number; failed: number } | null = null;
-  private corpusBusy: Promise<NonNullable<ContextService["corpus"]>> | null = null;
+  private corpus: Corpus | null = null;
+  private scanning: Corpus | null = null;
+  private corpusBusy: Promise<Corpus> | null = null;
+  private corpusRevision = 0;
+  private scanLifetime = new AbortController();
+  private retryCorpusAt = 0;
+  private overviewCache = new Map<string, ReturnType<typeof aggregate>>();
+  private overviewCacheRevision = "";
   private closed = false;
   private nativeMembers = new Map<string, PaseoAgent>();
   private revisions = new Map<string, { fingerprint: string; revision: number }>();
@@ -61,7 +82,9 @@ export class ContextService {
     let epoch: string | undefined;
     const seen = new Set<string>();
     do {
+      if (this.closed) throw new Error("Plugin was stopped");
       const page = await paseo.agents.ref(agent.id).timeline.refetch({ direction: cursor ? "before" : "tail", limit: 200, ...(cursor ? { cursor } : {}) });
+      if (this.closed) throw new Error("Plugin was stopped");
       if (page.error) throw new Error(page.error);
       if (epoch !== undefined && page.epoch !== epoch) throw new Error("Timeline changed while reading history");
       epoch = page.epoch;
@@ -164,6 +187,7 @@ export class ContextService {
   private async ledger(raw: PaseoAgent, paseo: PaseoApi) {
     const path = await this.reader.locate(agentOf(raw));
     const source = path ? await stat(path) : null;
+    if (this.closed) throw new Error("Plugin was stopped");
     const key = JSON.stringify([raw.updatedAt, raw.status, raw.lastUsage, raw.title, raw.labels, raw.archivedAt,
       source?.ino, source?.size, source?.mtimeMs, this.pricing.revision]);
     const cached = this.summaries.get(raw.id);
@@ -187,35 +211,93 @@ export class ContextService {
     const corpus = await this.readCorpus(paseo);
     return aggregate(corpus.all, corpus.requests, scope, offset, corpus.scanned, corpus.failed);
   }
+  async overviewForScreen(scope: Scope, offset: number, paseo: PaseoApi, revision: string) {
+    void this.pricing.refresh();
+    let corpus = this.corpus ?? (this.scanning?.all.length ? this.scanning : null);
+    if (corpus) {
+      if (Date.now() >= this.retryCorpusAt) void this.readCorpus(paseo).catch(() => {});
+    } else {
+      const refresh = this.readCorpus(paseo);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        corpus = await Promise.race([
+          refresh,
+          new Promise<Corpus | null>((resolve) => {
+            timer = setTimeout(() => resolve(this.corpus ?? this.scanning), FIRST_PAINT_BUDGET_MS);
+          }),
+        ]);
+      } finally { clearTimeout(timer); }
+    }
+    if (!corpus || this.closed) throw new Error("Plugin was stopped");
+    const running = this.scanning !== null;
+    const refreshFailed = this.retryCorpusAt !== 0;
+    const covered = corpus.all.length, remaining = corpus.scanned - covered - corpus.failed;
+    const version = `${corpus.revision}:${running}:${refreshFailed}:${new Date().toDateString()}`;
+    const coverage = { complete: !corpus.running && corpus.failed === 0, remaining,
+      failed: corpus.failed, running: corpus.running, total: corpus.scanned, covered, unsupported: 0 };
+    if (this.overviewCacheRevision !== version) {
+      this.overviewCache.clear();
+      this.overviewCacheRevision = version;
+    }
+    const key = JSON.stringify([scope, offset]);
+    let data = revision === version ? null : this.overviewCache.get(key) ?? null;
+    if (revision !== version && !data) {
+      data = aggregate(corpus.all, corpus.requests, scope, offset, corpus.scanned, corpus.failed);
+      if (this.overviewCache.size >= 12) this.overviewCache.delete(this.overviewCache.keys().next().value!);
+      this.overviewCache.set(key, data);
+    }
+    return { revision: version, coverage, refreshing: running, refreshFailed,
+      data };
+  }
   async backfill(paseo: PaseoApi) {
-    this.corpus = null;
-    const corpus = await this.readCorpus(paseo);
+    const corpus = await this.readCorpus(paseo, true);
     return { complete: corpus.failed === 0, remaining: 0, failed: corpus.failed, running: false,
       total: corpus.scanned, covered: corpus.scanned - corpus.failed, unsupported: 0 };
   }
-  private async readCorpus(paseo: PaseoApi) {
-    if (this.corpus && this.corpus.pricingRevision === this.pricing.revision && Date.now() - this.corpus.at < 10_000) return this.corpus;
+  private async readCorpus(paseo: PaseoApi, force = false) {
+    if (this.closed) throw new Error("Plugin was stopped");
     if (this.corpusBusy) return this.corpusBusy;
-    this.corpusBusy = this.scanCorpus(paseo);
-    try { return await this.corpusBusy; } finally { this.corpusBusy = null; }
+    if (!force && this.corpus && this.corpus.pricingRevision === this.pricing.revision
+      && Date.now() - this.corpus.at < CORPUS_TTL_MS) return this.corpus;
+    const corpus = this.scanning = { at: 0, pricingRevision: this.pricing.revision, all: [],
+      requests: new Map(), scanned: 0, failed: 0, running: true, revision: ++this.corpusRevision };
+    this.corpusBusy = this.scanCorpus(paseo, corpus);
+    try { return await this.corpusBusy; }
+    catch (error) { this.retryCorpusAt = Date.now() + CORPUS_TTL_MS; throw error; }
+    finally { this.corpusBusy = null; this.scanning = null; }
   }
-  private async scanCorpus(paseo: PaseoApi) {
-    const pricingRevision = this.pricing.revision;
-    const agents = await listAgents(paseo);
-    const all: Summary[] = [];
-    const allRequests = new Map<string, Awaited<ReturnType<ContextService["load"]>>["requests"]>();
-    let failed = 0;
-    for (let i = 0; i < agents.length; i += 4) {
-      if (this.closed) throw new Error("Plugin was stopped");
-      const batch = await Promise.allSettled(agents.slice(i, i + 4).map(async (agent) => {
-        const data = await this.ledger(agent, paseo);
-        allRequests.set(agent.id, data.requests);
-        return data.summary;
-      }));
-      for (const r of batch) if (r.status === "fulfilled") all.push(r.value); else failed++;
+  private async scanCorpus(paseo: PaseoApi, corpus: Corpus) {
+    const signal = this.scanLifetime.signal;
+    const agents = await listAgents(paseo, signal);
+    const order = new Map(agents.map((agent, index) => [agent.id, index]));
+    agents.sort((a, b) => timestamp(b.updatedAt) - timestamp(a.updatedAt));
+    corpus.scanned = agents.length;
+    corpus.revision = ++this.corpusRevision;
+    let cursor = 0;
+    await Promise.all(Array.from({ length: SCAN_CONCURRENCY }, async () => {
+      while (!signal.aborted && cursor < agents.length) {
+        const raw = agents[cursor++];
+        try {
+          const data = await this.ledger(raw, paseo);
+          if (signal.aborted) return;
+          corpus.all.push(data.summary);
+          corpus.requests.set(raw.id, data.requests);
+        } catch { corpus.failed++; }
+        corpus.revision = ++this.corpusRevision;
+      }
+    }));
+    if (signal.aborted) throw new Error("Plugin was stopped");
+    // Keep exact sort ties stable even though the workers finish out of order.
+    corpus.all.sort((a, b) => order.get(a.agent.id)! - order.get(b.agent.id)!);
+    corpus.at = Date.now();
+    corpus.running = false;
+    corpus.revision = ++this.corpusRevision;
+    if (agents.length && corpus.failed === agents.length) {
+      this.retryCorpusAt = corpus.at + CORPUS_TTL_MS;
+      return corpus;
     }
-    const corpus = { at: Date.now(), pricingRevision, all, requests: allRequests, scanned: agents.length, failed };
-    if (!this.closed) this.corpus = corpus;
+    this.corpus = corpus;
+    this.retryCorpusAt = 0;
     return corpus;
   }
   async fleet(id: string, paseo: PaseoApi) {
@@ -260,7 +342,7 @@ export class ContextService {
     }
     return { records: records.sort((a, b) => a.time - b.time), failed };
   }
-  clear() { this.closed = true; this.reader.clear(); this.pricing.clear(); this.summaries.clear(); this.nativeMembers.clear(); this.revisions.clear(); this.derived.clear(); this.loading.clear(); this.corpus = null; }
+  clear() { this.closed = true; this.scanLifetime.abort(); this.reader.clear(); this.pricing.clear(); this.summaries.clear(); this.nativeMembers.clear(); this.revisions.clear(); this.derived.clear(); this.loading.clear(); this.overviewCache.clear(); this.corpus = null; this.scanning = null; }
 }
 
 export function aggregate(all: Summary[], requests: Map<string, ContextFold["requests"]>, scope: Scope, offset: number, scanned: number, failed: number, now = Date.now()) {
@@ -272,10 +354,10 @@ export function aggregate(all: Summary[], requests: Map<string, ContextFold["req
   const end = scope.day ? shiftDay(timestamp(`${scope.day}T00:00:00`), 1)
     : scope.range === "custom" && scope.end ? shiftDay(timestamp(`${scope.end}T00:00:00`), 1) : Infinity;
   const groups = [...new Set(all.map((s) => s.agent.cwd))].sort();
+  const query = scope.query.toLowerCase();
   const filtered = all.filter((s) => {
-    const a = s.agent, rows = requests.get(a.id) ?? [];
-    const active = rows.some((r) => r.time >= start && r.time < end) || (!rows.length && a.updatedAt >= start && a.updatedAt < end);
-    const search = `${a.title} ${a.cwd} ${a.provider} ${a.model}`.toLowerCase().includes(scope.query.toLowerCase());
+    const a = s.agent;
+    const search = !query || `${a.title} ${a.cwd} ${a.provider} ${a.model}`.toLowerCase().includes(query);
     return search && (!scope.group || a.cwd === scope.group)
       && (scope.coverage === "all" || (scope.coverage === "archived") === a.archived)
       && (!scope.pick || s.activity.some((d) => d.time >= start && d.time < end && d[scope.pick as "tools" | "skills" | "programs"].some((t) => t.name === scope.name)));
@@ -289,6 +371,8 @@ export function aggregate(all: Summary[], requests: Map<string, ContextFold["req
   let tokens = 0, input = 0, cacheRead = 0, cost = 0, priced = 0, total = 0, turns = 0;
   const days = new Map<string, { day: string; tokens: number; costUsd: number | null; sessions: Set<string> }>();
   const parts = emptyParts();
+  const partKeys = Object.keys(parts) as Array<keyof typeof parts>;
+  const rangeUsage = new Map<string, { tokens: number; complete: boolean }>();
   const tallySessionCounts = { tools: {} as Record<string, number>, skills: {} as Record<string, number>, programs: {} as Record<string, number> };
   const tally = (key: "tools" | "skills" | "programs") => {
     const map = new Map<string, Tally>();
@@ -313,21 +397,26 @@ export function aggregate(all: Summary[], requests: Map<string, ContextFold["req
       d.costUsd = d.costUsd === null || r.costUsd === null ? null : d.costUsd + r.costUsd;
       days.set(day, d);
       if (r.time < start || r.time >= end) continue;
+      const usage = rangeUsage.get(s.agent.id) ?? { tokens: 0, complete: true };
+      usage.tokens += r.usage.input + r.usage.output;
+      usage.complete &&= r.costUsd !== null;
+      rangeUsage.set(s.agent.id, usage);
       total++; turnIds.add(r.turn); input += r.usage.input; cacheRead += r.usage.cacheRead;
       tokens += r.usage.input + r.usage.output;
       if (r.costUsd !== null) { cost += r.costUsd; priced++; }
       const sum = Object.values(r.parts).reduce((a, b) => a + b, 0);
-      for (const key of Object.keys(parts) as Array<keyof typeof parts>) parts[key] += sum ? r.parts[key] / sum * r.usage.input : 0;
+      for (const key of partKeys) parts[key] += sum ? r.parts[key] / sum * r.usage.input : 0;
       parts.assistant += Math.max(0, r.usage.output - r.usage.reasoning); parts.reasoning += r.usage.reasoning;
     }
     turns += turnIds.size;
   }
-  const inRange = (s: Summary) => (requests.get(s.agent.id) ?? []).filter((r) => r.time >= start && r.time < end);
-  const rangeTokens = (s: Summary) => inRange(s).reduce((n, r) => n + r.usage.input + r.usage.output, 0);
+  const rangeTokens = (s: Summary) => rangeUsage.get(s.agent.id)?.tokens ?? 0;
   selected.sort((a, b) => scope.sort === "tokens" ? rangeTokens(b) - rangeTokens(a)
     : scope.sort === "context" ? (b.contextTokens ?? 0) - (a.contextTokens ?? 0) : b.agent.updatedAt - a.agent.updatedAt);
   const tools = tally("tools"), skills = tally("skills"), programs = tally("programs");
-  const groupCounts = groups.map((key) => ({ key, count: selected.filter((s) => s.agent.cwd === key).length }));
+  const counts = new Map<string, number>();
+  for (const s of selected) counts.set(s.agent.cwd, (counts.get(s.agent.cwd) ?? 0) + 1);
+  const groupCounts = groups.map((key) => ({ key, count: counts.get(key) ?? 0 }));
   let wallMs = 0, toolsMs = 0;
   for (const s of selected) {
     const intervals = scopedIntervals(s.intervals ?? [], start, end);
@@ -340,8 +429,8 @@ export function aggregate(all: Summary[], requests: Map<string, ContextFold["req
     costComplete: total > 0 && priced === total, parts, groups,
     groupCounts, tallySessionCounts, sessionsArchived: all.filter((s) => s.agent.archived).length,
     archivedScoped: selected.filter((s) => s.agent.archived).length,
-    costSessions: selected.filter((s) => { const rows = inRange(s); return rows.length > 0 && rows.every((r) => r.costUsd !== null); }).length,
-    usageSessions: selected.filter((s) => inRange(s).length > 0).length,
+    costSessions: [...rangeUsage.values()].filter((usage) => usage.complete).length,
+    usageSessions: rangeUsage.size,
     days: [...days.values()].map((d) => ({ ...d, sessions: d.sessions.size })).sort((a, b) => a.day.localeCompare(b.day)),
     tools, skills, programs };
 }

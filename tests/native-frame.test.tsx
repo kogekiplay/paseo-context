@@ -95,7 +95,7 @@ describe("Native upstream UI container", () => {
     expect(mocks.dispatch).toHaveBeenCalledWith(7, "injectJavaScript", [expect.stringContaining('"type":"paseo-context:result"')]);
     mocks.dispatch.mockClear();
     await act(async () => view.props.onLoadingStart({ nativeEvent: {
-      url: `${view.props.source.baseUrl}#paseo-context=2:${encodeURIComponent(JSON.stringify(message))}`,
+      url: `data:text/html;charset=utf-8;base64,#paseo-context=2:${encodeURIComponent(JSON.stringify(message))}`,
     } }));
     expect(mocks.dispatch).not.toHaveBeenCalledWith(7, "stopLoading", []);
     expect(mocks.dispatch).toHaveBeenCalledWith(7, "injectJavaScript", [expect.stringContaining('"type":"paseo-context:result"')]);

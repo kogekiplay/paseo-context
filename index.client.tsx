@@ -3,6 +3,7 @@ import { useComposers, useSettings, type PluginAgentPanelProps, type PluginButto
 import { SidebarRow } from "@getpaseo/plugin/client/ui";
 import { FrameSurface } from "./client/frame";
 import { messages } from "./client/messages";
+import { PreferencesScreen } from "./client/preferences";
 import { WorkspacePanels, WorkspaceSurface, type PanelMode } from "./client/workspace";
 import { preferences, preferencesRpc, type Preferences } from "./shared/contracts";
 
@@ -66,7 +67,7 @@ export default function contribute(client: PluginClientContext) {
       onClose={() => id && (id.startsWith("native:") || !props.navigation ? openContext(id) : props.navigation.openAgent({ agentId: id }))} />;
   }
   function Insights(props: PluginScreenProps) { rememberNavigation(props); usePreferences(); return <FrameSurface {...props} {...common} mode="insights" />; }
-  function Settings(props: PluginSurfaceProps) { rememberNavigation(props); usePreferences(); return <FrameSurface {...props} {...common} mode="settings" />; }
+  function Settings(props: PluginSurfaceProps) { rememberNavigation(props); return <PreferencesScreen {...props} settings={usePreferences()} />; }
   function updatePanels(next: Preferences) {
     options = next;
     const key = `${next.defaultPlacement}:${next.fleetTab}`;

@@ -613,6 +613,7 @@ export const DICT_PT = {
   'attach.fileTokensTip': 'Estimativa: o modelo recebe um identificador com o nome do arquivo, seu tamanho e um prefixo de 8 caracteres do resumo SHA-256 — nunca seu conteúdo — então o custo quase não varia com o tamanho do arquivo',
   'ov.title': 'Insights de contexto',
   'ov.unavailable': 'A lista de sessões está indisponível',
+  'ov.refreshFailed': 'Exibindo os resultados anteriores',
   'ov.range.label': 'Intervalo',
   'ov.range.today': 'Hoje',
   'ov.range.7d': 'Últimos 7 dias',

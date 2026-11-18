@@ -613,6 +613,7 @@ export const DICT_DE = {
   'attach.fileTokensTip': 'Geschätzt: Das Modell erhält einen Handle mit Dateiname, Größe und einem 8-stelligen SHA-256-Digest-Präfix — niemals den Inhalt —, daher ändern sich die Kosten kaum mit der Dateigröße',
   'ov.title': 'Kontext-Einblicke',
   'ov.unavailable': 'Die Sitzungsliste ist nicht verfügbar',
+  'ov.refreshFailed': 'Vorherige Ergebnisse werden angezeigt',
   'ov.range.label': 'Bereich',
   'ov.range.today': 'Heute',
   'ov.range.7d': 'Letzte 7 Tage',

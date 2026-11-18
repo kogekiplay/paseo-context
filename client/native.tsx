@@ -8,7 +8,7 @@ import { preferences } from "../shared/contracts";
 import { messages } from "./messages";
 import { useQuery } from "@tanstack/react-query";
 import { uiRevision } from "../shared/generated/ui-revision";
-import { isNativeDocumentUrl, nativeDocumentUrl } from "./native-navigation";
+import { isNativeDocumentUrl, isNativeLoadEventUrl, nativeDocumentUrl } from "./native-navigation";
 
 type Props = PluginSurfaceProps & {
   mode: "context" | "fleet" | "statistics" | "insights" | "settings" | "modal";
@@ -84,6 +84,7 @@ function NativeFrameBody(props: Props) {
   }, [markupQuery.data, markupQuery.error, nonce]);
   useEffect(initialize, [settings.status === "ready" ? settings.revision : "", locale, props.mode, props.agentId, props.theme.colors.surface0]);
   const receive = (event: { nativeEvent: { data: string } }) => {
+    if (!mounted.current) return;
     let data: any;
     try { data = JSON.parse(event.nativeEvent.data); } catch { return; }
     if (data?.nonce !== nonce) return;
@@ -140,11 +141,12 @@ function NativeFrameBody(props: Props) {
     // plugins cannot subscribe to. Local same-document history events use the
     // native view's direct event channel and never load a network URL.
     onLoadingStart: (event: { nativeEvent: { url: string } }) => {
-      if (!isNativeDocumentUrl(event.nativeEvent.url, baseUrl)) {
+      if (!isNativeLoadEventUrl(event.nativeEvent.url, baseUrl, Platform.OS === "android")) {
         const tag = findNodeHandle(ref.current);
         if (tag !== null) UIManager.dispatchViewManagerCommand(tag, "stopLoading", []);
         setError("Navigation outside the bundled interface was blocked.");
-        report("unexpected navigation blocked"); return;
+        const scheme = /^[a-z]+(?=:)/i.exec(event.nativeEvent.url)?.[0] ?? "unknown";
+        report(`unexpected navigation blocked (${scheme})`); return;
       }
       const marker = "#paseo-context=";
       const at = event.nativeEvent.url.indexOf(marker);
@@ -152,9 +154,11 @@ function NativeFrameBody(props: Props) {
       if (at < 0) return;
       const value = event.nativeEvent.url.slice(at + marker.length);
       const colon = value.indexOf(":");
-      try {
-        receive({ nativeEvent: { data: decodeURIComponent(value.slice(colon + 1)) } });
-      } finally { inject("globalThis.__PASEO_CONTEXT_ACK__?.();true;"); }
+      if (colon < 1) return;
+      let message: string;
+      try { message = decodeURIComponent(value.slice(colon + 1)); } catch { return; }
+      receive({ nativeEvent: { data: message } });
+      inject("globalThis.__PASEO_CONTEXT_ACK__?.();true;");
     },
     onLoadingError: (event: { nativeEvent: { description?: string } }) => setError(event.nativeEvent.description ?? "Could not load the UI"),
     onShouldStartLoadWithRequest: (event: { nativeEvent: { url: string; lockIdentifier: number } }) => {

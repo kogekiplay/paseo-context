@@ -186,23 +186,25 @@ export class UiRoutes {
       day: text(raw.day), coverage: raw.coverage || "all", group: text(raw.group), query: text(raw.query), sort: body.sort || "recent",
       pick: field === "cmds" ? "programs" : field, name: text(pick.name),
     });
-    const index = count(body.page), data = await this.service.overview(scope, index * 24, paseo), revision = String(Math.floor(Date.now() / 10000));
-    const part = text(body.part), pricingReady = true;
+    const index = count(body.page);
+    const { data, revision, coverage, refreshing, refreshFailed } = await this.service.overviewForScreen(scope, index * 24, paseo, text(body.revision));
+    if (!data) return { ok: true, value: { revision, refreshing, refreshFailed, unchanged: true } };
+    const part = text(body.part), state = { revision, refreshing, refreshFailed, partial: coverage.running, pricingReady: true };
     const tokenParts = Object.entries(data.parts).map(([key, value]) => ({ key: key === "reasoning" ? "thinking" : key === "assistant" ? "answers" : key === "calls" ? "toolCalls" : key, value }));
-    if (part === "days") return { ok: true, value: { revision, pricingReady, days: data.days.map((d) => ({ key: d.day, tokens: d.tokens, sessions: d.sessions, costUsd: d.costUsd })) } };
-    if (part === "summary") return { ok: true, value: { revision, pricingReady, summary: {
+    if (part === "days") return { ok: true, value: { ...state, days: data.days.map((d) => ({ key: d.day, tokens: d.tokens, sessions: d.sessions, costUsd: d.costUsd })) } };
+    if (part === "summary") return { ok: true, value: { ...state, summary: {
       sessions: data.total, sessionsTotal: data.scanned, sessionsArchived: data.sessionsArchived, archivedScoped: data.archivedScoped,
       tokens: data.tokens, turns: data.turns, costUsd: data.costUsd, costSessions: data.costSessions,
       usageSessions: data.usageSessions, cacheHit: data.input > 0 ? (data.cacheRead / data.input * 100).toFixed(1) : null,
       tokenParts, timing: data.timing, windowTiming: { calls: data.calls, toolCalls: data.toolCalls, toolsMs: data.toolsMs, wallMs: data.wallMs },
-      coverage: { complete: data.failed === 0, remaining: 0, failed: data.failed, running: false, total: data.scanned, covered: data.scanned - data.failed, unsupported: 0 },
+      coverage,
     } } };
     if (part === "tally") {
       const items = tally === "cmds" ? data.programs : tally === "skills" ? data.skills : data.tools;
       const sessions = data.tallySessionCounts[tally === "cmds" ? "programs" : tally === "skills" ? "skills" : "tools"];
-      return { ok: true, value: { revision, pricingReady, tally: { field: tally, stats: items.map((t) => ({ name: t.name, n: t.count, sessions: sessions[t.name] ?? 0, last: t.last })) } } };
+      return { ok: true, value: { ...state, tally: { field: tally, stats: items.map((t) => ({ name: t.name, n: t.count, sessions: sessions[t.name] ?? 0, last: t.last })) } } };
     }
-    return { ok: true, value: { revision, pricingReady, page: {
+    return { ok: true, value: { ...state, page: {
       index, count: Math.max(1, Math.ceil(data.total / 24)), total: data.total, scopeTotal: data.total,
       groups: data.groupCounts,
       items: data.sessions.map((s) => ({ id: s.agent.id, title: s.agent.title, cwd: s.agent.cwd, updatedAt: s.agent.updatedAt,

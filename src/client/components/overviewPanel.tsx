@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState, useSyncExternalStore, type ReactElement } from 'react'
+import { invalidate } from '../invalidation'
 import { formatCost, toCurrency, type CostCurrency } from '../cost'
 import { RING_COLOR } from '../categories'
 import { fmt } from '../format'
@@ -152,9 +153,16 @@ export function makeOverviewPanel(
     const skillsState = useOverviewTally({ part: 'tally', scope: tallyScope, tally: 'skills' }, bodyMounted)
     const toolsState = useOverviewTally({ part: 'tally', scope: tallyScope, tally: 'tools' }, bodyMounted)
     const cmdsState = useOverviewTally({ part: 'tally', scope: tallyScope, tally: 'cmds' }, bodyMounted)
-    const summary: OverviewSummary | null = summaryState.data?.summary ?? null
     const backfill = summaryState.coverage
     const fold = foldStateOf(backfill)
+    const visibleParts = [summaryState, daysState, pageState, skillsState, toolsState, cmdsState]
+    const stale = visibleParts.some(state => state.stale && state.data !== null)
+    const partial = visibleParts.some(state => state.partial)
+    const waitingForFirstSession = backfill?.running === true && backfill.covered === 0
+    const firstLoadFailed = (summaryState.error && (backfill === null || waitingForFirstSession))
+      || (pageState.error && pageState.data === null)
+      || (backfill !== null && !backfill.running && backfill.covered === 0 && backfill.failed > 0)
+    const summary: OverviewSummary | null = waitingForFirstSession ? null : summaryState.data?.summary ?? null
     const pageValue = pageState.data?.page ?? null
     const pageIndex = pageValue?.index ?? 0
     const pageCount = pageValue?.count ?? 1
@@ -199,9 +207,9 @@ export function makeOverviewPanel(
       { kind: 'tool', field: 'tools', stats: toolStats },
       { kind: 'command', field: 'cmds', stats: commandStats },
     ]
-    const summaryLoading = awaitingValueOf(summaryState)
-    const daysLoading = awaitingValueOf(daysState)
-    const pageLoading = awaitingValueOf(pageState)
+    const summaryLoading = waitingForFirstSession || awaitingValueOf(summaryState)
+    const daysLoading = waitingForFirstSession || awaitingValueOf(daysState)
+    const pageLoading = waitingForFirstSession || awaitingValueOf(pageState)
     const busy = summaryState.pending || daysState.pending || pageState.pending
     const pickPreset = (range: OverviewRange): void => {
       setPicked(range)
@@ -236,13 +244,16 @@ export function makeOverviewPanel(
               </button>
               <BalanceCapsule />
               <UpdatePill />
-              {backfill !== null && fold !== 'idle' && (
+              {!firstLoadFailed && stale && (
+                <span className="lc-ov-folding" role="status">{t('ov.refreshFailed')}</span>
+              )}
+              {!firstLoadFailed && !stale && (fold !== 'idle' || partial) && (
                 <span className="lc-ov-folding" title={t('ov.fold.tip')}>
-                  {fold === 'stalled'
+                  {backfill === null || backfill.total === 0 || fold === 'idle'
+                    ? t('ov.fold.starting')
+                    : fold === 'stalled'
                     ? t('ov.fold.stalled', { n: fmt(backfill.failed) })
-                    : backfill.total === 0
-                      ? t('ov.fold.starting')
-                      : t('ov.fold.progress', { n: fmt(backfill.covered), total: fmt(backfill.total) })}
+                    : t('ov.fold.progress', { n: fmt(backfill.covered), total: fmt(backfill.total) })}
                 </span>
               )}
               <div className="lc-ov-headctl">
@@ -266,8 +277,8 @@ export function makeOverviewPanel(
               </div>
             </div>
 
-            {pageValue === null && pageState.error ? (
-              <div className="lc-empty">{t('ov.unavailable')}</div>
+            {firstLoadFailed ? (
+              <div className="lc-empty">{t('ov.unavailable')} <button type="button" className="lc-ov-settings" onClick={() => invalidate('overview')}>{t('error.retry')}</button></div>
             ) : (
               <>
                 <div className="lc-ov-first">

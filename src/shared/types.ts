@@ -674,4 +674,8 @@ export interface OverviewTallyValue {
   tally: OverviewTally
 }
 
-export type OverviewValue = OverviewUnchanged | OverviewSummaryValue | OverviewDaysValue | OverviewPageValue | OverviewTallyValue
+export type OverviewValue = (OverviewUnchanged | OverviewSummaryValue | OverviewDaysValue | OverviewPageValue | OverviewTallyValue) & {
+  refreshing?: boolean
+  refreshFailed?: boolean
+  partial?: boolean
+}

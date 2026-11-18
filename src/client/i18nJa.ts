@@ -613,6 +613,7 @@ export const DICT_JA = {
   'attach.fileTokensTip': '推定値：モデルが受け取るのはハンドル（ファイル名、サイズ、SHA-256 ダイジェストの 8 文字の接頭辞）のみでファイル内容は受け取らないため、オーバーヘッドはファイルサイズによる影響をほとんど受けません',
   'ov.title': 'コンテキストインサイト',
   'ov.unavailable': 'セッション一覧を利用できません',
+  'ov.refreshFailed': '前回の結果を表示中',
   'ov.range.label': '集計範囲',
   'ov.range.today': '今日',
   'ov.range.7d': '過去 7 日',

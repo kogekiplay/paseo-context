@@ -18,6 +18,7 @@ export class SessionReader {
   private paths = new Map<string, { path: string; at: number }>();
   private bodies = new Map<string, { text: string; at: number }>();
   private version = 0;
+  private lifetime = new AbortController();
   private bodyTimer: ReturnType<typeof setInterval> | null = null;
   constructor(private roots = {
     codex: process.env.CODEX_HOME || join(homedir(), ".codex"),
@@ -59,7 +60,7 @@ export class SessionReader {
         }
       }
     }
-    if (path) {
+    if (path && !this.lifetime.signal.aborted) {
       if (this.paths.size >= 512) this.paths.delete(this.paths.keys().next().value!);
       this.paths.set(key, { path, at: Date.now() });
     }
@@ -67,10 +68,13 @@ export class SessionReader {
   }
   async read(agent: Agent) {
     const path = await this.locate(agent);
+    const signal = this.lifetime.signal;
+    if (signal.aborted) throw new Error("Plugin was stopped");
     if (!path) return null;
     let entry = this.cache.get(path);
     if (entry?.busy) return { path, entry: await entry.busy };
     const info = await stat(path);
+    if (signal.aborted) throw new Error("Plugin was stopped");
     entry = this.cache.get(path);
     if (entry?.busy) return { path, entry: await entry.busy };
     if (!entry || entry.ino !== info.ino || info.size < entry.offset || (info.size === entry.offset && info.mtimeMs !== entry.mtimeMs)) {
@@ -85,7 +89,7 @@ export class SessionReader {
     const current = entry;
     current.busy = (async () => {
       if (info.size > current.offset) {
-        const stream = createReadStream(path, { start: current.offset, end: info.size - 1 });
+        const stream = createReadStream(path, { start: current.offset, end: info.size - 1, signal });
         for await (const buffer of stream) {
           const decoded = current.tail + current.decoder.write(buffer);
           const lines = decoded.split("\n");
@@ -126,7 +130,7 @@ export class SessionReader {
       const messages = messagesOf(JSON.parse(bytes.toString("utf8")), agent.provider);
       const message = messages.find((m) => m.block === node.block && (m.category === node.category || node.category === "skill"));
       const text = message?.text ?? "";
-      if (text.length <= 32 * 1024 * 1024) {
+      if (!this.lifetime.signal.aborted && text.length <= 32 * 1024 * 1024) {
         let chars = [...this.bodies.values()].reduce((n, body) => n + body.text.length, text.length);
         for (const [oldKey, body] of this.bodies) {
           if (chars <= 32 * 1024 * 1024 && this.bodies.size < 4) break;
@@ -144,6 +148,7 @@ export class SessionReader {
     } finally { await file.close(); }
   }
   clear() {
+    this.lifetime.abort();
     this.cache.clear(); this.paths.clear(); this.bodies.clear();
     if (this.bodyTimer) clearInterval(this.bodyTimer); this.bodyTimer = null;
   }

@@ -206,24 +206,25 @@ export function overviewValueOf(value: unknown): OverviewValue | null {
   if (data === null) return null
   const revision = stringOf(data.revision)
   if (revision === undefined) return null
-  if (data.unchanged === true) return { revision, unchanged: true }
+  const scan = { refreshing: data.refreshing === true, refreshFailed: data.refreshFailed === true, partial: data.partial === true }
+  if (data.unchanged === true) return { revision, ...scan, unchanged: true }
   if (typeof data.pricingReady !== 'boolean') return null
   const pricingReady = data.pricingReady
   if (data.summary !== undefined) {
     const summary = summaryOf(data.summary)
-    return summary === null ? null : { revision, pricingReady, summary }
+    return summary === null ? null : { revision, ...scan, pricingReady, summary }
   }
   if (data.days !== undefined) {
     const days = daysOf(data.days)
-    return days === null ? null : { revision, pricingReady, days }
+    return days === null ? null : { revision, ...scan, pricingReady, days }
   }
   if (data.page !== undefined) {
     const page = pageOf(data.page)
-    return page === null ? null : { revision, pricingReady, page }
+    return page === null ? null : { revision, ...scan, pricingReady, page }
   }
   if (data.tally !== undefined) {
     const tally = tallyOf(data.tally)
-    return tally === null ? null : { revision, pricingReady, tally }
+    return tally === null ? null : { revision, ...scan, pricingReady, tally }
   }
   return null
 }
@@ -233,6 +234,7 @@ export interface PartState<T> {
   pending: boolean
   stale: boolean
   error: boolean
+  partial: boolean
   revision: string | null
 }
 
@@ -246,6 +248,7 @@ interface HeldPart<T> {
   key: string
   revision: string
   value: T
+  partial: boolean
 }
 
 function heldFor<T>(held: HeldPart<T> | null, key: string): HeldPart<T> | null {
@@ -273,6 +276,7 @@ function useOverviewPart<T>(options: PartOptions<T>): PartState<T> {
       return
     }
     const live = { cancelled: false, inFlight: false, queued: false }
+    const lifetime = new AbortController()
     const stopped = (): boolean => live.cancelled
     const busy = (): boolean => live.inFlight
     const queued = (): boolean => live.queued
@@ -294,7 +298,7 @@ function useOverviewPart<T>(options: PartOptions<T>): PartState<T> {
       try {
         const heldPart = heldFor(heldRef.current, key)
         const body: OverviewRequest = { ...request, revision: heldPart === null ? null : heldPart.revision }
-        const read = await postRoute(OVERVIEW_ROUTE, body, overviewValueOf, { label: 'overview ' + request.part })
+        const read = await postRoute(OVERVIEW_ROUTE, body, overviewValueOf, { label: 'overview ' + request.part, signal: lifetime.signal })
         if (stopped()) return
         if (read === null) {
           setError(true)
@@ -302,17 +306,17 @@ function useOverviewPart<T>(options: PartOptions<T>): PartState<T> {
           return
         }
         setError(false)
+        setStale(read.refreshFailed === true)
+        if (read.refreshing) schedule(600)
         if ('unchanged' in read) {
           notePricingPending(pricingReady.current)
-          setStale(false)
           return
         }
         pricingReady.current = read.pricingReady
         notePricingPending(read.pricingReady)
         const picked = pickRef.current(read)
         if (picked === null) return
-        hold({ key, revision: read.revision, value: picked })
-        setStale(false)
+        hold({ key, revision: read.revision, value: picked, partial: read.partial === true })
       } catch {
         if (!stopped()) {
           setError(true)
@@ -329,18 +333,25 @@ function useOverviewPart<T>(options: PartOptions<T>): PartState<T> {
     }
     const schedule = (delay: number): void => {
       clearTimer()
-      timers.refresh = setTimeout(() => { timers.refresh = null; void fetchNow() }, delay)
+      timers.refresh = setTimeout(() => {
+        timers.refresh = null
+        if (delay === 0 || document.visibilityState === 'visible') void fetchNow()
+      }, delay)
     }
     const off = subscribeInvalidations((event) => {
       if (stopped()) return
       if (event.kind === 'overview' || event.kind === 'sessions' || event.kind === 'pricing') schedule(REFRESH_COALESCE_MS)
     })
     schedule(0)
+    const onVisibility = (): void => { if (document.visibilityState === 'visible') schedule(0) }
+    document.addEventListener('visibilitychange', onVisibility)
     const pollTimer = setInterval(() => {
       if (document.visibilityState === 'visible') void fetchNow()
     }, POLL_MS)
     return () => {
       live.cancelled = true
+      lifetime.abort()
+      document.removeEventListener('visibilitychange', onVisibility)
       clearTimer()
       clearInterval(pollTimer)
       off()
@@ -353,6 +364,7 @@ function useOverviewPart<T>(options: PartOptions<T>): PartState<T> {
     pending,
     stale,
     error,
+    partial: heldPart?.partial ?? false,
     revision: heldPart === null ? null : heldPart.revision,
   }
 }
