@@ -8,3 +8,4 @@ button, input, select, textarea, div { box-sizing: border-box; }
 .pc-statistics { height: 100%; min-height: 0; --dsh-composer-height: 0px; }
 #pc-error:empty { display: none; }
 #pc-error:not(:empty) { position: fixed; bottom: 8px; right: 8px; max-width: min(560px, 90%); padding: 10px; border: 1px solid var(--dsw-alias-state-error-primary); background: var(--dsw-alias-bg-layer-1); border-radius: 8px; font-size: 12px; z-index: 10000; }
+[data-pc-preview] .lc-ov-pagehead > .lc-ov-settings { display: none; }

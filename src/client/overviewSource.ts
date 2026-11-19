@@ -345,7 +345,7 @@ function useOverviewPart<T>(options: PartOptions<T>): PartState<T> {
     schedule(0)
     const onVisibility = (): void => { if (document.visibilityState === 'visible') schedule(0) }
     document.addEventListener('visibilitychange', onVisibility)
-    const pollTimer = setInterval(() => {
+    const pollTimer = document.body.hasAttribute('data-pc-preview') ? undefined : setInterval(() => {
       if (document.visibilityState === 'visible') void fetchNow()
     }, POLL_MS)
     return () => {

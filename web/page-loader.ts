@@ -1,4 +1,4 @@
-export interface PageTarget { agentId: string; mode: string }
+export interface PageTarget { agentId: string; mode: string; preview?: boolean }
 interface LoaderOptions {
   read(target: PageTarget, signal: AbortSignal): Promise<unknown>;
   accept(target: PageTarget, result: any): void;
@@ -15,7 +15,7 @@ export class PageLoader {
   private pending: AbortController | null = null;
   constructor(private options: LoaderOptions) {}
   configure(target: PageTarget) {
-    if (this.target?.agentId === target.agentId && this.target.mode === target.mode) return;
+    if (this.target?.agentId === target.agentId && this.target.mode === target.mode && this.target.preview === target.preview) return;
     this.stopRead(); this.target = target;
     this.refresh();
   }
@@ -40,7 +40,7 @@ export class PageLoader {
     }).finally(() => {
       if (generation !== this.generation) return;
       this.pending = null;
-      if (this.visible) this.timer = setTimeout(() => { this.timer = null; this.refresh(); }, this.options.interval ?? 5000);
+      if (this.visible && !target.preview) this.timer = setTimeout(() => { this.timer = null; this.refresh(); }, this.options.interval ?? 5000);
     });
   }
   private stopRead() {

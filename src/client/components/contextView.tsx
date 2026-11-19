@@ -830,10 +830,10 @@ export function makeContextView(
               onCommandPick={hasCommands ? setCommandFocus : undefined}
               onCommandMore={hasCommands ? onCommandMore : undefined}
               onEventsClick={onEventsClick} />
-            <div className="lc-col">
+            {ctx.get('paseoContextPreview') === true ? null : <div className="lc-col">
               <PluginInfo />
               <RecomCard key={typeof sessionId === 'string' ? sessionId : undefined} />
-            </div>
+            </div>}
           </div>
         )}
         <div className="lc-cols lc-head">

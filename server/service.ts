@@ -46,8 +46,12 @@ export async function listAgents(paseo: PaseoApi, signal?: AbortSignal) {
   return [...new Map(agents.map((a) => [a.id, a])).values()];
 }
 export class ContextService {
-  constructor(readonly reader = new SessionReader()) {}
-  readonly pricing = new Pricing();
+  constructor(readonly reader: {
+    read(agent: Agent): Promise<{ entry: { fold: ContextFold } } | null>;
+    locate(agent: Agent): Promise<string | null>;
+    content(agent: Agent, nodeId: number): Promise<string>;
+    clear(): void;
+  } = new SessionReader(), readonly pricing = new Pricing()) {}
   private summaries = new Map<string, { at: number; key: string; summary: Summary; requests: ContextFold["requests"] }>();
   private corpus: Corpus | null = null;
   private scanning: Corpus | null = null;

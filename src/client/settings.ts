@@ -30,8 +30,6 @@ export interface SettingsState {
   overviewAutoSteps: OverviewAutoSteps
   overviewRange: DefaultOverviewRange
   fleetTab: FleetTab
-  promptPrefix: string
-  promptSuffix: string
   writable: boolean
 }
 
@@ -64,8 +62,6 @@ type Prefs = {
   overviewAutoSteps?: OverviewAutoSteps
   overviewRange?: DefaultOverviewRange
   fleetTab?: FleetTab
-  promptPrefix?: string
-  promptSuffix?: string
 }
 
 function prefsOf(value: unknown): Prefs {
@@ -83,13 +79,11 @@ function prefsOf(value: unknown): Prefs {
     ...(v.overviewAutoSteps === '100' || v.overviewAutoSteps === '200' || v.overviewAutoSteps === '300' || v.overviewAutoSteps === 'off' ? { overviewAutoSteps: v.overviewAutoSteps } : {}),
     ...(v.defaultOverviewRange === 'today' || v.defaultOverviewRange === '7d' || v.defaultOverviewRange === '30d' ? { overviewRange: v.defaultOverviewRange } : {}),
     ...(v.fleetTab === 'show' || v.fleetTab === 'hide' ? { fleetTab: v.fleetTab } : {}),
-    ...(typeof v.promptPrefix === 'string' ? { promptPrefix: v.promptPrefix } : {}),
-    ...(typeof v.promptSuffix === 'string' ? { promptSuffix: v.promptSuffix } : {}),
   }
 }
 
 export function createContextSettings(): ContextSettings {
-  let state: SettingsState = { status: 'loading', placement: 'all', granularity: 'step', mode: 'total', deltaBase: 'step', toolSort: 'count', fileSort: 'lines', insightsEntry: 'show', durationCurve: 'show', overviewAutoSteps: '100', overviewRange: '30d', fleetTab: 'show', promptPrefix: '', promptSuffix: '', writable: false }
+  let state: SettingsState = { status: 'loading', placement: 'all', granularity: 'step', mode: 'total', deltaBase: 'step', toolSort: 'count', fileSort: 'lines', insightsEntry: 'show', durationCurve: 'show', overviewAutoSteps: '100', overviewRange: '30d', fleetTab: 'show', writable: false }
   let scope: SettingsScopeLike | undefined
   const listeners = new Set<() => void>()
   const unchanged = (a: SettingsState, b: SettingsState): boolean =>
@@ -120,8 +114,6 @@ export function createContextSettings(): ContextSettings {
       overviewAutoSteps: prefs.overviewAutoSteps ?? (raw?.overviewAutoSteps === undefined ? state.overviewAutoSteps : '100'),
       overviewRange: prefs.overviewRange ?? (raw?.defaultOverviewRange === undefined ? state.overviewRange : '30d'),
       fleetTab: prefs.fleetTab ?? (raw?.fleetTab === undefined ? state.fleetTab : 'show'),
-      promptPrefix: prefs.promptPrefix ?? (raw?.promptPrefix === undefined ? state.promptPrefix : ''),
-      promptSuffix: prefs.promptSuffix ?? (raw?.promptSuffix === undefined ? state.promptSuffix : ''),
       writable: snap.writable,
     })
     return { placement: prefs.placement, insightsEntry: prefs.insightsEntry, fleetTab: prefs.fleetTab }

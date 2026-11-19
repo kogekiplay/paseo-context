@@ -53,7 +53,7 @@ These native Paseo workspace tabs sit alongside agents, terminals and files. Eac
 
 Sidebar-only placement opens Context in Explorer and automatically adds only Fleet and Statistics. Hidden placement disables automatic tab creation. Disabling Fleet removes its menu entry and stops adding it automatically. Existing agent-specific tabs from earlier versions remain supported.
 
-Prompt prefix/suffix settings apply to **new agents' systemPrompt**. They do not rewrite existing agents or dynamically modify each provider request; Paseo has no equivalent dynamic system-section hook.
+Plugin settings show interactive previews of Context, Fleet, Statistics, and Insights at desktop or phone widths. The previews use sample sessions only.
 
 Pages fetch only their required data. Context paints the selected session before independently completing family costs; Fleet transfers graph summaries and reads full messages on demand; Statistics loads only its original table data. Unchanged sessions skip full retransmission and redraws, hidden documents pause page polling, and Settings does not poll sessions. Syntax grammars load through the local host on demand with all original languages retained. Public pricing requests do not block dashboard startup.
 
@@ -79,7 +79,7 @@ Public metadata requests fetch model pricing from `models.dev`, this fork's late
 
 If the daemon explicitly has `DEEPSEEK_API_KEY`, the balance capsule uses only the official `https://api.deepseek.com/user/balance` endpoint. Otherwise it is hidden. The key is not sent to the client or other sites. No DSH settings or credentials are read.
 
-Plugins run as trusted local code with the daemon user's filesystem access. Configured prompt prefixes/suffixes are sent to the selected model provider as part of new agents' system prompts.
+Plugins run as trusted local code with the daemon user's filesystem access.
 
 ## Development and upstream
 

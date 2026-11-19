@@ -171,8 +171,6 @@ export interface PluginSettings {
   overviewAutoSteps: OverviewAutoSteps
   defaultOverviewRange: DefaultOverviewRange
   fleetTab: FleetTab
-  promptPrefix: string
-  promptSuffix: string
 }
 
 export type SettingsField = keyof PluginSettings

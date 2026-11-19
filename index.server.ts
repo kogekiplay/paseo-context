@@ -2,24 +2,19 @@ import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { activityRpc, browserRpc, collaborationRpc, contentRpc, fleetRpc, overviewRpc, preferences, preferenceSchema, preferencesRpc, snapshotRpc } from "./shared/contracts";
 import { ContextService } from "./server/service";
 import { UiRoutes } from "./server/ui-routes";
-import { bridgeRpc } from "./shared/bridge";
+import { bridgeRpc, settingsPreviewRpc } from "./shared/bridge";
+import { SettingsPreview } from "./server/settings-preview";
 
 export default function contribute(server: PluginServerContext) {
   const service = new ContextService();
   const ui = new UiRoutes(service);
+  const preview = new SettingsPreview();
   server.handle(bridgeRpc, ({ route, payload }, { paseo }) => ui.handle(route, payload, paseo));
+  server.handle(settingsPreviewRpc, ({ route, payload }) => preview.handle(route, payload));
   const settings = server.registerSettings(preferences);
   server.handle(preferencesRpc, async () => {
     const state = await settings.read();
     return state.status === "ready" ? state.values : preferenceSchema.parse({});
-  });
-  const remove = server.addHook("agent.create.before", async ({ request }) => {
-    const state = await settings.read();
-    if (state.status !== "ready") return;
-    const { promptPrefix, promptSuffix } = state.values;
-    if (!promptPrefix && !promptSuffix) return;
-    return { ...request, config: { ...request.config,
-      systemPrompt: [promptPrefix, request.config.systemPrompt, promptSuffix].filter(Boolean).join("\n\n") } };
   });
   server.handle(snapshotRpc, ({ agentId }, { paseo }) => service.snapshot(agentId, paseo));
   server.handle(browserRpc, async ({ agentId, requestId, category, query, sort, offset, limit }, { paseo }) => {
@@ -50,5 +45,5 @@ export default function contribute(server: PluginServerContext) {
   server.handle(overviewRpc, ({ offset, ...scope }, { paseo }) => service.overview(scope, offset, paseo));
   server.handle(fleetRpc, ({ agentId }, { paseo }) => service.fleet(agentId, paseo));
   server.handle(collaborationRpc, ({ agentId }, { paseo }) => service.collaboration(agentId, paseo));
-  return () => { remove(); ui.clear(); service.clear(); };
+  return () => { preview.clear(); ui.clear(); service.clear(); };
 }

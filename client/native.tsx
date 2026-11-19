@@ -1,20 +1,16 @@
 import { createElement, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import { findNodeHandle, Linking, Platform, Text, TurboModuleRegistry, UIManager, View } from "react-native";
 import type { TurboModule } from "react-native";
-import { useRpc, useSettings, useTranslation, type PluginSurfaceProps } from "@getpaseo/plugin/client";
+import { useRpc, useSettings, useTranslation } from "@getpaseo/plugin/client";
 import { copyText, Modal } from "@getpaseo/plugin/client/ui";
-import { bridgeRpc } from "../shared/bridge";
+import { bridgeRpc, settingsPreviewRpc } from "../shared/bridge";
+import type { FrameProps } from "./frame";
 import { preferences } from "../shared/contracts";
 import { messages } from "./messages";
 import { useQuery } from "@tanstack/react-query";
 import { uiRevision } from "../shared/generated/ui-revision";
 import { isNativeDocumentUrl, isNativeLoadEventUrl, nativeDocumentUrl } from "./native-navigation";
 
-type Props = PluginSurfaceProps & {
-  mode: "context" | "fleet" | "statistics" | "insights" | "settings" | "modal";
-  agentId?: string; overlay?: boolean; onClose?: () => void;
-  openSettings: () => void; openContext: (agentId: string) => void;
-};
 interface WebViewModule extends TurboModule {
   shouldStartLoadWithLockIdentifier(allow: boolean, lock: number): void;
 }
@@ -25,15 +21,15 @@ const RNCWebView = "RNCWebView" as unknown as ComponentType<any>;
 const originalPreferences = (values: Record<string, unknown>) => Object.fromEntries(Object.entries(values).map(([key, value]) =>
   [key, typeof value === "boolean" ? value ? "show" : "hide" : value]));
 
-export function NativeFrame(props: Props) {
+export function NativeFrame(props: FrameProps) {
   const { t } = useTranslation(messages);
   const content = <NativeFrameBody {...props} />;
   return props.overlay ? <Modal title={t("context")} open onOpenChange={(open) => { if (!open) props.onClose?.(); }}>
     <Modal.Content scrollable={false} style={{ flex: 1 }} contentContainerStyle={{ padding: 0, gap: 0, flex: 1 }}>{content}</Modal.Content>
   </Modal> : content;
 }
-function NativeFrameBody(props: Props) {
-  const rpc = useRpc(bridgeRpc), settings = useSettings(preferences), { locale } = useTranslation(messages);
+function NativeFrameBody(props: FrameProps) {
+  const rpc = useRpc(bridgeRpc), previewRpc = useRpc(settingsPreviewRpc), settings = useSettings(preferences), { locale } = useTranslation(messages);
   const ref = useRef<any>(null), mounted = useRef(true), reported = useRef(new Set<string>());
   const latest = useRef({ props, settings, locale, rpc });
   latest.current = { props, settings, locale, rpc };
@@ -51,7 +47,7 @@ function NativeFrameBody(props: Props) {
     },
   });
   const report = (phase: string) => {
-    if (reported.current.has(phase)) return;
+    if (latest.current.props.preview || reported.current.has(phase)) return;
     reported.current.add(phase);
     void latest.current.rpc({ route: "ui.status", payload: { phase, platform: Platform.OS } }).catch(() => {});
   };
@@ -63,12 +59,13 @@ function NativeFrameBody(props: Props) {
   const send = (data: unknown) => inject(`globalThis.__PASEO_CONTEXT_RECEIVE__?.(${JSON.stringify(data)});true;`);
   const initialize = () => {
     const { props, settings, locale } = latest.current;
-    if (settings.status !== "ready") return;
+    const values = props.preview?.values ?? (settings.status === "ready" ? settings.values : null);
+    if (!values) return;
     const hex = props.theme.colors.surface0.replace("#", "");
     const rgb = hex.length === 3 ? hex.split("").map((c) => parseInt(c + c, 16))
       : [0, 2, 4].map((at) => parseInt(hex.slice(at, at + 2), 16));
     send({ type: "paseo-context:init", nonce, agentId: props.agentId ?? "", mode: props.mode, locale,
-      preferences: originalPreferences(settings.values), dark: rgb.reduce((n, c) => n + c, 0) / 3 < 128 });
+      preferences: originalPreferences(values), preview: !!props.preview, dark: rgb.reduce((n, c) => n + c, 0) / 3 < 128 });
   };
   useEffect(() => {
     mounted.current = true;
@@ -82,7 +79,7 @@ function NativeFrameBody(props: Props) {
     setHtml(Platform.OS === "android" ? markup.replace("globalThis.__PASEO_CONTEXT_NONCE__=",
       'globalThis.__PASEO_CONTEXT_TRANSPORT__="history";globalThis.__PASEO_CONTEXT_NONCE__=') : markup);
   }, [markupQuery.data, markupQuery.error, nonce]);
-  useEffect(initialize, [settings.status === "ready" ? settings.revision : "", locale, props.mode, props.agentId, props.theme.colors.surface0]);
+  useEffect(initialize, [settings.status === "ready" ? settings.revision : "", props.preview?.values, locale, props.mode, props.agentId, props.theme.colors.surface0]);
   const receive = (event: { nativeEvent: { data: string } }) => {
     if (!mounted.current) return;
     let data: any;
@@ -92,12 +89,18 @@ function NativeFrameBody(props: Props) {
     if (data.type === "paseo-context:status") { report("rendered"); return; }
     if (data.type === "paseo-context:fatal") { setError(String(data.message)); report("JavaScript error"); return; }
     if (data.type === "paseo-context:action") {
-      if (data.name === "openSettings") latest.current.props.openSettings();
-      else if (data.name === "close") latest.current.props.onClose?.();
+      const { props } = latest.current;
+      if (props.preview) {
+        if (data.name === "openAgent") props.preview.onSelectAgent(String(data.payload?.agentId ?? ""));
+        if (data.name === "previewPage") props.preview.onSelectPage(data.payload?.mode);
+        return;
+      }
+      if (data.name === "openSettings") props.openSettings();
+      else if (data.name === "close") props.onClose?.();
       else if (data.name === "openAgent") {
         const id = String(data.payload?.agentId ?? "");
-        if (id.startsWith("native:")) latest.current.props.openContext(id);
-        else latest.current.props.navigation?.openAgent({ agentId: id });
+        if (id.startsWith("native:")) props.openContext(id);
+        else props.navigation?.openAgent({ agentId: id });
       } else if (data.name === "openExternal" && /^https?:\/\//.test(String(data.payload?.url))) void Linking.openURL(data.payload.url);
       return;
     }
@@ -107,7 +110,8 @@ function NativeFrameBody(props: Props) {
     };
     void (async () => {
       try {
-        const { settings, rpc } = latest.current;
+        const { props, settings, rpc } = latest.current;
+        if (props.preview) { reply(await previewRpc({ route: String(data.route), payload: data.payload })); return; }
         if (data.route === "clipboard.write") { await copyText(String(data.payload?.text ?? "")); reply(true); return; }
         if (data.route === "settings.set") {
           if (settings.status !== "ready") throw new Error("Preferences are not ready");
@@ -168,6 +172,6 @@ function NativeFrameBody(props: Props) {
     cacheEnabled: false, incognito: true, domStorageEnabled: false,
     thirdPartyCookiesEnabled: false, setSupportMultipleWindows: false,
     javaScriptCanOpenWindowsAutomatically: false,
-    automaticallyAdjustContentInsets: false, contentInsetAdjustmentBehavior: "never",
+    automaticallyAdjustContentInsets: false, contentInsetAdjustmentBehavior: "never", nestedScrollEnabled: !!props.preview,
   });
 }

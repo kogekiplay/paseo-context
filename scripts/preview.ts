@@ -60,7 +60,7 @@ const service = new ContextService(new SessionReader({ codex: root, claude: root
 const frame = (await readFile(".tmp/web/index.html", "utf8")).replaceAll("%%PASEO_CONTEXT_NONCE%%", nonce);
 const preferences = { defaultPlacement: "all", defaultGranularity: "step", defaultTrendMode: "total", defaultDeltaBase: "step",
   defaultToolSort: "size", defaultFileSort: "latest", insightsEntry: "show", defaultDurationCurve: "show", overviewAutoSteps: "200",
-  defaultOverviewRange: "30d", fleetTab: "show", promptPrefix: "", promptSuffix: "" };
+  defaultOverviewRange: "30d", fleetTab: "show" };
 const server = createServer(async (request, response) => {
   try {
     if (request.url === "/frame") { response.setHeader("Content-Type", "text/html; charset=utf-8"); response.end(frame); return; }

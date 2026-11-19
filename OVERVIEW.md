@@ -10,6 +10,6 @@ Requires Paseo 0.16.0 or newer and Node.js 22+ on the daemon. The original inter
 
 The daemon reads local Codex and Claude Code JSONL logs, falling back to Paseo timeline for other sessions. Actual token usage is provider reported; composition, cost and observable timing are estimates. Unlogged schemas, system prompts, provider internals and missing attachment data cannot be reconstructed.
 
-Preferences control panel placement, date range, trends, sorting and fleet visibility. Prompt prefix/suffix settings apply to new agents' system prompts and are sent to their chosen providers.
+Preferences control panel placement, date range, trends, sorting and fleet visibility. Interactive previews use sample sessions at desktop or phone widths.
 
 Session text travels only through the selected Paseo host's plugin RPC to your own client. Public requests fetch model pricing from models.dev, release/recommendation metadata from GitHub and recommendation icons from their HTTPS sources. If the daemon explicitly has DEEPSEEK_API_KEY, its official balance API is used; no DSH settings or credentials are read. Plugins run with the daemon user's filesystem access.

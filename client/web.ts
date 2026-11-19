@@ -1,6 +1,7 @@
 import { createElement, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
-import { useRpc, useSettings, useTranslation, type PluginSurfaceProps } from "@getpaseo/plugin/client";
-import { bridgeRpc } from "../shared/bridge";
+import { useRpc, useSettings, useTranslation } from "@getpaseo/plugin/client";
+import { bridgeRpc, settingsPreviewRpc } from "../shared/bridge";
+import type { FrameProps } from "./frame";
 import { preferences } from "../shared/contracts";
 import { upstreamHtmlGzip } from "../shared/generated/upstream-ui";
 import { messages } from "./messages";
@@ -20,11 +21,6 @@ declare const Blob: { new(parts: (ArrayBuffer | string)[], options?: { type: str
 declare const URL: { createObjectURL(blob: BrowserBlob): string; revokeObjectURL(url: string): void };
 declare const DecompressionStream: { new(format: "gzip"): unknown };
 declare const Response: { new(body: unknown): { text(): Promise<string> } };
-type Props = PluginSurfaceProps & {
-  mode: "context" | "fleet" | "statistics" | "insights" | "settings" | "modal";
-  agentId?: string; overlay?: boolean; onClose?: () => void;
-  openSettings: () => void; openContext: (agentId: string) => void;
-};
 const originalPreferences = (values: Record<string, unknown>) => Object.fromEntries(Object.entries(values).map(([key, value]) =>
   [key, typeof value === "boolean" ? value ? "show" : "hide" : value]));
 const Iframe = "iframe" as unknown as ComponentType<any>;
@@ -36,15 +32,15 @@ function readDocument() {
     return new Response(stream).text();
   })().catch((error) => { documentPromise = undefined; throw error; });
 }
-export function WebFrame(props: Props) {
+export function WebFrame(props: FrameProps) {
   return Platform.OS === "web" ? createElement(WebFrameHost, props) : null;
 }
-function WebFrameHost(props: Props) {
+function WebFrameHost(props: FrameProps) {
   const [attempt, setAttempt] = useState(0);
   return createElement(WebFrameBody, { ...props, key: attempt, retry: () => setAttempt((value) => value + 1) });
 }
-function WebFrameBody(props: Props & { retry: () => void }) {
-  const rpc = useRpc(bridgeRpc), settings = useSettings(preferences), { locale } = useTranslation(messages);
+function WebFrameBody(props: FrameProps & { retry: () => void }) {
+  const rpc = useRpc(props.preview ? settingsPreviewRpc : bridgeRpc), settings = useSettings(preferences), { locale } = useTranslation(messages);
   const frame = useRef<Frame | null>(null);
   const latest = useRef({ props, settings, locale });
   latest.current = { props, settings, locale };
@@ -54,8 +50,8 @@ function WebFrameBody(props: Props & { retry: () => void }) {
   const [error, setError] = useState("");
   const [slow, setSlow] = useState(false);
   const chinese = locale.startsWith("zh");
-  const loaded = ready && settings.status === "ready";
-  const failure = error || (settings.status === "error" || settings.status === "invalid" ? settings.error : "");
+  const loaded = ready && (!!props.preview || settings.status === "ready");
+  const failure = error || (!props.preview && (settings.status === "error" || settings.status === "invalid") ? settings.error : "");
   const failed = Boolean(failure);
   useEffect(() => {
     if (failed) {
@@ -76,11 +72,12 @@ function WebFrameBody(props: Props & { retry: () => void }) {
   }, [nonce, failed]);
   const initialize = () => {
     const { props, settings, locale } = latest.current;
-    if (settings.status !== "ready") return;
+    const values = props.preview?.values ?? (settings.status === "ready" ? settings.values : null);
+    if (!values) return;
     const hex = props.theme.colors.surface0.replace("#", ""), short = hex.length === 3;
     const rgb = short ? hex.split("").map((c) => parseInt(c + c, 16)) : [0, 2, 4].map((at) => parseInt(hex.slice(at, at + 2), 16));
     frame.current?.contentWindow?.postMessage({ type: "paseo-context:init", nonce, agentId: props.agentId ?? "", mode: props.mode,
-      locale, preferences: originalPreferences(settings.values), dark: rgb.reduce((n, c) => n + c, 0) / 3 < 128 }, "*");
+      locale, preferences: originalPreferences(values), preview: !!props.preview, dark: rgb.reduce((n, c) => n + c, 0) / 3 < 128 }, "*");
   };
   useEffect(() => {
     let active = true;
@@ -92,6 +89,11 @@ function WebFrameBody(props: Props & { retry: () => void }) {
       if (data.type === "paseo-context:fatal") { setError(String(data.message)); return; }
       if (data.type === "paseo-context:ready") { setSlow(false); setReady(true); initialize(); return; }
       if (data.type === "paseo-context:action") {
+        if (props.preview) {
+          if (data.name === "openAgent") props.preview.onSelectAgent(String(data.payload?.agentId ?? ""));
+          if (data.name === "previewPage") props.preview.onSelectPage(data.payload?.mode);
+          return;
+        }
         if (data.name === "openAgent") {
           const id = String(data.payload?.agentId ?? "");
           if (id.startsWith("native:")) props.openContext(id); else props.navigation?.openAgent({ agentId: id });
@@ -110,6 +112,7 @@ function WebFrameBody(props: Props & { retry: () => void }) {
       void (async () => {
         try {
           if (!active) return;
+          if (props.preview) { reply(await rpc({ route: String(data.route), payload: data.payload })); return; }
           if (data.route === "clipboard.write") {
             await copyText(String(data.payload?.text ?? ""));
             if (!active) return;
@@ -135,7 +138,7 @@ function WebFrameBody(props: Props & { retry: () => void }) {
     window.addEventListener("message", listener);
     return () => { active = false; window.removeEventListener("message", listener); };
   }, [rpc, nonce]);
-  useEffect(initialize, [settings.status, settings.status === "ready" ? settings.revision : "", locale, props.mode, props.agentId, props.theme.colors.surface0]);
+  useEffect(initialize, [settings.status, settings.status === "ready" ? settings.revision : "", props.preview?.values, locale, props.mode, props.agentId, props.theme.colors.surface0]);
   useEffect(() => {
     if (loaded || failed) return;
     const timer = setTimeout(() => setSlow(true), 15000);
@@ -157,7 +160,7 @@ function WebFrameBody(props: Props & { retry: () => void }) {
         createElement(Text, { style: { color: props.theme.colors.accent } }, chinese ? "关闭" : "Close")) : null) : null,
     source && !failed ? createElement(Iframe, {
       ref: frame, title: "Paseo Context", src: source, onLoad: initialize,
-      sandbox: "allow-scripts allow-downloads", referrerPolicy: "no-referrer", allow: "clipboard-write",
+      sandbox: props.preview ? "allow-scripts" : "allow-scripts allow-downloads", referrerPolicy: "no-referrer", allow: props.preview ? undefined : "clipboard-write",
       style: { display: "block", width: "100%", height: "100%", minHeight: 0, border: 0, flex: 1, visibility: loaded || slow ? "visible" : "hidden" },
     }) : null);
 }

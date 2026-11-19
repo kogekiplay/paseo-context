@@ -1,8 +1,7 @@
-import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactElement, type ReactNode } from 'react'
+import { useState, type MouseEvent as ReactMouseEvent, type ReactElement, type ReactNode } from 'react'
 import { Menu } from '../../../web/vendor/ui/index.js'
 import { IconChevronDown } from '../primitives'
 import { seatKeyOf, seatOf } from '../services'
-import { ClearButton, clearOnEscape } from './clearableInput'
 import type { SettingsField, SettingsState } from '../settings'
 import type { ViewKit } from '../viewkit'
 
@@ -84,59 +83,6 @@ function PrefRow(props: PrefRowProps): ReactElement {
 }
 
 type Translate = ViewKit['t']
-
-interface PromptTextRowProps {
-  label: string
-  placeholder: string
-  value: string
-  disabled: boolean
-  clearLabel: string
-  onCommit: (text: string) => void
-}
-
-function PromptTextRow(props: PromptTextRowProps): ReactElement {
-  const [draft, setDraft] = useState(props.value)
-  const [focused, setFocused] = useState(false)
-  const areaRef = useRef<HTMLTextAreaElement>(null)
-  const latest = useRef({ draft: props.value, value: props.value, commit: props.onCommit })
-  latest.current = { draft, value: props.value, commit: props.onCommit }
-  if (!focused && draft !== props.value) setDraft(props.value)
-  useEffect(() => () => {
-    const { draft: text, value, commit } = latest.current
-    if (text !== value) commit(text)
-  }, [])
-  const rows = Math.min(8, Math.max(2, draft.split('\n').length))
-  const clear = (): void => {
-    setDraft('')
-    areaRef.current?.focus()
-  }
-  return (
-    <div className="lc-settings-row lc-settings-textrow">
-      <span className="lc-settings-label">{props.label}</span>
-      <div className="lc-settings-textwrap">
-        <textarea
-          ref={areaRef}
-          className="lc-settings-textarea"
-          rows={rows}
-          placeholder={props.placeholder}
-          disabled={props.disabled}
-          value={draft}
-          data-lc-clearable=""
-          onFocus={() => { setFocused(true) }}
-          onBlur={() => {
-            setFocused(false)
-            if (draft !== props.value) props.onCommit(draft)
-          }}
-          onChange={(event) => { setDraft(event.target.value) }}
-          onKeyDown={(event) => { clearOnEscape(event, clear) }}
-        />
-        {!props.disabled && draft !== '' ? (
-          <ClearButton label={props.clearLabel} className="lc-settings-textx" onClick={clear} />
-        ) : null}
-      </div>
-    </div>
-  )
-}
 
 function ShowHideRow(props: { t: Translate; label: string; value: string; disabled: boolean; onPick: (id: string) => void }): ReactElement {
   return (
@@ -264,25 +210,6 @@ function PreferenceRows(props: { t: Translate; state: SettingsState; set?: Setti
             { id: 'name', label: t('files.sort.name') },
           ]}
           onPick={(id) => { set?.('defaultFileSort', id) }}
-        />
-      </Group>
-      <Group title={t('settings.group.prompt')}>
-        <p className="lc-settings-note">{t('settings.promptHint')}</p>
-        <PromptTextRow
-          label={t('settings.promptPrefix')}
-          placeholder={t('settings.promptPlaceholder')}
-          value={state.promptPrefix}
-          disabled={disabled}
-          clearLabel={t('field.clear')}
-          onCommit={(text) => { set?.('promptPrefix', text) }}
-        />
-        <PromptTextRow
-          label={t('settings.promptSuffix')}
-          placeholder={t('settings.promptPlaceholder')}
-          value={state.promptSuffix}
-          disabled={disabled}
-          clearLabel={t('field.clear')}
-          onCommit={(text) => { set?.('promptSuffix', text) }}
         />
       </Group>
     </>

@@ -54,7 +54,7 @@ document.addEventListener("click", (event) => {
   if (/^https?:\/\//.test(url)) { event.preventDefault(); action("openExternal", { url }); }
 });
 
-type State = { byId: Record<string, any>; selected: any; familyRevision?: string; current: string; locale: string; mode: string; preferences: Record<string, unknown>; image: { src: string; name: string; text?: string; note?: string } | null };
+type State = { byId: Record<string, any>; selected: any; familyRevision?: string; current: string; locale: string; mode: string; preview?: boolean; preferences: Record<string, unknown>; image: { src: string; name: string; text?: string; note?: string } | null };
 let state: State = { byId: {}, selected: null, current: "", locale: "en", mode: "context", preferences: {}, image: null };
 const listeners = new Set<() => void>(), cleanups: Array<() => void> = [];
 const subscribe = (listener: () => void) => { listeners.add(listener); return () => { listeners.delete(listener); }; };
@@ -73,6 +73,7 @@ const sessions = {
   scope: () => ({ bail: (_subject: unknown, _event: string, payload: any) => {
     if (!payload?.view) return;
     const mode = payload.view === "context-fleet" ? "fleet" : "context";
+    if (state.preview) { action("previewPage", { mode }); return; }
     familyRead?.abort(); familyRead = null;
     publish({ mode, selected: null, familyRevision: undefined });
     loader.configure({ agentId: state.current, mode });
@@ -94,9 +95,10 @@ const sessions = {
 };
 let familyStamp = "";
 const scope = {
-  getSnapshot: () => ({ status: "ready", value: state.preferences, writable: true }),
+  getSnapshot: () => ({ status: "ready", value: state.preferences, writable: !state.preview }),
   subscribe,
   set: async (field: string, value: unknown) => {
+    if (state.preview) return;
     const values = await call("settings.set", { field, value });
     publish({ preferences: values });
   },
@@ -105,7 +107,7 @@ const context = {
   locale, slots: { entries: () => [], inject: (_name: string, fn: () => unknown) => fn(), register: () => () => {} },
   remote: { session: { page: (request: unknown, signal?: AbortSignal) => call("history.page", request, { signal }) } },
   get(name: string) {
-    return ({ sessions, locale, connection: { isLoopback: false },
+    return ({ sessions, locale, paseoContextPreview: state.preview, connection: { isLoopback: false },
       uiWorkspace: { openSession: (id: string) => action("openAgent", { agentId: id }) },
       uiConversation: {
         imageUrl: (sessionId: string, attachment: { attachmentId: string }) => call("api/paseo-context/image", { sessionId, attachmentId: attachment.attachmentId }),
@@ -156,14 +158,16 @@ const useProjection = (key: string) => {
 const useSessions = <T,>(selector: (snapshot: any) => T) => selector(state);
 function App() {
   const s = useSyncExternalStore(subscribe, () => state);
-  if (s.mode === "insights") return <Overview useSessions={useSessions} />;
+  const previewKey = s.preview ? JSON.stringify(s.preferences) : undefined;
+  if (s.mode === "insights") return <Overview key={previewKey} useSessions={useSessions} />;
   if (s.mode === "settings") return <div className="pc-settings"><Config useContextSettings={(selector) => useSyncExternalStore(settings.store.subscribe, () => selector(settings.store.getSnapshot()))} set={(field, value) => settings.set(field, value)} /></div>;
   if (!s.current) return <div className="pc-status">{t("trend.empty")}</div>;
   if (!s.selected) return <div className="pc-status" role="status">{s.locale.startsWith("zh") ? "正在加载…" : "Loading…"}</div>;
   const props = { sessionId: s.current, useProjection };
   if (s.mode === "statistics") return <Statistics key={s.current} {...props} locale={s.locale} snapshot={s.selected?.statistics ?? null} />;
   if (s.mode === "modal") return <ContextModal {...props} useContextModal={(selector) => useSyncExternalStore(modalStoreOf(s.current).subscribe, () => selector(modalStoreOf(s.current).getSnapshot()))} />;
-  return s.mode === "fleet" ? <FleetView {...props} /> : <ContextView {...props} />;
+  return s.mode === "fleet" ? <FleetView {...props} /> : <ContextView key={previewKey === undefined ? undefined : `${s.current}:${previewKey}`}
+    host={s.mode === "sidebar-context" ? "sidebar" : undefined} {...props} />;
 }
 function ImagePreview() {
   const image = useSyncExternalStore(subscribe, () => state.image);
@@ -182,7 +186,7 @@ function ImagePreview() {
 let stopped = false, rendered = false;
 const loader = new PageLoader({
   read: ({ agentId, mode }, signal) => call("bootstrap", {
-    agentId, mode, revision: state.selected?.revision, familyRevision: state.familyRevision,
+    agentId, mode: mode === "sidebar-context" ? "context" : mode, revision: state.selected?.revision, familyRevision: state.familyRevision,
   }, { signal }),
   accept: (_target, result) => {
     const selected = result.selected?.unchanged ? state.selected : result.selected;
@@ -208,10 +212,11 @@ const loader = new PageLoader({
     }
     const error = document.getElementById("pc-error");
     if (error) error.textContent = "";
-    if (state.mode === "context" || state.mode === "modal") {
+    const wantsFamily = () => state.mode === "context" || state.mode === "sidebar-context" || state.mode === "modal";
+    if (wantsFamily()) {
       // Headline and browser paint first; family costs follow independently.
       requestAnimationFrame(() => {
-        if (!stopped && (state.mode === "context" || state.mode === "modal")) void sessions.refreshSubagents(state.current);
+        if (!stopped && wantsFamily()) void sessions.refreshSubagents(state.current);
       });
     }
   },
@@ -225,10 +230,12 @@ window.addEventListener("message", (event) => {
   if (event.source !== parent || event.data?.type !== "paseo-context:init" || event.data?.nonce !== (globalThis as any).__PASEO_CONTEXT_NONCE__) return;
   const current = event.data.agentId || "";
   const mode = event.data.mode || "context";
+  const preview = event.data.preview === true;
   if (current !== state.current || mode !== state.mode) {
     familyRead?.abort(); familyRead = null; familyStamp = "";
   }
-  publish({ current, ...(current !== state.current || mode !== state.mode ? { selected: null, image: null, byId: {}, familyRevision: undefined } : {}), locale: event.data.locale || "en", mode, preferences: event.data.preferences || {} });
+  document.body.toggleAttribute("data-pc-preview", preview);
+  publish({ current, ...(current !== state.current || mode !== state.mode ? { selected: null, image: null, byId: {}, familyRevision: undefined } : {}), locale: event.data.locale || "en", mode, preview, preferences: event.data.preferences || {} });
   const modalTarget = state.mode === "modal" ? state.current : null;
   if (modalTarget !== modalSession) {
     modalOff?.(); modalOff = null;
@@ -243,7 +250,7 @@ window.addEventListener("message", (event) => {
   }
   if (state.mode !== "modal") document.body.style.background = "";
   if (event.data.dark) document.body.setAttribute("data-ds-dark-theme", ""); else document.body.removeAttribute("data-ds-dark-theme");
-  loader.configure({ agentId: current, mode });
+  loader.configure({ agentId: current, mode, preview });
   if ((mode === "settings" || mode === "insights") && !rendered) {
     rendered = true;
     send({ type: "paseo-context:status", nonce: (globalThis as any).__PASEO_CONTEXT_NONCE__, phase: "rendered" });
