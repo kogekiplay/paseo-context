@@ -3,7 +3,7 @@ import { recomsOfPayload } from "../shared/core/recoms";
 import { recommendations } from "../shared/recommendations";
 import { record, text } from "./value";
 import type { PublicCache } from "./public-cache";
-import { version as VERSION } from "../package.json";
+import { pluginVersion as VERSION } from "../shared/generated/ui-revision";
 
 export class Metadata {
   constructor(private publicCache?: PublicCache) {}
