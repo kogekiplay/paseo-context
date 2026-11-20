@@ -4,10 +4,13 @@ import { ContextService } from "./server/service";
 import { UiRoutes } from "./server/ui-routes";
 import { bridgeRpc, settingsPreviewRpc } from "./shared/bridge";
 import { SettingsPreview } from "./server/settings-preview";
+import { Pricing } from "./server/pricing";
+import { PublicCache } from "./server/public-cache";
 
 export default function contribute(server: PluginServerContext) {
-  const service = new ContextService();
-  const ui = new UiRoutes(service);
+  const cache = new PublicCache();
+  const service = new ContextService(undefined, new Pricing(cache));
+  const ui = new UiRoutes(service, cache);
   const preview = new SettingsPreview();
   server.handle(bridgeRpc, ({ route, payload }, { paseo }) => ui.handle(route, payload, paseo));
   server.handle(settingsPreviewRpc, ({ route, payload }) => preview.handle(route, payload));
@@ -45,5 +48,5 @@ export default function contribute(server: PluginServerContext) {
   server.handle(overviewRpc, ({ offset, ...scope }, { paseo }) => service.overview(scope, offset, paseo));
   server.handle(fleetRpc, ({ agentId }, { paseo }) => service.fleet(agentId, paseo));
   server.handle(collaborationRpc, ({ agentId }, { paseo }) => service.collaboration(agentId, paseo));
-  return () => { preview.clear(); ui.clear(); service.clear(); };
+  return async () => { preview.clear(); ui.clear(); service.clear(); await cache.clear(); };
 }

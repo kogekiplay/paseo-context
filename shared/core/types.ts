@@ -13,6 +13,8 @@ export interface TimelineCounts {
   compactions: number
   prunes: number
   skills?: number
+  events?: number
+  modelSwitches?: number
 }
 
 export interface TimelineLast {
@@ -458,6 +460,7 @@ export interface RequestRecord extends SlimRequestRecord {
 }
 
 export interface ContextEventRecord {
+  id?: number
   seq: number
   time: number
   kind: 'compaction' | 'prune' | 'inject' | 'model' | 'mode'

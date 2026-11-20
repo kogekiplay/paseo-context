@@ -2,9 +2,11 @@ import { isNewerRelease } from "../shared/core/version";
 import { recomsOfPayload } from "../shared/core/recoms";
 import { recommendations } from "../shared/recommendations";
 import { record, text } from "./value";
+import type { PublicCache } from "./public-cache";
+import { version as VERSION } from "../package.json";
 
-export const VERSION = "0.2.6";
 export class Metadata {
+  constructor(private publicCache?: PublicCache) {}
   private cache = new Map<string, { at: number; value: unknown }>();
   private busy = new Map<string, Promise<unknown>>();
   private controllers = new Set<AbortController>();
@@ -44,13 +46,25 @@ export class Metadata {
       }
     });
   }
-  recoms() {
-    return this.cached("recoms", 1_800_000, async () => {
+  async recoms() {
+    const ttl = 3_600_000;
+    const { recoms, degraded, expires } = await this.cached("recoms", 60_000, async () => {
+      const cached = await this.publicCache?.read("recommendations");
+      const previous = cached ? recomsOfPayload(cached.value) : [];
+      if (cached && previous.length && Date.now() - cached.at < ttl) {
+        return { recoms: previous, degraded: false, expires: cached.at + ttl };
+      }
       try {
         const rows = recomsOfPayload(await this.json("https://raw.githubusercontent.com/bowenliang123/dsh-context/main/data/recoms.json"));
-        return rows.length ? rows : recommendations;
-      } catch { return recommendations; }
+        if (rows.length) {
+          const at = Date.now();
+          if (!this.closed) await this.publicCache?.write("recommendations", rows, at);
+          return { recoms: rows, degraded: false, expires: at + ttl };
+        }
+      } catch {}
+      return { recoms: previous.length ? previous : recommendations, degraded: true, expires: Date.now() + 60_000 };
     });
+    return { recoms, degraded, freshForMs: Math.max(0, expires - Date.now()) };
   }
   balance() {
     const key = process.env.DEEPSEEK_API_KEY;

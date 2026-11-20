@@ -74,3 +74,7 @@ export async function postRouteQuietly<T>(
     return null
   }
 }
+
+export async function postRouteAction(route: string, body: unknown): Promise<void> {
+  try { await readEnvelope(route, body, {}); } catch {}
+}

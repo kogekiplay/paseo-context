@@ -11,6 +11,14 @@ import { remoteStateOf } from './useRemoteState'
 
 export const EVENT_KINDS = ['inject', 'compaction', 'prune', 'model'] as const
 
+export const EVENT_FILTERS = ['all', ...EVENT_KINDS] as const
+
+export type EventKindFilter = (typeof EVENT_FILTERS)[number]
+
+export function eventFilterLabelOf(t: Translate, filter: EventKindFilter): string {
+  return t(filter === 'model' ? 'kind.modelSwitch' : 'kind.' + filter)
+}
+
 const EVENT_ICONS: Record<string, string> = { compaction: '✂', prune: '✂', mode: '⇄' }
 
 export interface EventListProps {
@@ -148,7 +156,7 @@ export function makeEventList(kit: ViewKit): (props: EventListProps) => ReactEle
           const label = lead === '' ? tail : <><b>{lead}</b>{tail}</>
           const tip = eventTipOf(ev)
           return (
-            <div key={ev.seq} className="lc-event @max-[380px]/lc-card:flex-wrap">
+            <div key={ev.id === undefined ? `${ev.seq}:${ev.kind}` : `event:${ev.id}`} className="lc-event @max-[380px]/lc-card:flex-wrap">
               <span className={'lc-event-icon lc-event-' + ev.kind}>{glyph}</span>
               <span className={'lc-kind lc-kind-' + ev.kind}>{t('kind.' + ev.kind)}</span>
               {reveal !== undefined ? (

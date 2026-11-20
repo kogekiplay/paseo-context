@@ -8,6 +8,7 @@ import { count, printable, record, text, timestamp } from "./value";
 import { createHash } from "node:crypto";
 import { messagesOf } from "./normalize";
 import { scopedIntervals, sumTiming, unionMs } from "./timing";
+import { dayKeyOf, shiftDayKey, startOfDayKey } from "../shared/core/days";
 
 const CORPUS_TTL_MS = 10_000;
 const FIRST_PAINT_BUDGET_MS = 400;
@@ -19,6 +20,9 @@ interface Corpus {
   requests: Map<string, ContextFold["requests"]>;
   scanned: number;
   failed: number;
+  unreadable: number;
+  failedSessions: { id: string; reason: string }[];
+  unreadableSessions: { id: string; reason: string }[];
   running: boolean;
   revision: number;
 }
@@ -59,6 +63,7 @@ export class ContextService {
   private corpusRevision = 0;
   private scanLifetime = new AbortController();
   private retryCorpusAt = 0;
+  private refreshIssues: Corpus["failedSessions"] = [];
   private overviewCache = new Map<string, ReturnType<typeof aggregate>>();
   private overviewCacheRevision = "";
   private closed = false;
@@ -235,10 +240,12 @@ export class ContextService {
     if (!corpus || this.closed) throw new Error("Plugin was stopped");
     const running = this.scanning !== null;
     const refreshFailed = this.retryCorpusAt !== 0;
-    const covered = corpus.all.length, remaining = corpus.scanned - covered - corpus.failed;
-    const version = `${corpus.revision}:${running}:${refreshFailed}:${new Date().toDateString()}`;
+    const covered = corpus.all.length, remaining = corpus.scanned - covered - corpus.failed - corpus.unreadable;
+    const version = `${corpus.revision}:${running}:${this.retryCorpusAt}:${new Date().toDateString()}`;
     const coverage = { complete: !corpus.running && corpus.failed === 0, remaining,
-      failed: corpus.failed, running: corpus.running, total: corpus.scanned, covered, unsupported: 0 };
+      failed: corpus.failed, running: corpus.running, total: corpus.scanned, covered, unsupported: 0,
+      unreadable: corpus.unreadable, failedSessions: corpus.failedSessions, unreadableSessions: corpus.unreadableSessions,
+      refreshIssues: this.refreshIssues };
     if (this.overviewCacheRevision !== version) {
       this.overviewCache.clear();
       this.overviewCacheRevision = version;
@@ -256,7 +263,8 @@ export class ContextService {
   async backfill(paseo: PaseoApi) {
     const corpus = await this.readCorpus(paseo, true);
     return { complete: corpus.failed === 0, remaining: 0, failed: corpus.failed, running: false,
-      total: corpus.scanned, covered: corpus.scanned - corpus.failed, unsupported: 0 };
+      total: corpus.scanned, covered: corpus.all.length, unsupported: 0, unreadable: corpus.unreadable,
+      failedSessions: corpus.failedSessions, unreadableSessions: corpus.unreadableSessions };
   }
   private async readCorpus(paseo: PaseoApi, force = false) {
     if (this.closed) throw new Error("Plugin was stopped");
@@ -264,10 +272,17 @@ export class ContextService {
     if (!force && this.corpus && this.corpus.pricingRevision === this.pricing.revision
       && Date.now() - this.corpus.at < CORPUS_TTL_MS) return this.corpus;
     const corpus = this.scanning = { at: 0, pricingRevision: this.pricing.revision, all: [],
-      requests: new Map(), scanned: 0, failed: 0, running: true, revision: ++this.corpusRevision };
+      requests: new Map(), scanned: 0, failed: 0, unreadable: 0, failedSessions: [], unreadableSessions: [],
+      running: true, revision: ++this.corpusRevision };
     this.corpusBusy = this.scanCorpus(paseo, corpus);
     try { return await this.corpusBusy; }
-    catch (error) { this.retryCorpusAt = Date.now() + CORPUS_TTL_MS; throw error; }
+    catch (error) {
+      if (!this.closed) {
+        this.retryCorpusAt = Date.now() + CORPUS_TTL_MS;
+        this.refreshIssues = [];
+      }
+      throw error;
+    }
     finally { this.corpusBusy = null; this.scanning = null; }
   }
   private async scanCorpus(paseo: PaseoApi, corpus: Corpus) {
@@ -286,7 +301,14 @@ export class ContextService {
           if (signal.aborted) return;
           corpus.all.push(data.summary);
           corpus.requests.set(raw.id, data.requests);
-        } catch { corpus.failed++; }
+        } catch (error) {
+          if (signal.aborted) return;
+          const code = (error as NodeJS.ErrnoException | undefined)?.code;
+          const unreadable = code === "EACCES" || code === "EPERM";
+          if (unreadable) corpus.unreadable++; else corpus.failed++;
+          const issues = unreadable ? corpus.unreadableSessions : corpus.failedSessions;
+          if (issues.length < 32) issues.push({ id: raw.id, reason: error instanceof Error ? error.message.slice(0, 300) : "Session read failed" });
+        }
         corpus.revision = ++this.corpusRevision;
       }
     }));
@@ -296,12 +318,14 @@ export class ContextService {
     corpus.at = Date.now();
     corpus.running = false;
     corpus.revision = ++this.corpusRevision;
-    if (agents.length && corpus.failed === agents.length) {
+    if (agents.length && corpus.all.length === 0) {
       this.retryCorpusAt = corpus.at + CORPUS_TTL_MS;
+      this.refreshIssues = [...corpus.failedSessions, ...corpus.unreadableSessions];
       return corpus;
     }
     this.corpus = corpus;
     this.retryCorpusAt = 0;
+    this.refreshIssues = [];
     return corpus;
   }
   async fleet(id: string, paseo: PaseoApi) {
@@ -346,32 +370,36 @@ export class ContextService {
     }
     return { records: records.sort((a, b) => a.time - b.time), failed };
   }
-  clear() { this.closed = true; this.scanLifetime.abort(); this.reader.clear(); this.pricing.clear(); this.summaries.clear(); this.nativeMembers.clear(); this.revisions.clear(); this.derived.clear(); this.loading.clear(); this.overviewCache.clear(); this.corpus = null; this.scanning = null; }
+  clear() { this.closed = true; this.scanLifetime.abort(); this.reader.clear(); this.pricing.clear(); this.summaries.clear(); this.nativeMembers.clear(); this.revisions.clear(); this.derived.clear(); this.loading.clear(); this.overviewCache.clear(); this.refreshIssues = []; this.corpus = null; this.scanning = null; }
 }
 
 export function aggregate(all: Summary[], requests: Map<string, ContextFold["requests"]>, scope: Scope, offset: number, scanned: number, failed: number, now = Date.now()) {
-  const midnight = new Date(now); midnight.setHours(0, 0, 0, 0);
-  const shiftDay = (value: number, n: number) => { const date = new Date(value); date.setDate(date.getDate() + n); return date.getTime(); };
-  const start = scope.day ? timestamp(`${scope.day}T00:00:00`) : scope.range === "all" ? 0
-    : scope.range === "custom" ? timestamp(`${scope.start}T00:00:00`)
-    : shiftDay(midnight.getTime(), -(scope.range === "today" ? 0 : scope.range === "7d" ? 6 : 29));
-  const end = scope.day ? shiftDay(timestamp(`${scope.day}T00:00:00`), 1)
-    : scope.range === "custom" && scope.end ? shiftDay(timestamp(`${scope.end}T00:00:00`), 1) : Infinity;
-  const groups = [...new Set(all.map((s) => s.agent.cwd))].sort();
+  const today = dayKeyOf(now) ?? "";
+  const day = startOfDayKey(scope.day) === null ? "" : scope.day;
+  const from = day || (scope.range === "custom" ? scope.start : scope.range === "all" ? ""
+    : shiftDayKey(today, -(scope.range === "today" ? 0 : scope.range === "7d" ? 6 : 29)) ?? "");
+  const to = day || (scope.range === "custom" ? scope.end : "");
+  const start = startOfDayKey(from) ?? 0;
+  const end = startOfDayKey(shiftDayKey(to, 1) ?? "") ?? Infinity;
+  const projectKey = (s: Summary) => s.agent.cwd || "__ungrouped__";
+  const groups = [...new Set(all.map(projectKey))].sort();
   const query = scope.query.toLowerCase();
-  const filtered = all.filter((s) => {
+  const eligible = all.filter((s) => {
     const a = s.agent;
     const search = !query || `${a.title} ${a.cwd} ${a.provider} ${a.model}`.toLowerCase().includes(query);
-    return search && (!scope.group || a.cwd === scope.group)
-      && (scope.coverage === "all" || (scope.coverage === "archived") === a.archived)
-      && (!scope.pick || s.activity.some((d) => d.time >= start && d.time < end && d[scope.pick as "tools" | "skills" | "programs"].some((t) => t.name === scope.name)));
+    return search && (scope.coverage === "all" || (scope.coverage === "archived") === a.archived);
   });
-  const selected = filtered.filter((s) => {
+  const inScope = eligible.filter((s) => {
     const rows = requests.get(s.agent.id) ?? [];
     return rows.some((r) => r.time >= start && r.time < end)
       || (!rows.length && s.agent.updatedAt >= start && s.agent.updatedAt < end)
       || s.activity.some((d) => d.time >= start && d.time < end);
   });
+  const matchesPick = (s: Summary) => !scope.pick || s.activity.some((d) => d.time >= start && d.time < end
+    && d[scope.pick as "tools" | "skills" | "programs"].some((t) => t.name === scope.name));
+  const matchesFilters = (s: Summary) => (!scope.group || projectKey(s) === scope.group) && matchesPick(s);
+  const selected = inScope.filter(matchesFilters);
+  const filtered = eligible.filter(matchesFilters);
   let tokens = 0, input = 0, cacheRead = 0, cost = 0, priced = 0, total = 0, turns = 0;
   const days = new Map<string, { day: string; tokens: number; costUsd: number | null; sessions: Set<string> }>();
   const parts = emptyParts();
@@ -418,20 +446,33 @@ export function aggregate(all: Summary[], requests: Map<string, ContextFold["req
   selected.sort((a, b) => scope.sort === "tokens" ? rangeTokens(b) - rangeTokens(a)
     : scope.sort === "context" ? (b.contextTokens ?? 0) - (a.contextTokens ?? 0) : b.agent.updatedAt - a.agent.updatedAt);
   const tools = tally("tools"), skills = tally("skills"), programs = tally("programs");
+  const byProject = new Map<string, { key: string; sessions: number; tokens: number }>();
+  for (const session of selected) {
+    const key = projectKey(session);
+    const project = byProject.get(key) ?? { key, sessions: 0, tokens: 0 };
+    project.sessions++; project.tokens += rangeTokens(session);
+    byProject.set(key, project);
+  }
   const counts = new Map<string, number>();
-  for (const s of selected) counts.set(s.agent.cwd, (counts.get(s.agent.cwd) ?? 0) + 1);
+  for (const session of inScope) {
+    const key = projectKey(session);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
   const groupCounts = groups.map((key) => ({ key, count: counts.get(key) ?? 0 }));
+  const projects = [...byProject.values()].filter((row) => row.tokens > 0)
+    .sort((a, b) => b.tokens - a.tokens || a.key.localeCompare(b.key));
   let wallMs = 0, toolsMs = 0;
   for (const s of selected) {
     const intervals = scopedIntervals(s.intervals ?? [], start, end);
     wallMs += unionMs(intervals);
     toolsMs += intervals.filter((row) => row.kind === "tools").reduce((n, row) => n + row.end - row.start, 0);
   }
-  return { sessions: selected.slice(offset, offset + 24), total: selected.length, scanned, failed,
+  return { sessions: selected.slice(offset, offset + 24), total: selected.length, scopeTotal: inScope.length, scanned, failed,
     tokens, input, cacheRead, turns, calls: total, toolCalls: tools.reduce((n, t) => n + t.count, 0),
     wallMs, toolsMs, timing: sumTiming(selected), costUsd: priced ? cost : null,
     costComplete: total > 0 && priced === total, parts, groups,
-    groupCounts, tallySessionCounts, sessionsArchived: all.filter((s) => s.agent.archived).length,
+    groupCounts, projects, window: { start, end: Number.isFinite(end) ? end - 1 : null, from: from || null, to: to || today || null },
+    tallySessionCounts, sessionsArchived: all.filter((s) => s.agent.archived).length,
     archivedScoped: selected.filter((s) => s.agent.archived).length,
     costSessions: [...rangeUsage.values()].filter((usage) => usage.complete).length,
     usageSessions: rangeUsage.size,

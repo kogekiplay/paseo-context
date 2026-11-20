@@ -18,6 +18,15 @@ const usage = (id: string, time: number) => row("token_usage_record", { response
 const adapt = (fold: ContextFold) => upstreamOf({ fold, requests: fold.requests, summary: fold.summary(agent), agent, revision: fold.revision });
 
 describe("Original UI data contracts", () => {
+  test("counts an observed model transition once when Codex logs settings and turn context", () => {
+    const fold = new ContextFold("codex");
+    fold.apply(row("turn_context", { turn_id: "one", model: "model-a" }, 1000));
+    fold.apply(row("event_msg", { type: "thread_settings_applied", model: "model-b" }, 2000));
+    fold.apply(row("turn_context", { turn_id: "two", model: "model-b" }, 3000));
+    const { events, counts } = adapt(fold).head;
+    expect(events).toEqual([expect.objectContaining({ kind: "model", from: "model-a", to: "model-b" })]);
+    expect(counts).toMatchObject({ events: 1, modelSwitches: 1 });
+  });
   test("unknown usage survives the real adapter while provider-reported zero remains zero", () => {
     const fold = new ContextFold("codex");
     fold.apply(user("hello"));
@@ -100,7 +109,13 @@ describe("Original UI data contracts", () => {
     expect(data.costSessions).toBe(30);
     expect(data.archivedScoped).toBe(3);
     expect(data.groupCounts).toEqual([{ key: "/project", count: 30 }]);
+    expect(data.projects).toEqual([{ key: "/project", sessions: 30, tokens: 3600 }]);
+    expect(data.window).toMatchObject({ from: "2026-11-16", to: "2026-11-16" });
     expect(data.tallySessionCounts.tools.exec_command).toBe(30);
+    const projects = sessions.map((session, i) => i < 10 ? { ...session, agent: { ...session.agent, cwd: "/other" } } : session);
+    expect(aggregate(projects, requests, scopeSchema.parse({ range: "today", group: "/other" }), 0, 30, 0, now)).toMatchObject({
+      total: 10, scopeTotal: 30, groupCounts: [{ key: "/other", count: 10 }, { key: "/project", count: 20 }],
+    });
   });
   test("timeline fallback expands stdout and arguments from the correct normalized block", async () => {
     const service = new ContextService();

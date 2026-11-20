@@ -2,6 +2,8 @@
 
 This is a public GitHub fork of bowenliang123/dsh-context. The initial Paseo migration is based on `9e221195ac7c02cff9a21311dda6d61f50cf50d3` (v0.85.1 plus its next fix).
 
+Paseo Context v0.2.8 merges upstream `504bbac49dcaa5d7933027263bfa65178cdc2d48` (v0.86.0 plus subsequent fixes). Project distribution, scan progress and retries use the Paseo overview corpus. The upstream DSH log workers, persisted projection shards, and benchmark harness are tied to its own event stream and storage. Paseo continues to read native logs incrementally and uses Paseo timeline fallback, with public pricing and recommendation catalogs cached separately on disk.
+
 Keep the original component and stylesheet paths under `src/client`. Changes there should be limited to module imports, brand text and host calls. Preserve upstream layout, chart algorithms and CSS. The static primitives, store, language/path utilities and base theme under `web/vendor` originate from DeepSeek's MIT packages at `0.2.0-rc.2`; they are UI assets, not a host compatibility layer.
 
 ```sh

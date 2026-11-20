@@ -5,6 +5,7 @@ import { IconShare } from '../primitives'
 import type { ClientCtx, LocaleService } from '../services'
 import type { ViewKit } from '../viewkit'
 import { postRoute } from '../route'
+import { asRecord } from '../wire'
 
 const UNCACHED_STATE: RecomRead = { recom: DEFAULT_RECOM, degraded: false }
 
@@ -17,27 +18,35 @@ const shapeOf = (value: RecomRead): string =>
 const RECOM_TTL_MS = 30 * 60_000
 
 let latest: RecomRead | null = null
-let latestAt = 0
+let freshUntil = 0
 let pool: Recom[] | null = null
 let inFlight: Promise<RecomRead> | null = null
 
 export function resetRecomCache(): void {
   latest = null
-  latestAt = 0
+  freshUntil = 0
   pool = null
   inFlight = null
 }
 
 function nextCachedState(): RecomRead | null {
-  if (pool === null) return null
+  if (pool === null || Date.now() >= freshUntil) return null
   const index = pool.findIndex(item => item.id === latest?.recom.id)
   return { recom: pool[(index + 1) % pool.length], degraded: false }
 }
 
-async function requestRecoms(): Promise<RecomsRead | null> {
+type TimedRecomsRead = RecomsRead & { freshForMs: number }
+
+async function requestRecoms(): Promise<TimedRecomsRead | null> {
   try {
-    const recoms = await postRoute(RECOM_ROUTE, {}, recomsOfPayload)
-    return recoms === null || recoms.length === 0 ? null : { recoms, degraded: false }
+    return await postRoute(RECOM_ROUTE, {}, (value) => {
+      const data = asRecord(value)
+      const recoms = recomsOfPayload(Array.isArray(value) ? value : data?.recoms)
+      if (!recoms.length) return null
+      const age = data?.freshForMs
+      const freshForMs = typeof age === 'number' && Number.isFinite(age) ? Math.max(0, Math.min(RECOM_TTL_MS, age)) : RECOM_TTL_MS
+      return { recoms, degraded: data?.degraded === true, freshForMs }
+    })
   } catch {
     return null
   }
@@ -46,11 +55,11 @@ async function requestRecoms(): Promise<RecomsRead | null> {
 function loadRecom(): Promise<RecomRead> {
   if (inFlight !== null) return inFlight
   const request = requestRecoms().then((next) => {
-    const read: RecomsRead = next ?? { recoms: [DEFAULT_RECOM], degraded: true }
+    const read = next ?? { recoms: [DEFAULT_RECOM], degraded: true, freshForMs: 60_000 }
     pool = read.degraded ? null : read.recoms
     const recom = read.recoms[Math.floor(Math.random() * read.recoms.length)]
     latest = { recom, degraded: read.degraded }
-    latestAt = Date.now()
+    freshUntil = Date.now() + read.freshForMs
     return latest
   })
   const tracked = request.finally(() => {
@@ -76,7 +85,7 @@ export function makeRecomCard(kit: ViewKit, ctx: ClientCtx): () => ReactElement 
     useEffect(() => {
       const cached = latest
       latest = state
-      if (pool !== null && !state.degraded && Date.now() - latestAt < RECOM_TTL_MS) return
+      if (Date.now() < freshUntil) return
       let active = true
       void loadRecom().then((next) => {
         if (!active) return

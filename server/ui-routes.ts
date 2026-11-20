@@ -7,6 +7,7 @@ import { ContextService, agentOf } from "./service";
 import { nodeSeq, rowOf, upstreamOf } from "./upstream";
 import { count, record, text } from "./value";
 import { Metadata } from "./metadata";
+import type { PublicCache } from "./public-cache";
 import { UiFleet, graphHeadOf } from "./ui-fleet";
 import { uiDocument } from "./assets";
 import { imageUrlOf } from "./images";
@@ -15,12 +16,14 @@ import { statisticsOf } from "./statistics";
 import { statisticsDetails } from "./statistics-details";
 import { grammarOf } from "./grammars";
 import { createHash } from "node:crypto";
+import { dayKeyOf, startOfDayKey } from "../shared/core/days";
 
 export class UiRoutes {
-  private metadata = new Metadata();
+  private metadata: Metadata;
   private fleet: UiFleet;
   private projections = new WeakMap<Awaited<ReturnType<ContextService["load"]>>, ReturnType<typeof upstreamOf>>();
-  constructor(private service: ContextService) {
+  constructor(private service: ContextService, cache?: PublicCache) {
+    this.metadata = new Metadata(cache);
     this.fleet = new UiFleet(service);
     void service.pricing.refresh();
   }
@@ -117,7 +120,13 @@ export class UiRoutes {
     const name = route.replace(/^api\/paseo-context\//, "");
     if (name === "version") return { ok: true, value: await this.metadata.version() };
     if (name === "balance") return { ok: true, value: await this.metadata.balance() };
-    if (name === "backfill") return { ok: true, value: await this.service.backfill(paseo) };
+    if (name === "backfill") {
+      if (body.retry === true) {
+        void this.service.backfill(paseo).catch(() => {});
+        return { ok: true, value: null };
+      }
+      return { ok: true, value: await this.service.backfill(paseo) };
+    }
     if (name === "recom") return { ok: true, value: await this.metadata.recoms() };
     if (name === "file.preview") {
       const data = await this.load(id, paseo);
@@ -178,11 +187,14 @@ export class UiRoutes {
   }
   private async overview(body: Record<string, unknown>, paseo: PaseoApi) {
     const raw = record(body.scope), range = raw.range;
-    const date = (n: number) => { const d = new Date(n); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; };
+    const calendar = record(raw.calendar), from = text(calendar.from), to = text(calendar.to);
+    const explicitDays = startOfDayKey(from) !== null && startOfDayKey(to) !== null;
+    const custom = explicitDays || (range !== null && typeof range === "object");
+    const rangeObject = record(range);
+    const [start, end] = (explicitDays ? [from, to] : [dayKeyOf(count(rangeObject.start)) ?? "", dayKeyOf(count(rangeObject.end)) ?? ""]).sort();
     const pick = record(body.pick), field = text(pick.field), tally = text(body.tally);
-    const scope = scopeSchema.parse({ range: typeof range === "object" ? "custom" : range || "30d",
-      start: typeof range === "object" ? date(count(record(range).start)) : "",
-      end: typeof range === "object" ? date(count(record(range).end)) : "",
+    const scope = scopeSchema.parse({ range: custom ? "custom" : range || "30d",
+      start: custom ? start : "", end: custom ? end : "",
       day: text(raw.day), coverage: raw.coverage || "all", group: text(raw.group), query: text(raw.query), sort: body.sort || "recent",
       pick: field === "cmds" ? "programs" : field, name: text(pick.name),
     });
@@ -191,27 +203,28 @@ export class UiRoutes {
     if (!data) return { ok: true, value: { revision, refreshing, refreshFailed, unchanged: true } };
     const part = text(body.part), state = { revision, refreshing, refreshFailed, partial: coverage.running, pricingReady: true };
     const tokenParts = Object.entries(data.parts).map(([key, value]) => ({ key: key === "reasoning" ? "thinking" : key === "assistant" ? "answers" : key === "calls" ? "toolCalls" : key, value }));
-    if (part === "days") return { ok: true, value: { ...state, days: data.days.map((d) => ({ key: d.day, tokens: d.tokens, sessions: d.sessions, costUsd: d.costUsd })) } };
+    if (part === "days") return { ok: true, value: { ...state, today: dayKeyOf(Date.now()), days: data.days.map((d) => ({ key: d.day, tokens: d.tokens, sessions: d.sessions, costUsd: d.costUsd })) } };
     if (part === "summary") return { ok: true, value: { ...state, summary: {
       sessions: data.total, sessionsTotal: data.scanned, sessionsArchived: data.sessionsArchived, archivedScoped: data.archivedScoped,
       tokens: data.tokens, turns: data.turns, costUsd: data.costUsd, costSessions: data.costSessions,
       usageSessions: data.usageSessions, cacheHit: data.input > 0 ? (data.cacheRead / data.input * 100).toFixed(1) : null,
       tokenParts, timing: data.timing, windowTiming: { calls: data.calls, toolCalls: data.toolCalls, toolsMs: data.toolsMs, wallMs: data.wallMs },
-      coverage,
+      coverage, window: data.window,
     } } };
+    if (part === "projects") return { ok: true, value: { ...state, projects: data.projects } };
     if (part === "tally") {
       const items = tally === "cmds" ? data.programs : tally === "skills" ? data.skills : data.tools;
       const sessions = data.tallySessionCounts[tally === "cmds" ? "programs" : tally === "skills" ? "skills" : "tools"];
       return { ok: true, value: { ...state, tally: { field: tally, stats: items.map((t) => ({ name: t.name, n: t.count, sessions: sessions[t.name] ?? 0, last: t.last })) } } };
     }
     return { ok: true, value: { ...state, page: {
-      index, count: Math.max(1, Math.ceil(data.total / 24)), total: data.total, scopeTotal: data.total,
+      index, count: Math.max(1, Math.ceil(data.total / 24)), total: data.total, scopeTotal: data.scopeTotal,
       groups: data.groupCounts,
       items: data.sessions.map((s) => ({ id: s.agent.id, title: s.agent.title, cwd: s.agent.cwd, updatedAt: s.agent.updatedAt,
-        running: s.agent.running, archived: s.agent.archived, group: s.agent.cwd,
+        running: s.agent.running, archived: s.agent.archived, group: s.agent.cwd || "__ungrouped__",
         tokens: s.usage.input + s.usage.output, turns: s.turns, steps: s.steps, parts: Object.entries(currentOfSummary(s)).map(([key, value]) => ({ key, value })),
         total: Object.values(s.parts).reduce((a, b) => a + b, 0), contextWindow: s.contextWindow ?? undefined,
-        model: s.agent.model, costUsd: s.costUsd, createdDay: date(s.agent.createdAt) })),
+        model: s.agent.model, costUsd: s.costUsd, createdDay: dayKeyOf(s.agent.createdAt) ?? "" })),
     } } };
   }
 }

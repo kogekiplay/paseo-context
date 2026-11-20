@@ -37,7 +37,7 @@ function sampleFold(now: number, member: number) {
     const day = windows[Math.floor(turn / turnCount * windows.length)];
     const start = sampleTime(now, day) - (turnCount - turn) * 15_000;
     const turnId = `sample-turn-${turn}`;
-    add("turn_context", { turn_id: turnId, model: "gpt-5", tools }, start);
+    add("turn_context", { turn_id: turnId, model: member === 0 && turn < 6 ? "gpt-5-mini" : "gpt-5", tools }, start);
     message("user", ["Build the usage dashboard.", "Review the compact layout.", "Verify chart totals and request details."][turn % 3], start + 50);
     for (let step = 0; step < steps; step++) {
       const at = start + 150 + step * 1100, id = `sample-${turn}-${step}`, path = samplePaths[(turn + step) % samplePaths.length];

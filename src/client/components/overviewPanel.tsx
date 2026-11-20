@@ -8,9 +8,9 @@ import {
   type DayRange, type DayTotals, type OverviewCoverage, type OverviewRange, type OverviewSort,
   type TallyField, type TallyStat,
 } from '../overview'
-import { foldStateOf, useOverviewDays, useOverviewPage, useOverviewSummary, useOverviewTally } from '../overviewSource'
+import { foldStateOf, retryBackfill, useOverviewDays, useOverviewPage, useOverviewProjects, useOverviewSummary, useOverviewTally } from '../overviewSource'
 import type { PartState } from '../overviewSource'
-import type { OverviewRange as HostRange, OverviewScope, OverviewSummary } from '../../shared/types'
+import type { OverviewRange as HostRange, OverviewScope, OverviewSummary, BackfillSessionIssue } from '../../shared/types'
 import { openPluginSettings, openSessionVia, seatKeyOf, type ClientCtx } from '../services'
 import { readSkillCatalog } from '../skills'
 import type { ContextSettings } from '../settings'
@@ -28,6 +28,7 @@ import { makeOverviewTokens } from './overviewTokens'
 import { makeOverviewUsage } from './overviewUsage'
 import { makeStatsTiming } from './statsTiming'
 import { makeOverviewCard, type OverviewCardRow } from './overviewCard'
+import { makeOverviewProjects } from './overviewProjects'
 import { makeOverviewSkills } from './overviewSkills'
 import { makeOverviewTally } from './overviewTally'
 import type { TallyCardKind } from './overviewTally'
@@ -70,6 +71,7 @@ export function makeOverviewPanel(
   const OverviewTokens = makeOverviewTokens(kit, Donut)
   const StatsTiming = makeStatsTiming(kit, Donut)
   const OverviewUsage = makeOverviewUsage(kit)
+  const OverviewProjects = makeOverviewProjects(kit)
   const OverviewSkills = makeOverviewSkills(kit)
   const OverviewTally = makeOverviewTally(kit)
   const UpdatePill = makeUpdatePill(kit, ctx)
@@ -97,6 +99,7 @@ export function makeOverviewPanel(
     const [sort, setSort] = useState<OverviewSort>('recent')
     const [metric, setMetric] = useState<HeatMetric>('tokens')
     const [page, setPage] = useState(0)
+    const [retrying, setRetrying] = useState(false)
     const { zoneProps, bubble } = useHoverTip()
     const [bodyRef, bodyMounted] = useLazyMount()
 
@@ -120,26 +123,21 @@ export function makeOverviewPanel(
       const window = custom === null ? null : dayRangeWindow(custom)
       return window === null ? preset : { start: window.start, end: window.end }
     }, [custom, preset])
-    const scopeWindow = useMemo(
-      () => (custom !== null ? dayRangeWindow(custom) : null) ?? rangeWindowOf(preset, nowMinute),
-      [custom, preset, nowMinute],
-    )
-    const spanFrom = dayKeyOf(scopeWindow.start)
-    const spanTo = dayKeyOf(scopeWindow.end ?? nowMinute)
-    const span = spanFrom !== null && spanTo !== null ? { from: spanFrom, to: spanTo } : null
     const listScope = useMemo<OverviewScope>(() => ({
       range: hostRange,
+      ...(custom === null ? {} : { calendar: custom }),
       coverage,
       ...(day === null ? {} : { day }),
       ...(group === null ? {} : { group: group === UNGROUPED_KEY ? '__ungrouped__' : group }),
       ...(query.trim() === '' ? {} : { query: query.trim() }),
-    }), [hostRange, coverage, day, group, query])
+    }), [hostRange, custom, coverage, day, group, query])
     const tallyScope = useMemo<OverviewScope>(() => ({
       range: hostRange,
+      ...(custom === null ? {} : { calendar: custom }),
       coverage,
       ...(day === null ? {} : { day }),
-    }), [hostRange, coverage, day])
-    const summaryScope = useMemo<OverviewScope>(() => ({ range: hostRange, coverage }), [hostRange, coverage])
+    }), [hostRange, custom, coverage, day])
+    const summaryScope = listScope
     const daysScope = useMemo<OverviewScope>(() => ({ coverage }), [coverage])
     const summaryState = useOverviewSummary(summaryScope, true)
     const daysState = useOverviewDays(daysScope, true)
@@ -153,16 +151,45 @@ export function makeOverviewPanel(
     const skillsState = useOverviewTally({ part: 'tally', scope: tallyScope, tally: 'skills' }, bodyMounted)
     const toolsState = useOverviewTally({ part: 'tally', scope: tallyScope, tally: 'tools' }, bodyMounted)
     const cmdsState = useOverviewTally({ part: 'tally', scope: tallyScope, tally: 'cmds' }, bodyMounted)
+    const projectsState = useOverviewProjects({ part: 'projects', scope: tallyScope }, bodyMounted)
     const backfill = summaryState.coverage
-    const fold = foldStateOf(backfill)
-    const visibleParts = [summaryState, daysState, pageState, skillsState, toolsState, cmdsState]
-    const stale = visibleParts.some(state => state.stale && state.data !== null)
-    const partial = visibleParts.some(state => state.partial)
     const waitingForFirstSession = backfill?.running === true && backfill.covered === 0
     const firstLoadFailed = (summaryState.error && (backfill === null || waitingForFirstSession))
       || (pageState.error && pageState.data === null)
-      || (backfill !== null && !backfill.running && backfill.covered === 0 && backfill.failed > 0)
+      || (backfill !== null && !backfill.running && backfill.covered === 0 && backfill.total > 0)
     const summary: OverviewSummary | null = waitingForFirstSession ? null : summaryState.data?.summary ?? null
+    const fallbackWindow = (custom !== null ? dayRangeWindow(custom) : null) ?? rangeWindowOf(preset, nowMinute)
+    const today = daysState.data?.today ?? todayKey()
+    const spanFrom = summary?.window?.from ?? day ?? dayKeyOf(fallbackWindow.start)
+    const spanTo = summary?.window?.to ?? day ?? (fallbackWindow.end === null ? today : dayKeyOf(fallbackWindow.end))
+    const span = spanFrom !== null && spanTo !== null ? { from: spanFrom, to: spanTo } : null
+    const fold = foldStateOf(backfill)
+    const unreadable = backfill?.unreadable ?? 0
+    const failedCount = backfill?.failed ?? 0
+    const coveredCount = backfill?.covered ?? 0
+    const totalSessions = backfill?.total ?? 0
+    const refreshFailed = summaryState.stale && summary !== null
+    const retryable = refreshFailed || fold === 'stalled' || (fold === 'idle' && unreadable > 0)
+    const issues: BackfillSessionIssue[] = refreshFailed && backfill?.refreshIssues
+      ? backfill.refreshIssues : [...(backfill?.failedSessions ?? []), ...(backfill?.unreadableSessions ?? [])]
+    const issueTotal = refreshFailed ? issues.length : failedCount + unreadable
+    const foldTip = [
+      fold === 'idle' ? t('ov.fold.unreadableTip') : fold === 'stalled' ? t('ov.fold.stalledTip') : t('ov.fold.tip'),
+      ...(retryable ? [t('ov.fold.retry')] : []),
+      ...issues.map(entry => `${entry.id} — ${entry.reason}`),
+      ...(issues.length > 0 && issues.length < issueTotal ? [t('ov.fold.more', { n: issues.length, total: issueTotal })] : []),
+    ].join('\n')
+    const foldLabel = refreshFailed ? t('ov.refreshFailed') : fold === 'stalled'
+      ? t('ov.fold.stalled', { n: fmt(failedCount) })
+      : fold === 'idle'
+        ? t('ov.fold.unreadable', { n: unreadable })
+        : totalSessions === 0
+          ? t('ov.fold.starting')
+          : t('ov.fold.progress', { n: coveredCount, total: totalSessions })
+    const retryFold = (): void => {
+      setRetrying(true)
+      void retryBackfill().finally(() => { setRetrying(false) })
+    }
     const pageValue = pageState.data?.page ?? null
     const pageIndex = pageValue?.index ?? 0
     const pageCount = pageValue?.count ?? 1
@@ -203,6 +230,7 @@ export function makeOverviewPanel(
     const skillStats = useMemo(() => [...(skillsState.data?.tally.stats ?? [])], [skillsState.data])
     const toolStats = useMemo(() => [...(toolsState.data?.tally.stats ?? [])], [toolsState.data])
     const commandStats = useMemo(() => [...(cmdsState.data?.tally.stats ?? [])], [cmdsState.data])
+    const projectStats = useMemo(() => [...(projectsState.data?.projects ?? [])], [projectsState.data])
     const tallyCards: readonly { kind: TallyCardKind; field: TallyField; stats: TallyStat[] }[] = [
       { kind: 'tool', field: 'tools', stats: toolStats },
       { kind: 'command', field: 'cmds', stats: commandStats },
@@ -244,24 +272,27 @@ export function makeOverviewPanel(
               </button>
               <BalanceCapsule />
               <UpdatePill />
-              {!firstLoadFailed && stale && (
-                <span className="lc-ov-folding" role="status">{t('ov.refreshFailed')}</span>
-              )}
-              {!firstLoadFailed && !stale && (fold !== 'idle' || partial) && (
-                <span className="lc-ov-folding" title={t('ov.fold.tip')}>
-                  {backfill === null || backfill.total === 0 || fold === 'idle'
-                    ? t('ov.fold.starting')
-                    : fold === 'stalled'
-                    ? t('ov.fold.stalled', { n: fmt(backfill.failed) })
-                    : t('ov.fold.progress', { n: fmt(backfill.covered), total: fmt(backfill.total) })}
-                </span>
+              {backfill !== null && (refreshFailed || fold !== 'idle' || unreadable > 0) && (
+                retryable ? (
+                  <button
+                    type="button"
+                    className="lc-ov-folding lc-ov-folding-action"
+                    title={foldTip}
+                    aria-label={`${foldLabel}, ${t('ov.fold.retry')}`}
+                    aria-busy={retrying || undefined}
+                    disabled={retrying}
+                    onClick={retryFold}
+                  >{foldLabel}</button>
+                ) : (
+                  <span className="lc-ov-folding" title={foldTip}>{foldLabel}</span>
+                )
               )}
               <div className="lc-ov-headctl">
                 <DateRange
                   value={span}
                   picked={custom !== null}
                   onChange={(next) => { setCustom(next) }}
-                  today={todayKey()}
+                  today={today}
                   locale={activeLocale()}
                 />
                 <div className="lc-gran lc-ov-range" role="group" aria-label={t('ov.range.label')}>
@@ -278,7 +309,8 @@ export function makeOverviewPanel(
             </div>
 
             {firstLoadFailed ? (
-              <div className="lc-empty">{t('ov.unavailable')} <button type="button" className="lc-ov-settings" onClick={() => invalidate('overview')}>{t('error.retry')}</button></div>
+              <div className="lc-empty">{t('ov.unavailable')} <button type="button" className="lc-ov-settings"
+                disabled={retrying} onClick={() => backfill === null ? invalidate('overview') : retryFold()}>{t('error.retry')}</button></div>
             ) : (
               <>
                 <div className="lc-ov-first">
@@ -314,7 +346,29 @@ export function makeOverviewPanel(
                       <span className="lc-stat-sub">{summary === null ? '—' : t('ov.kpi.wallSub', { n: fmt(summary.windowTiming.calls) })}</span>
                     </div>
                   </div>
-                  <OverviewUsage days={days} currency={currency} today={todayKey()} pending={daysLoading} />
+                  <OverviewUsage days={days} currency={currency} today={today} pending={daysLoading} />
+                  <div className="lc-card lc-ov-heat-card">
+                    <div className="lc-card-title">
+                      <span className="lc-card-title-text">
+                        <IconGauge size={14} />
+                        {t('ov.heat.title')}
+                      </span>
+                      <span className="lc-heat-ctl">
+                        <span className="lc-card-sub">{t('ov.heat.sub')}</span>
+                        <div className="lc-gran" role="group" aria-label={t('ov.heat.metric')}>
+                          {METRICS.map(m => (
+                            <button
+                              key={m}
+                              type="button"
+                              className={'lc-gran-btn' + (metric === m ? ' lc-gran-on' : '')}
+                              onClick={() => { setMetric(m) }}
+                            >{t('ov.heat.metric.' + m)}</button>
+                          ))}
+                        </div>
+                      </span>
+                    </div>
+                    <Heatmap days={days} metric={metric} selected={day} onSelect={setDay} today={today} pending={daysLoading} />
+                  </div>
                 </div>
                 <div className="lc-ov-stats">
                   <OverviewTokens tokens={tokenParts} pending={summaryLoading} />
@@ -323,28 +377,13 @@ export function makeOverviewPanel(
                 <div className="lc-ov-body" ref={bodyRef}>
                   {bodyMounted ? (<>
                     <div className="lc-ov-tiles">
-                      <div className="lc-card lc-ov-tile lc-ov-heat-card">
-                        <div className="lc-card-title">
-                          <span className="lc-card-title-text">
-                            <IconGauge size={14} />
-                            {t('ov.heat.title')}
-                          </span>
-                          <span className="lc-heat-ctl">
-                            <span className="lc-card-sub">{t('ov.heat.sub')}</span>
-                            <div className="lc-gran" role="group" aria-label={t('ov.heat.metric')}>
-                              {METRICS.map(m => (
-                                <button
-                                  key={m}
-                                  type="button"
-                                  className={'lc-gran-btn' + (metric === m ? ' lc-gran-on' : '')}
-                                  onClick={() => { setMetric(m) }}
-                                >{t('ov.heat.metric.' + m)}</button>
-                              ))}
-                            </div>
-                          </span>
-                        </div>
-                        <Heatmap days={days} metric={metric} selected={day} onSelect={setDay} today={todayKey()} pending={daysLoading} />
-                      </div>
+                      <OverviewProjects
+                        stats={projectStats}
+                        day={day}
+                        selected={group}
+                        onSelect={setGroup}
+                        pending={awaitingValueOf(projectsState)}
+                      />
                       <OverviewSkills
                         stats={skillStats}
                         day={day}
@@ -410,7 +449,7 @@ export function makeOverviewPanel(
                         </div>
                       </div>
 
-                      {chips.length > 0 && (
+                      {pageValue !== null && (
                         <div className="lc-ov-groups" role="group" aria-label={t('ov.group.label')}>
                           <button
                             type="button"

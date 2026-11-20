@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import { agentForestOf, layoutForest, AGENT_CARD_COMPACT_H, AGENT_CARD_H } from "../src/client/agentTree";
+import { agentForestOf, layoutForest, runningOnlyForestOf, AGENT_CARD_COMPACT_H, AGENT_CARD_H } from "../src/client/agentTree";
 
 function forestOf(parents: Array<string | undefined>) {
   const byId = Object.fromEntries(parents.map((parentId, index) => [`a${index}`, {
@@ -8,6 +8,14 @@ function forestOf(parents: Array<string | undefined>) {
   }]));
   return agentForestOf({ byId }, "a0")!;
 }
+
+test("the running filter retains the current agent and ancestors of running children", () => {
+  const forest = forestOf([undefined, "a0", "a0", "a1"]);
+  forest.nodes.find((node) => node.id === "a3")!.running = true;
+  const filtered = runningOnlyForestOf(forest);
+  expect(filtered.nodes.map((node) => node.id).sort()).toEqual(["a0", "a1", "a3"]);
+  expect(filtered.edges.map((edge) => [edge.from, edge.to])).toEqual([["a0", "a1"], ["a1", "a3"]]);
+});
 
 test.each([false, true])("solo and single-child chains fit a measured narrow stage (compact=%s)", (compact) => {
   for (const width of [120, 180, 200, 280, 347, 700]) {

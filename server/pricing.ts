@@ -1,28 +1,46 @@
-import { calculateSessionCost, pricesBookOf, type ModelBook } from "../shared/core/pricing";
+import { calculateSessionCost, pricesBookOf, priceSourceOf, type ModelBook } from "../shared/core/pricing";
 import type { Request, Usage } from "../shared/contracts";
+import type { PublicCache } from "./public-cache";
 
 export class Pricing {
+  constructor(private cache?: PublicCache) {}
   revision = 0;
   private book: ModelBook | null = null;
   private fetchedAt = 0;
   private busy: Promise<void> | null = null;
   private controller: AbortController | null = null;
+  private cacheLoaded = false;
+  private closed = false;
   async refresh() {
-    if (Date.now() - this.fetchedAt < 3_600_000) return;
+    if (this.closed || Date.now() - this.fetchedAt < 3_600_000) return;
     if (this.busy) return this.busy;
-    this.controller = new AbortController();
-    const timer = setTimeout(() => this.controller?.abort(), 8000);
-    this.busy = (async () => {
-      try {
-        const response = await fetch("https://models.dev/api.json", { signal: this.controller!.signal });
-        if (!response.ok) throw new Error(`Pricing HTTP ${response.status}`);
-        const book = pricesBookOf(await response.json());
-        if (book) { this.book = book; this.revision++; }
-        this.fetchedAt = Date.now();
-      } catch { this.fetchedAt = Date.now() - 3_540_000; }
-      finally { clearTimeout(timer); this.busy = null; this.controller = null; }
-    })();
-    return this.busy;
+    const pending = this.busy = this.load();
+    try { await pending; } finally { this.busy = null; }
+  }
+  private async load() {
+    if (this.cache && !this.cacheLoaded) {
+      this.cacheLoaded = true;
+      const cached = await this.cache.read("pricing");
+      if (this.closed) return;
+      const book = cached && pricesBookOf(cached.value);
+      if (cached && book && Object.keys(book.prices).length) {
+        this.book = book; this.revision++; this.fetchedAt = cached.at;
+        if (Date.now() - cached.at < 3_600_000) return;
+      }
+    }
+    const controller = this.controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    try {
+      const response = await fetch("https://models.dev/api.json", { signal: controller.signal });
+      if (!response.ok) throw new Error(`Pricing HTTP ${response.status}`);
+      const source = priceSourceOf(await response.json());
+      const book = pricesBookOf(source);
+      if (!source || !book || !Object.keys(book.prices).length) throw new Error("Invalid price catalog");
+      if (this.closed) return;
+      this.book = book; this.revision++; this.fetchedAt = Date.now();
+      await this.cache?.write("pricing", source, this.fetchedAt);
+    } catch { this.fetchedAt = Date.now() - 3_540_000; }
+    finally { clearTimeout(timer); this.controller = null; }
   }
   cost(provider: string, model: string, usage: Usage) {
     if (usage.input + usage.output === 0) return 0;
@@ -34,5 +52,5 @@ export class Pricing {
   priceRequests(provider: string, requests: Request[]) {
     return requests.map((r) => ({ ...r, costUsd: this.cost(provider, r.model, r.usage) }));
   }
-  clear() { this.controller?.abort(); this.book = null; }
+  clear() { this.closed = true; this.controller?.abort(); this.book = null; }
 }

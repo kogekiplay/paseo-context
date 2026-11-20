@@ -35,6 +35,11 @@ test("all preview pages use the same sample sessions, with drill-down and no ext
     expect(value.summary.sessions).toBe(expected);
     expect(value.summary.tokens).toBeGreaterThan(0);
   }
+  const scope = { range: "7d", calendar: { from: "2026-11-19", to: "2026-11-19" } };
+  const { value: { projects } } = await read("api/paseo-context/overview", { part: "projects", scope });
+  const { value: { summary } } = await read("api/paseo-context/overview", { part: "summary", scope });
+  expect(projects).toEqual([{ key: "/demo/atlas", sessions: 2, tokens: summary.tokens }]);
+  expect(summary.window).toMatchObject({ from: "2026-11-19", to: "2026-11-19" });
   expect(fetch).not.toHaveBeenCalled();
 });
 

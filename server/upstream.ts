@@ -70,15 +70,16 @@ export function upstreamOf(data: Loaded): { head: ContextTimeline; headers: Cont
     images: s.images, generatedReasoning: s.usage.reasoning, generatedAnswerTokens: Math.max(0, s.usage.output - s.usage.reasoning),
     toolCalls: s.toolCalls, toolTally: Object.fromEntries(s.tools.map((t) => [t.name, t.count])),
     programTally: Object.fromEntries(s.programs.map((t) => [t.name, t.count])),
-    counts: { turns: s.turns, steps: s.steps, injects: fold.events.filter((e) => e.kind === "inject").length,
+    counts: { turns: s.turns, steps: s.steps, injects: fold.events.filter((e) => e.kind === "inject" || e.kind === "skill").length,
       compactions: fold.events.filter((e) => e.kind === "compaction").length, prunes: fold.events.filter((e) => e.kind === "prune").length,
-      skills: s.skills.reduce((n, t) => n + t.count, 0) },
+      skills: s.skills.reduce((n, t) => n + t.count, 0), events: fold.events.length,
+      modelSwitches: fold.events.filter((e) => e.kind === "model").length },
     events: fold.events.map((e) => {
       const seq = e.seq ?? nodeSeq(fold, fold.nodes.find((n) => n.time >= e.time)?.id ?? fold.nodes.length);
       const removed = fold.nodes.filter((node) => node.goneSeq === seq);
       const gross = removed.reduce((n, node) => n + node.tokens, 0);
       const replacement = fold.nodes.filter((node) => node.seq !== undefined && Math.floor(node.seq / 1_000_000) === Math.floor(seq / 1_000_000)).reduce((n, node) => n + node.tokens, 0);
-      return { seq, time: e.time,
+      return { id: e.id, seq, time: e.time,
       kind: e.kind === "skill" ? "inject" : e.kind, name: e.title, detail: e.detail,
       ...(e.kind === "skill" ? { sub: "skill" } : {}),
       ...(e.kind === "model" ? { to: e.title, from: e.detail.split(" → ")[0] } : {}),

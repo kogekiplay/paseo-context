@@ -62,6 +62,11 @@ export class ContextFold {
   private event(kind: ContextEvent["kind"], at: number, title: string, detail: string) {
     this.events.push({ id: this.events.length, seq: this.line * 1_000_000, time: at, kind, title, detail });
   }
+  private observeModel(model: string, at: number) {
+    if (!model || model === this.model) return;
+    if (this.model) this.event("model", at, model, `${this.model} → ${model}`);
+    this.model = model;
+  }
   private compact(at: number) {
     for (const n of this.nodes) if (n.gone === undefined && n.category !== "system" && n.category !== "tools") {
       n.gone = this.nodes.length; n.goneSeq = this.line * 1_000_000;
@@ -223,11 +228,7 @@ export class ContextFold {
     if (row.type === "turn_context") {
       const turnId = text(p.turn_id) || `context:${this.line}`;
       this.turnIds.add(turnId); this.turn = this.turnIds.size;
-      const model = text(p.model);
-      if (model && model !== this.model) {
-        if (this.model) this.event("model", at, model, `${this.model} → ${model}`);
-        this.model = model;
-      }
+      this.observeModel(text(p.model), at);
       if (p.effort) this.event("mode", at, text(p.effort), "Reasoning effort");
     }
     if (row.type === "event_msg" && p.type === "task_started" && text(p.turn_id)) {
@@ -284,7 +285,7 @@ export class ContextFold {
     let usageId: string | undefined;
     if (this.provider === "claude" && row.type === "assistant" && record(row.message).usage) {
       const msg = record(row.message), raw = record(msg.usage), model = text(msg.model);
-      if (model) this.model = model;
+      this.observeModel(model, at);
       usageId = text(msg.id) || String(this.line);
       this.request(usageId, {
         input: count(raw.input_tokens) + count(raw.cache_read_input_tokens) + count(raw.cache_creation_input_tokens),
@@ -306,7 +307,7 @@ export class ContextFold {
         reasoning: count(record(info.last_token_usage).reasoning_output_tokens),
       }, at, this.model, usageFields(this.meter.lastUsageRecord, "codex"), timing);
     }
-    if (row.type === "event_msg" && p.type === "thread_settings_applied" && text(p.model)) this.model = text(p.model);
+    if (row.type === "event_msg" && p.type === "thread_settings_applied") this.observeModel(text(p.model), at);
     const close = row.type === "event_msg" && ["task_complete", "task_completed", "turn_aborted"].includes(text(p.type))
       ? p.type === "turn_aborted" ? "abort" : "complete"
       : row.type === "system" && row.subtype === "turn_duration" ? "complete" : undefined;

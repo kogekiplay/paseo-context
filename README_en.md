@@ -41,7 +41,7 @@ After editing, build again and run `paseo plugin reload paseo-context`.
 - Original context browser: DNA, grouped rows, treemap, filtering, content expansion, system prompts and captured tool schemas.
 - File activity and commands: reads, writes, searches, counts, line changes, failures, duration and background process state.
 - Fleet: agent network, communication timeline, delegations, captured tasks/dependencies, Paseo Subtasks, prompts and replies. Subtasks come directly from Paseo's timeline, retain running/completed/failed/canceled status and link to existing children.
-- Context Insights: session usage, date ranges, heatmap, skill/tool/program rankings, search, archive and directory filters.
+- Context Insights: session usage, date ranges, a heatmap, project distribution, skill/tool/program rankings, search, and archive and directory filters. Failed session reads show a reason and a retry control.
 - Context, Fleet and Statistics workspace tabs are added automatically when an agent conversation is opened, then focus returns to that conversation. The Context composer button is removed. All three entries are available in the workspace tab bar's **+** menu.
 
 Tab initialization uses public navigation to return to the original agent. A cold client opens its first panel, uses that panel's layout commit to create the remaining panels, then returns to the conversation. This short-lived handoff is canceled if the source is left, the panel takes too long or the plugin stops. Opening a panel later cannot trigger a delayed return. Returning on mobile does not need to focus the input or open the keyboard.

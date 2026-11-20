@@ -67,6 +67,27 @@ test("retains the completed snapshot and reports a failed refresh until recovery
   } finally { service.clear(); vi.useRealTimers(); }
 });
 
+test("reports unreadable and failed sessions separately while retaining usable insights", async () => {
+  const { service, paseo, refetch, finish } = fixture();
+  const read = refetch.getMockImplementation()!;
+  refetch.mockImplementation(async (id) => {
+    if (id === "a0") throw Object.assign(new Error("Permission denied"), { code: "EACCES" });
+    if (id === "a1") throw new Error("Invalid session record");
+    return read(id);
+  });
+  try {
+    const snapshot = await service.overviewForScreen(scopeSchema.parse({ range: "all" }), 0, paseo, "");
+    expect(snapshot.coverage).toMatchObject({
+      remaining: 0, covered: 3, unreadable: 1, failed: 1,
+      unreadableSessions: [{ id: "a0", reason: "Permission denied" }],
+      failedSessions: [{ id: "a1", reason: "Invalid session record" }],
+    });
+    refetch.mockImplementation(read);
+    finish();
+    expect(await service.backfill(paseo)).toMatchObject({ complete: true, covered: 5 });
+  } finally { finish(); service.clear(); }
+});
+
 test("keeps a usable snapshot when the directory is available but every session read fails", async () => {
   vi.useFakeTimers();
   const { service, paseo, refetch, finish } = fixture();
@@ -79,7 +100,10 @@ test("keeps a usable snapshot when the directory is available but every session 
     refetch.mockRejectedValue(new Error("Session unavailable"));
     expect(await service.backfill(paseo)).toMatchObject({ failed: 5, covered: 0 });
     const stale = await service.overviewForScreen(scope, 0, paseo, before.revision);
-    expect(stale).toMatchObject({ refreshing: false, refreshFailed: true, data: { total: 5 } });
+    expect(stale).toMatchObject({
+      refreshing: false, refreshFailed: true, data: { total: 5 },
+      coverage: { refreshIssues: expect.arrayContaining([{ id: "a0", reason: "Session unavailable" }]) },
+    });
     refetch.mockImplementation(read);
     expect(await service.backfill(paseo)).toMatchObject({ failed: 0, covered: 5 });
     expect(await service.overviewForScreen(scope, 0, paseo, stale.revision)).toMatchObject({ refreshFailed: false, data: { total: 5 } });
