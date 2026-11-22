@@ -7,6 +7,7 @@ import type { Preferences } from "../shared/contracts";
 export type FrameProps = PluginSurfaceProps & {
   mode: "context" | "sidebar-context" | "fleet" | "statistics" | "insights" | "settings" | "modal";
   agentId?: string; overlay?: boolean; onClose?: () => void;
+  activationToken?: number;
   openSettings: () => void; openContext: (agentId: string) => void;
   preview?: { values: Preferences; onSelectAgent: (id: string) => void; onSelectPage: (mode: unknown) => void };
 };

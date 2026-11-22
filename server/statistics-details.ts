@@ -1,6 +1,6 @@
 import type { ContextService } from "./service";
 import type { Loaded } from "./upstream";
-import { parseArgs, text } from "./value";
+import { detachSlice, parseArgs, text } from "./value";
 import type { StatsRequestDetails } from "../shared/core/stats-contract";
 import { statisticsRow } from "./statistics-rows";
 import { CALL_LIMIT } from "../shared/core/stats-tools";
@@ -43,10 +43,10 @@ export async function statisticsDetails(data: Loaded, requestId: string, content
   const project = (id: number, body: string) => {
     const parsed = argsIds.has(id) ? parseCall(body) : {};
     return {
-      text: body.slice(0, argsIds.has(id) ? 2000 : PREVIEW_LIMIT), chars: body.length,
+      text: detachSlice(body, argsIds.has(id) ? 2000 : PREVIEW_LIMIT), chars: body.length,
       lines: argsIds.has(id) ? null : lineCount(body),
-      before: text(parsed.old_string ?? parsed.oldText).slice(0, 8000) || null,
-      after: text(parsed.new_string ?? parsed.newText).slice(0, 8000) || null,
+      before: detachSlice(text(parsed.old_string ?? parsed.oldText), 8000) || null,
+      after: detachSlice(text(parsed.new_string ?? parsed.newText), 8000) || null,
     };
   };
   let bodies: Map<number, ReturnType<typeof project>>;
@@ -70,5 +70,5 @@ export async function statisticsDetails(data: Loaded, requestId: string, content
   const answer = answers.map((body) => body.text).filter(Boolean).join("\n");
   const answerTruncated = answerNodes.length > answerIds.length || answer.length > PREVIEW_LIMIT
     || answers.some((body) => body.chars > body.text.length);
-  return { requestId, contentRevision: revision, calls, answerBody: answer.slice(0, PREVIEW_LIMIT) || null, answerTruncated };
+  return { requestId, contentRevision: revision, calls, answerBody: detachSlice(answer, PREVIEW_LIMIT) || null, answerTruncated };
 }

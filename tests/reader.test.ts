@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { mkdtemp, mkdir, writeFile, appendFile, rename, rm, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +7,7 @@ import { scopeSchema, type Agent } from "../shared/contracts";
 import { ContextService } from "../server/service";
 import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 import { UiRoutes } from "../server/ui-routes";
+import { ContextFold } from "../server/fold";
 
 const fixtures: string[] = [];
 afterEach(async () => { await Promise.all(fixtures.splice(0).map((p) => rm(p, { recursive: true, force: true }))); });
@@ -21,6 +22,47 @@ async function fixture() {
 const message = (value: string) => JSON.stringify({ type: "response_item", timestamp: "2026-11-16T01:00:00Z",
   payload: { type: "message", role: "user", content: [{ type: "input_text", text: value }] } });
 describe("Incremental native reader", () => {
+  test("reuses derivations for a native snapshot between 48 and 64 MiB", async () => {
+    const { reader, file, agent } = await fixture(), service = new ContextService(reader);
+    const raw = { ...agent, labels: {}, status: "idle", persistence: { nativeHandle: "fixture" } } as unknown as PaseoAgent;
+    await writeFile(file, message("body on disk") + "\n");
+    const size = vi.spyOn(ContextFold.prototype, "residentBytes", "get").mockReturnValue(56 * 1024 * 1024);
+    const price = vi.spyOn(service.pricing, "priceRequests");
+    try {
+      const paseo = {} as PaseoApi;
+      const first = await service.load(raw, paseo);
+      expect(first.residentBytes).toBeGreaterThan(48 * 1024 * 1024);
+      expect(first.residentBytes).toBeLessThan(64 * 1024 * 1024);
+      expect(await service.load(raw, paseo)).toBe(first);
+      expect(price).toHaveBeenCalledOnce();
+    } finally { size.mockRestore(); service.clear(); }
+  });
+  test("expires native and derived snapshots independently while active callers retain exact bodies", async () => {
+    const { reader, file, agent } = await fixture(), service = new ContextService(reader);
+    const raw = { ...agent, labels: {}, status: "idle", persistence: { nativeHandle: "fixture" } } as unknown as PaseoAgent;
+    const paseo = {} as PaseoApi;
+    await writeFile(file, message("body on disk") + "\n");
+    vi.useFakeTimers();
+    try {
+      const first = await service.load(raw, paseo);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect((await reader.read(agent))!.entry.fold).toBe(first.fold);
+      await vi.advanceTimersByTimeAsync(90_000);
+      const derived = await service.load(raw, paseo);
+      expect(derived.fold).toBe(first.fold);
+      expect(derived).not.toBe(first);
+      expect(first.revision).toBe(derived.revision);
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(vi.getTimerCount()).toBe(0);
+      const rebuilt = await service.load(raw, paseo);
+      expect(rebuilt.fold).not.toBe(first.fold);
+      expect(await service.contents(first, [0])).toEqual(new Map([[0, "body on disk"]]));
+    } finally {
+      service.clear();
+      expect(vi.getTimerCount()).toBe(0);
+      vi.useRealTimers();
+    }
+  });
   test("renders overview and fleet while pricing is pending, then invalidates cached costs when prices arrive", async () => {
     const { reader, file, agent } = await fixture(), service = new ContextService(reader);
     const raw = { ...agent, labels: {}, status: "idle", persistence: { nativeHandle: "fixture" },

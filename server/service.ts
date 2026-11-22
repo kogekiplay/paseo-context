@@ -4,7 +4,7 @@ import { emptyParts, type Agent, type Request, type Scope, type Summary, type Ta
 import { ContextFold } from "./fold";
 import { SessionReader, type ReadBodies } from "./reader";
 import { Pricing } from "./pricing";
-import { timestamp } from "./value";
+import { detachSlice, timestamp } from "./value";
 import { createHash } from "node:crypto";
 import { scopedIntervals, sumTiming, unionMs } from "./timing";
 import { dayKeyOf, shiftDayKey, startOfDayKey } from "../shared/core/days";
@@ -14,11 +14,15 @@ import { TimelineReader } from "./timeline";
 import type { NativeLocation } from "./native-paths";
 import type { NativeChild } from "./collaboration";
 import { antigravityConversationId } from "./antigravity-log";
+import { MIB, sessionReadBudget, type ReadBudget } from "./read-budget";
+import { RetainedCache, SESSION_IDLE_MS } from "./retained-cache";
 
 const CORPUS_TTL_MS = 10_000;
+const CORPUS_IDLE_MS = 180_000;
 const FIRST_PAINT_BUDGET_MS = 400;
 const SCAN_CONCURRENCY = 4;
 const DERIVED_BYTES = 48 * 1024 * 1024;
+const OVERVIEW_PAGE_SIZE = 24;
 type LedgerRequest = Pick<Request, "time" | "usageAt" | "turn" | "usage" | "usageFields" | "usageSources" | "parts" | "costUsd">;
 interface Ledger { at: number; key: string; summary: Summary; requests: LedgerRequest[]; retry?: boolean }
 interface Reader {
@@ -60,7 +64,6 @@ interface Corpus {
   at: number;
   pricingRevision: number;
   all: Summary[];
-  requests: Map<string, LedgerRequest[]>;
   ledgers: Map<string, Ledger>;
   scanned: number;
   failed: number;
@@ -94,23 +97,35 @@ export async function listAgents(paseo: PaseoApi, signal?: AbortSignal) {
   return [...new Map(agents.map((a) => [a.id, a])).values()];
 }
 export class ContextService {
-  constructor(readonly reader: Reader = new SessionReader(), readonly pricing = new Pricing()) {}
-  private summaries = new Map<string, Ledger>();
+  private budget: ReadBudget;
+  private timeline: TimelineReader;
+  constructor(readonly reader: Reader = new SessionReader(), readonly pricing = new Pricing()) {
+    this.budget = reader instanceof SessionReader ? reader.budget : sessionReadBudget;
+    this.timeline = new TimelineReader(this.lifetime.signal, this.budget);
+  }
+  private summaries = new RetainedCache<Ledger>(256, 50_000);
   private corpus: Corpus | null = null;
+  private corpusTimer?: ReturnType<typeof setTimeout>;
   private scanning: Corpus | null = null;
   private corpusBusy: Promise<Corpus> | null = null;
   private corpusRevision = 0;
   private lifetime = new AbortController();
-  private timeline = new TimelineReader(this.lifetime.signal);
   private retryCorpusAt = 0;
   private refreshIssues: Corpus["failedSessions"] = [];
-  private overviewCache = new Map<string, ReturnType<typeof aggregate>>();
+  private overviewCache = new Map<string, ReturnType<typeof aggregateScope>>();
   private overviewCacheRevision = "";
   private get closed() { return this.lifetime.signal.aborted; }
   private nativeMembers = new Map<string, PaseoAgent>();
   private revisions = new Map<string, { fingerprint: string; revision: number }>();
   private serial = 0;
-  private derived = new Map<string, { fold: ContextFold; foldRevision: number; key: string; at: number; bytes: number; data: LoadedSession }>();
+  // Only the source cache or an active caller owns the Entry/Frame. A derived
+  // value can refer back to that snapshot without keeping its weak key alive.
+  private derivations = new WeakMap<object, Map<string, LoadedSession>>();
+  private derived = new RetainedCache<{ source: WeakRef<object>; key: string }>(8, DERIVED_BYTES, SESSION_IDLE_MS,
+    (id, entry) => {
+      const source = entry.source.deref();
+      if (source) this.derivations.get(source)?.delete(id);
+    });
   private loading = new Map<string, Promise<LoadedSession>>();
   async directory(paseo: PaseoApi) {
     const agents = await listAgents(paseo, this.lifetime.signal);
@@ -141,15 +156,15 @@ export class ContextService {
     const agent = agentOf(raw);
     const native = await this.reader.read(agent, location);
     const timeline = native ? null : await this.timeline.read(agent.id, paseo);
-    const fold = native?.entry.fold ?? timeline!.fold;
+    const source = native?.entry ?? timeline!;
+    const { fold } = source;
     ensureActive(this.lifetime.signal);
     const cached = this.derived.get(agent.id);
-    if (cached?.fold === fold && cached.foldRevision === fold.revision && cached.key === key
-      && cached.data.companionFailed === native?.companionFailed) {
-      cached.at = Date.now();
-      this.derived.delete(agent.id);
-      this.derived.set(agent.id, cached);
-      return cached.data;
+    if (cached?.key === key && cached.source.deref() === source) {
+      const data = this.derivations.get(source)?.get(agent.id);
+      if (data?.foldRevision === fold.revision && data.companionFailed === native?.companionFailed) {
+        return data;
+      }
     }
     for (const child of fold.collaboration.children.values()) this.rememberChild(raw, child);
     const summary = fold.summary(agent, native ? "native" : "timeline");
@@ -181,15 +196,12 @@ export class ContextService {
     const bytes = native?.residentBytes ?? (timeline ? this.timeline.weight(timeline) : fold.residentBytes);
     const data: LoadedSession = { agent, fold, summary, requests, revision, foldRevision: fold.revision, residentBytes: bytes,
       bodies: native?.bodies ?? (timeline ? this.timeline.bodyReader(timeline) : undefined), companionFailed: native?.companionFailed };
-    if (!this.closed) {
-      this.derived.delete(agent.id);
-      if (bytes <= DERIVED_BYTES) this.derived.set(agent.id, { fold, foldRevision: fold.revision, key, at: Date.now(), data, bytes });
-      let weight = [...this.derived.values()].reduce((n, entry) => n + entry.bytes, 0);
-      for (const [id, entry] of this.derived) {
-        if (this.derived.size > 8 || weight > DERIVED_BYTES || Date.now() - entry.at > 120000) {
-          this.derived.delete(id); weight -= entry.bytes;
-        }
-      }
+    const weight = 1024 + requests.length * 192 + (summary.intervals?.length ?? 0) * 64
+      + summary.activity.reduce((total, day) => total + 128 + 64 * (day.tools.length + day.skills.length + day.programs.length), 0);
+    if (this.derived.set(agent.id, { source: new WeakRef(source), key }, weight)) {
+      const entries = this.derivations.get(source) ?? new Map<string, LoadedSession>();
+      entries.set(agent.id, data);
+      this.derivations.set(source, entries);
     }
     return data;
   }
@@ -226,29 +238,20 @@ export class ContextService {
       source?.mtimeMs, source?.ctimeMs, location?.antigravity?.database?.fingerprint, this.pricing.revision]);
     const ttl = path ? 600_000 : 15_000;
     const valid = (entry: Ledger | undefined): entry is Ledger => entry?.key === key && !entry.retry && Date.now() - entry.at < ttl;
-    const cached = this.summaries.get(raw.id);
     if (valid(previous)) return previous;
+    const cached = this.summaries.get(raw.id);
     if (valid(cached)) return cached;
     const data = await this.load(raw, paseo, location);
     const value: Ledger = { at: Date.now(), key, summary: data.summary, retry: data.companionFailed,
       requests: data.requests.map(({ time, usageAt, turn, usage, usageFields, usageSources, parts, costUsd }) =>
         ({ time, usageAt, turn, usage, usageFields, usageSources, parts, costUsd })) };
-    if (!this.closed) {
-      this.summaries.delete(raw.id);
-      if (value.requests.length <= 50000) this.summaries.set(raw.id, value);
-      let weight = [...this.summaries.values()].reduce((n, v) => n + v.requests.length, 0);
-      for (const [id, old] of this.summaries) {
-        if (this.summaries.size > 256 || weight > 50000 || Date.now() - old.at > 600_000) {
-          this.summaries.delete(id); weight -= old.requests.length;
-        }
-      }
-    }
+    if (!this.closed) this.summaries.set(raw.id, value, value.requests.length);
     return value;
   }
   async overview(scope: Scope, offset: number, paseo: PaseoApi) {
     void this.pricing.refresh();
     const corpus = await this.readCorpus(paseo);
-    return aggregate(corpus.all, corpus.requests, scope, offset, corpus.scanned, corpus.failed);
+    return overviewPage(this.aggregateCorpus(corpus, scope), offset);
   }
   async overviewForScreen(scope: Scope, offset: number, paseo: PaseoApi, revision: string) {
     void this.pricing.refresh();
@@ -276,6 +279,7 @@ export class ContextService {
       }
     }
     if (!corpus || this.closed) throw new Error("Plugin was stopped");
+    this.touchCorpus();
     const running = this.scanning !== null;
     const refreshFailed = this.retryCorpusAt !== 0;
     const covered = corpus.all.length, remaining = corpus.scanned - covered - corpus.failed - corpus.unreadable;
@@ -288,15 +292,18 @@ export class ContextService {
       this.overviewCache.clear();
       this.overviewCacheRevision = version;
     }
-    const key = JSON.stringify([scope, offset]);
+    const key = JSON.stringify(scope);
     let data = revision === version ? null : this.overviewCache.get(key) ?? null;
     if (revision !== version && !data) {
-      data = aggregate(corpus.all, corpus.requests, scope, offset, corpus.scanned, corpus.failed);
+      data = this.aggregateCorpus(corpus, scope);
       if (this.overviewCache.size >= 12) this.overviewCache.delete(this.overviewCache.keys().next().value!);
       this.overviewCache.set(key, data);
     }
     return { revision: version, coverage, refreshing: running, refreshFailed,
-      data };
+      data: data ? overviewPage(data, offset) : null };
+  }
+  private aggregateCorpus(corpus: Corpus, scope: Scope) {
+    return aggregateScope(corpus.all, (id) => corpus.ledgers.get(id)?.requests, scope, corpus.scanned, corpus.failed);
   }
   async backfill(paseo: PaseoApi) {
     const corpus = await this.readCorpus(paseo, true);
@@ -306,11 +313,12 @@ export class ContextService {
   }
   private async readCorpus(paseo: PaseoApi, force = false) {
     if (this.closed) throw new Error("Plugin was stopped");
+    this.touchCorpus();
     if (this.corpusBusy) return this.corpusBusy;
     if (!force && this.corpus && this.corpus.pricingRevision === this.pricing.revision
       && Date.now() - this.corpus.at < CORPUS_TTL_MS) return this.corpus;
     const corpus = this.scanning = { at: 0, pricingRevision: this.pricing.revision, all: [],
-      requests: new Map(), ledgers: new Map(), scanned: 0, failed: 0, unreadable: 0, failedSessions: [], unreadableSessions: [],
+      ledgers: new Map(), scanned: 0, failed: 0, unreadable: 0, failedSessions: [], unreadableSessions: [],
       running: true, revision: ++this.corpusRevision };
     this.corpusBusy = this.scanCorpus(paseo, corpus);
     try { return await this.corpusBusy; }
@@ -323,11 +331,27 @@ export class ContextService {
     }
     finally { this.corpusBusy = null; this.scanning = null; }
   }
+  private touchCorpus() {
+    clearTimeout(this.corpusTimer);
+    this.corpusTimer = setTimeout(() => {
+      this.corpusTimer = undefined;
+      this.corpus = null;
+      this.overviewCache.clear();
+      this.overviewCacheRevision = "";
+      this.retryCorpusAt = 0;
+      this.refreshIssues = [];
+    }, CORPUS_IDLE_MS);
+    this.corpusTimer.unref();
+  }
+
   private async scanCorpus(paseo: PaseoApi, corpus: Corpus) {
     const signal = this.lifetime.signal;
-    const agents = await listAgents(paseo, signal);
+    const { agents, locate } = await this.budget.run(16 * MIB, signal, async () => {
+      const agents = await listAgents(paseo, signal);
+      const locate = await this.reader.locateForScan?.(agents.map(agentOf)).catch(() => undefined);
+      return { agents, locate };
+    });
     const previous = this.corpus?.ledgers;
-    const locate = await this.reader.locateForScan?.(agents.map(agentOf)).catch(() => undefined);
     ensureActive(signal);
     const order = new Map(agents.map((agent, index) => [agent.id, index]));
     agents.sort((a, b) => timestamp(b.updatedAt) - timestamp(a.updatedAt));
@@ -341,7 +365,6 @@ export class ContextService {
           const data = await this.ledger(raw, paseo, previous?.get(raw.id), locate);
           if (signal.aborted) return;
           corpus.all.push(data.summary);
-          corpus.requests.set(raw.id, data.requests);
           corpus.ledgers.set(raw.id, data);
         } catch (error) {
           if (signal.aborted) return;
@@ -349,7 +372,7 @@ export class ContextService {
           const unreadable = code === "EACCES" || code === "EPERM";
           if (unreadable) corpus.unreadable++; else corpus.failed++;
           const issues = unreadable ? corpus.unreadableSessions : corpus.failedSessions;
-          if (issues.length < 32) issues.push({ id: raw.id, reason: error instanceof Error ? error.message.slice(0, 300) : "Session read failed" });
+          if (issues.length < 32) issues.push({ id: raw.id, reason: error instanceof Error ? detachSlice(error.message, 300) : "Session read failed" });
         }
         corpus.revision = ++this.corpusRevision;
       }
@@ -365,7 +388,9 @@ export class ContextService {
       this.refreshIssues = [...corpus.failedSessions, ...corpus.unreadableSessions];
       return corpus;
     }
-    this.corpus = corpus;
+    if (this.corpusTimer) this.corpus = corpus;
+    this.overviewCache.clear();
+    this.overviewCacheRevision = "";
     this.retryCorpusAt = 0;
     this.refreshIssues = [];
     return corpus;
@@ -466,6 +491,8 @@ export class ContextService {
   }
   clear() {
     this.lifetime.abort();
+    clearTimeout(this.corpusTimer);
+    this.corpusTimer = undefined;
     this.reader.clear(); this.timeline.clear(); this.pricing.clear();
     this.summaries.clear(); this.nativeMembers.clear(); this.revisions.clear(); this.derived.clear(); this.loading.clear();
     this.overviewCache.clear(); this.refreshIssues = []; this.corpus = null; this.scanning = null;
@@ -475,6 +502,14 @@ export class ContextService {
 
 const accountingTime = (request: LedgerRequest) => request.usageAt ?? request.time;
 export function aggregate(all: Summary[], requests: ReadonlyMap<string, LedgerRequest[]>, scope: Scope, offset: number, scanned: number, failed: number, now = Date.now()) {
+  return overviewPage(aggregateScope(all, (id) => requests.get(id), scope, scanned, failed, now), offset);
+}
+
+function overviewPage(data: ReturnType<typeof aggregateScope>, offset: number) {
+  return { ...data, sessions: data.sessions.slice(offset, offset + OVERVIEW_PAGE_SIZE) };
+}
+
+function aggregateScope(all: Summary[], requests: (id: string) => LedgerRequest[] | undefined, scope: Scope, scanned: number, failed: number, now = Date.now()) {
   const today = dayKeyOf(now) ?? "";
   const day = startOfDayKey(scope.day) === null ? "" : scope.day;
   const from = day || (scope.range === "custom" ? scope.start : scope.range === "all" ? ""
@@ -491,7 +526,7 @@ export function aggregate(all: Summary[], requests: ReadonlyMap<string, LedgerRe
     return search && (scope.coverage === "all" || (scope.coverage === "archived") === a.archived);
   });
   const inScope = eligible.filter((s) => {
-    const rows = requests.get(s.agent.id) ?? [];
+    const rows = requests(s.agent.id) ?? [];
     return rows.some((r) => accountingTime(r) >= start && accountingTime(r) < end)
       || (!rows.length && s.agent.updatedAt >= start && s.agent.updatedAt < end)
       || s.activity.some((d) => d.time >= start && d.time < end);
@@ -522,7 +557,7 @@ export function aggregate(all: Summary[], requests: ReadonlyMap<string, LedgerRe
   };
   for (const s of filtered) {
     const turnIds = new Set<number>();
-    for (const r of requests.get(s.agent.id) ?? []) {
+    for (const r of requests(s.agent.id) ?? []) {
       const at = accountingTime(r), day = at > 0 ? dayKeyOf(at) : null;
       if (day === null) continue;
       const hasInput = usageSourceOf(r, "input"), hasOutput = usageSourceOf(r, "output"), hasRead = usageSourceOf(r, "cacheRead");
@@ -573,7 +608,7 @@ export function aggregate(all: Summary[], requests: ReadonlyMap<string, LedgerRe
     wallMs += unionMs(intervals);
     toolsMs += intervals.filter((row) => row.kind === "tools").reduce((n, row) => n + row.end - row.start, 0);
   }
-  return { sessions: selected.slice(offset, offset + 24), total: selected.length, scopeTotal: inScope.length, scanned, failed,
+  return { sessions: selected, total: selected.length, scopeTotal: inScope.length, scanned, failed,
     tokens, input, cacheRead, pairedInput, pairedRead, turns, calls: total, toolCalls: tools.reduce((n, t) => n + t.count, 0),
     wallMs, toolsMs, timing: sumTiming(selected), costUsd: priced ? cost : null,
     costComplete: total > 0 && priced === total, parts, groups,

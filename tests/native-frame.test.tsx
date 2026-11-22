@@ -6,6 +6,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 const mocks = vi.hoisted(() => ({
   platform: { OS: "ios" }, dispatch: vi.fn(), navigation: vi.fn(), copyText: vi.fn(async () => {}),
   module: { shouldStartLoadWithLockIdentifier: vi.fn() },
+  appStateListeners: new Set<(state: string) => void>(),
+  appStateCurrent: "active",
   rpc: vi.fn(async (input: { route: string; payload?: any }): Promise<unknown> => input.route === "ui.document"
     ? '<script>globalThis.__PASEO_CONTEXT_NONCE__="%%PASEO_CONTEXT_NONCE%%";</script>'
     : { sessions: [], selected: null }),
@@ -20,6 +22,13 @@ const mocks = vi.hoisted(() => ({
 }));
 vi.mock("react-native", () => ({
   Platform: mocks.platform, View: "View", Text: "Text", Pressable: "Pressable",
+  AppState: {
+    get currentState() { return mocks.appStateCurrent; },
+    addEventListener: (_type: string, fn: (state: string) => void) => {
+      mocks.appStateListeners.add(fn);
+      return { remove: () => { mocks.appStateListeners.delete(fn); } };
+    },
+  },
   Linking: { openURL: mocks.navigation },
   UIManager: { dispatchViewManagerCommand: mocks.dispatch }, findNodeHandle: () => 7,
   TurboModuleRegistry: { get: () => mocks.module },
@@ -32,15 +41,20 @@ vi.mock("@getpaseo/plugin/client", () => ({
 }));
 vi.mock("@getpaseo/plugin/client/ui", () => ({
   copyText: mocks.copyText,
-  Modal: Object.assign("Modal", { Content: "Content" }),
+  Modal: Object.assign(({ children }: any) => children, { Content: ({ children }: any) => children }),
 }));
 import { NativeFrame } from "../client/native";
+import { nativeWebViewPool } from "../client/native-pool";
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 let renderer: ReturnType<typeof create> | null = null;
 let queryClient: QueryClient;
 afterEach(async () => {
+  vi.useRealTimers();
   if (renderer) await act(async () => renderer?.unmount());
+  nativeWebViewPool.reset();
+  mocks.appStateListeners.clear();
+  mocks.appStateCurrent = "active";
   queryClient?.clear();
   renderer = null; vi.clearAllMocks(); mocks.platform.OS = "ios";
   mocks.settings.status = "ready";
@@ -258,5 +272,214 @@ describe("Native upstream UI container", () => {
     const progressInjected = mocks.dispatch.mock.calls.map(([, , args]) => args[0]);
     expect(progressInjected.filter((script) => script.includes('__PASEO_CONTEXT_ACK__?.("23")'))).toHaveLength(1);
     expect(progressInjected.filter((script) => script.includes("paseo-context:init"))).toHaveLength(1);
+  });
+
+  test("caps active non-overlay native WebViews to 2 via LRU, allows manual resume, and exempts overlay modals", async () => {
+    queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      renderer = create(createElement(QueryClientProvider, { client: queryClient },
+        createElement(NativeFrame, { ...baseProps, mode: "context" } as any),
+        createElement(NativeFrame, { ...baseProps, mode: "fleet" } as any),
+        createElement(NativeFrame, { ...baseProps, mode: "statistics" } as any),
+        createElement(NativeFrame, { ...baseProps, mode: "modal", overlay: true } as any)));
+    });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+
+    // 2 pooled WebViews + 1 overlay WebView = 3 mounted; oldest pooled WebView is paused.
+    expect(nativeWebViewPool.activeCount()).toBe(2);
+    expect(renderer!.root.findAllByType("RNCWebView" as any)).toHaveLength(3);
+    const resumeButton = renderer!.root.findAllByType("Pressable" as any).find((btn) =>
+      btn.findAllByType("Text" as any).some((t) => t.children.join("").includes("已暂停以节省内存，点击恢复")));
+    expect(resumeButton).toBeDefined();
+
+    // Tapping resume restores the paused tab and evicts the next oldest pooled tab.
+    await act(async () => resumeButton!.props.onPress());
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+    expect(nativeWebViewPool.activeCount()).toBe(2);
+    expect(renderer!.root.findAllByType("RNCWebView" as any)).toHaveLength(3);
+  });
+
+  test("fast-pauses initial 0x0 layout, delays post-load 0x0 by 5s, and uses iOS 1.5s / Android 30s background pause with active-race guard", async () => {
+    vi.useFakeTimers();
+    queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      renderer = create(createElement(QueryClientProvider, { client: queryClient },
+        createElement(NativeFrame, { ...baseProps, mode: "context", activationToken: 1 } as any)));
+    });
+    await act(async () => { await vi.advanceTimersByTimeAsync(10); });
+    expect(renderer!.root.findAllByType("RNCWebView" as any)).toHaveLength(1);
+
+    // 1. Before WebView finishes loading, 0x0 layout pauses IMMEDIATELY (fast path, no 5s wait).
+    const initialWrapper = renderer!.root.findAllByType("View" as any).find((v) => typeof v.props.onLayout === "function")!;
+    await act(async () => {
+      initialWrapper.props.onLayout({ nativeEvent: { layout: { width: 0, height: 0 } } });
+    });
+    expect(renderer!.root.findAllByType("RNCWebView" as any)).toHaveLength(0);
+    expect(nativeWebViewPool.activeCount()).toBe(0);
+
+    // Transition back to non-zero layout auto-resumes WebView.
+    const pausedWrapper = renderer!.root.findAllByType("View" as any).find((v) => typeof v.props.onLayout === "function")!;
+    await act(async () => {
+      pausedWrapper.props.onLayout({ nativeEvent: { layout: { width: 390, height: 700 } } });
+      await vi.advanceTimersByTimeAsync(10);
+    });
+    const loadedView = renderer!.root.findByType("RNCWebView" as any);
+    await act(async () => loadedView.props.onLoadingFinish({ nativeEvent: {} }));
+
+    // 2. After WebView has rendered, 0x0 waits 5s before pausing.
+    const liveWrapper = renderer!.root.findAllByType("View" as any).find((v) => typeof v.props.onLayout === "function")!;
+    await act(async () => {
+      liveWrapper.props.onLayout({ nativeEvent: { layout: { width: 0, height: 0 } } });
+      await vi.advanceTimersByTimeAsync(4900);
+    });
+    expect(renderer!.root.findAllByType("RNCWebView" as any)).toHaveLength(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(200); });
+    expect(renderer!.root.findAllByType("RNCWebView" as any)).toHaveLength(0);
+
+    // Resume via non-zero layout.
+    const hiddenWrapper = renderer!.root.findAllByType("View" as any).find((v) => typeof v.props.onLayout === "function")!;
+    await act(async () => {
+      hiddenWrapper.props.onLayout({ nativeEvent: { layout: { width: 390, height: 700 } } });
+      await vi.advanceTimersByTimeAsync(10);
+    });
+    expect(renderer!.root.findAllByType("RNCWebView" as any)).toHaveLength(1);
+
+    // 3. Race guard: if AppState.currentState is already "active" when timer fires, do NOT pause.
+    mocks.appStateCurrent = "active";
+    await act(async () => {
+      for (const fn of mocks.appStateListeners) fn("background");
+      await vi.advanceTimersByTimeAsync(1500);
+    });
+    expect(renderer!.root.findAllByType("RNCWebView" as any)).toHaveLength(1);
+
+    // 4. iOS background pauses at 1.5s when currentState is "background", and resumes on "active".
+    mocks.appStateCurrent = "background";
+    await act(async () => {
+      for (const fn of mocks.appStateListeners) fn("background");
+      await vi.advanceTimersByTimeAsync(1500);
+    });
+    expect(renderer!.root.findAllByType("RNCWebView" as any)).toHaveLength(0);
+    expect(nativeWebViewPool.activeCount()).toBe(0);
+
+    mocks.appStateCurrent = "active";
+    await act(async () => {
+      for (const fn of mocks.appStateListeners) fn("active");
+      await vi.advanceTimersByTimeAsync(10);
+    });
+    expect(renderer!.root.findAllByType("RNCWebView" as any)).toHaveLength(1);
+
+    // 5. Android background waits 30s (still alive at 1.5s, paused at 30s).
+    mocks.platform.OS = "android";
+    mocks.appStateCurrent = "background";
+    await act(async () => {
+      for (const fn of mocks.appStateListeners) fn("background");
+      await vi.advanceTimersByTimeAsync(1500);
+    });
+    expect(renderer!.root.findAllByType("RNCWebView" as any)).toHaveLength(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(28_500); });
+    expect(renderer!.root.findAllByType("RNCWebView" as any)).toHaveLength(0);
+  });
+
+  test("Android pause/resume resets history bridge seq/id caches and drops stale pre-pause RPC responses", async () => {
+    mocks.platform.OS = "android";
+    let resolveStaleRpc!: (value: unknown) => void;
+    let callCount = 0;
+    mocks.rpc.mockImplementation(async (input: { route: string }) => {
+      if (input.route === "ui.document") return '<script>globalThis.__PASEO_CONTEXT_NONCE__="%%PASEO_CONTEXT_NONCE%%";</script>';
+      if (input.route === "bootstrap") {
+        callCount++;
+        if (callCount === 1) return new Promise((resolve) => { resolveStaleRpc = resolve; });
+        return { fresh: true };
+      }
+      return { ok: true };
+    });
+
+    queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      renderer = create(createElement(QueryClientProvider, { client: queryClient },
+        createElement(NativeFrame, { ...baseProps, mode: "context" } as any),
+        createElement(NativeFrame, { ...baseProps, mode: "fleet" } as any)));
+    });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+
+    // First WebView (context) receives seq=1 (ready) and seq=2 (rpc id=1, stays in-flight).
+    const firstView = renderer!.root.findAllByType("RNCWebView" as any)[0];
+    const nonce = /__PASEO_CONTEXT_NONCE__="([^"]+)"/.exec(firstView.props.source.html)![1];
+    const readyEncoded = encodeURIComponent(JSON.stringify({ type: "paseo-context:ready", nonce }));
+    const rpcEncoded = encodeURIComponent(JSON.stringify({ type: "paseo-context:rpc", nonce, id: 1, route: "bootstrap", payload: {} }));
+
+    await act(async () => firstView.props.onLoadingStart({ nativeEvent: { url: `${firstView.props.source.baseUrl}#paseo-context=1:${readyEncoded}` } }));
+    await act(async () => firstView.props.onLoadingStart({ nativeEvent: { url: `${firstView.props.source.baseUrl}#paseo-context=2:${rpcEncoded}` } }));
+
+    // Mount a 3rd pooled tab so the 1st tab (context) is LRU-paused while rpc id=1 is still pending.
+    await act(async () => {
+      renderer!.update(createElement(QueryClientProvider, { client: queryClient },
+        createElement(NativeFrame, { ...baseProps, mode: "context" } as any),
+        createElement(NativeFrame, { ...baseProps, mode: "fleet" } as any),
+        createElement(NativeFrame, { ...baseProps, mode: "statistics" } as any)));
+    });
+    const resumeBtn = renderer!.root.findAllByType("Pressable" as any).find((btn) =>
+      btn.findAllByType("Text" as any).some((t) => t.children.join("").includes("已暂停以节省内存，点击恢复")))!;
+    await act(async () => resumeBtn.props.onPress());
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+
+    // Pre-pause stale RPC resolves AFTER resume -> MUST NOT inject stale result into new WebView.
+    mocks.dispatch.mockClear();
+    await act(async () => { resolveStaleRpc({ stale: true }); await Promise.resolve(); });
+    expect(mocks.dispatch.mock.calls.some(([, , args]) => String(args[0]).includes('"stale":true'))).toBe(false);
+
+    // Resumed Android WebView restarts history seq from 1 (ready) and rpc id from 1 -> MUST be accepted & ACKed!
+    const resumedView = renderer!.root.findAllByType("RNCWebView" as any)[0];
+    mocks.dispatch.mockClear();
+    await act(async () => resumedView.props.onLoadingStart({ nativeEvent: { url: `${resumedView.props.source.baseUrl}#paseo-context=1:${readyEncoded}` } }));
+    await act(async () => resumedView.props.onLoadingStart({ nativeEvent: { url: `${resumedView.props.source.baseUrl}#paseo-context=2:${rpcEncoded}` } }));
+    const scripts = mocks.dispatch.mock.calls.map(([, , args]) => String(args[0]));
+    expect(scripts.some((s) => s.includes('__PASEO_CONTEXT_ACK__?.("1")'))).toBe(true);
+    expect(scripts.some((s) => s.includes("paseo-context:init"))).toBe(true);
+    expect(scripts.some((s) => s.includes('__PASEO_CONTEXT_ACK__?.("2")'))).toBe(true);
+    expect(scripts.some((s) => s.includes('"fresh":true'))).toBe(true);
+  });
+
+  test("expires incomplete Android chunk groups after 30s and caps concurrent chunk groups at 4", async () => {
+    vi.useFakeTimers();
+    mocks.platform.OS = "android";
+    queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      renderer = create(createElement(QueryClientProvider, { client: queryClient },
+        createElement(NativeFrame, baseProps as any)));
+    });
+    await act(async () => { await vi.advanceTimersByTimeAsync(10); });
+    const view = renderer!.root.findByType("RNCWebView" as any);
+    const nonce = /__PASEO_CONTEXT_NONCE__="([^"]+)"/.exec(view.props.source.html)![1];
+    const encoded = encodeURIComponent(JSON.stringify({ type: "paseo-context:rpc", nonce, id: 501, route: "bootstrap", payload: { k: "v" } }));
+    const mid = Math.floor(encoded.length / 2);
+
+    mocks.rpc.mockClear();
+    // Send part 0/2 of group 10, then wait 30s so it expires.
+    await act(async () => view.props.onLoadingStart({
+      nativeEvent: { url: `${view.props.source.baseUrl}#paseo-context-chunk=100:10:0:2:${encoded.slice(0, mid)}` },
+    }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_001); });
+    // Now part 1/2 arrives alone -> group 10 expired, so bootstrap RPC must NOT fire.
+    await act(async () => view.props.onLoadingStart({
+      nativeEvent: { url: `${view.props.source.baseUrl}#paseo-context-chunk=101:10:1:2:${encoded.slice(mid)}` },
+    }));
+    expect(mocks.rpc).not.toHaveBeenCalledWith({ route: "bootstrap", payload: { k: "v" } });
+
+    // Start 5 incomplete groups (g1..g5); MAX_CHUNK_GROUPS=4 evicts g1.
+    for (let g = 1; g <= 5; g++) {
+      await act(async () => view.props.onLoadingStart({
+        nativeEvent: { url: `${view.props.source.baseUrl}#paseo-context-chunk=${200 + g}:g${g}:0:2:${encoded.slice(0, mid)}` },
+      }));
+    }
+    // Sending part 1/2 for evicted g1 does not complete, while g5 completes normally.
+    await act(async () => view.props.onLoadingStart({
+      nativeEvent: { url: `${view.props.source.baseUrl}#paseo-context-chunk=210:g1:1:2:${encoded.slice(mid)}` },
+    }));
+    expect(mocks.rpc).not.toHaveBeenCalledWith({ route: "bootstrap", payload: { k: "v" } });
+    await act(async () => view.props.onLoadingStart({
+      nativeEvent: { url: `${view.props.source.baseUrl}#paseo-context-chunk=211:g5:1:2:${encoded.slice(mid)}` },
+    }));
+    expect(mocks.rpc).toHaveBeenCalledWith({ route: "bootstrap", payload: { k: "v" } });
   });
 });

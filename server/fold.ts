@@ -6,7 +6,7 @@ import { SessionFold, type UsageObservation } from "./meter";
 import { CollaborationLedger } from "./collaboration";
 import { messagesOf, toolKind, type Message } from "./normalize";
 import { AntigravityCalls, antigravityMessages, type AntigravityStep } from "./antigravity-log";
-import { count, parseArgs, record, text, timestamp, type RecordValue } from "./value";
+import { count, detachPreview, detachSlice, parseArgs, record, stringBytes, stringIndexBytes, text, timestamp, type RecordValue } from "./value";
 import { unionMs } from "./timing";
 import { usageKeys } from "./usage-fields";
 import { StatisticsSpans } from "./statistics-spans";
@@ -64,8 +64,31 @@ export class ContextFold {
   get hasToolTiming() { return this.toolDurations.size > 0; }
   requestIndex(id: string) { return this.requestIds.get(id); }
   get residentBytes() {
-    return this.line * 160 + this.nodes.length * 768 + this.requests.length * 768
-      + this.events.length * 256 + this.files.length * 384 + this.commands.length * 4608 + this.collaboration.residentBytes;
+    // Include index and array overhead and budget two bytes per retained character.
+    let bytes = 2048 + stringBytes(this.model) + stringBytes(this.lastPrompt)
+      + this.nodeTurns.length * 8 + this.collaboration.residentBytes + this.statistics.residentBytes
+      + this.meter.residentBytes + (this.antigravityCalls?.residentBytes ?? 0);
+    for (const node of this.nodes) bytes += 240 + stringBytes(node.title) + stringBytes(node.preview)
+      + stringBytes(node.callId) + stringBytes(node.tool) + stringBytes(node.source);
+    for (const hash of this.contentHashes) bytes += 8 + stringBytes(hash);
+    for (const request of this.requests) bytes += 384 + stringBytes(request.id) + stringBytes(request.model)
+      + stringBytes(request.prompt) + stringBytes(request.response);
+    for (const event of this.events) bytes += 96 + stringBytes(event.title) + stringBytes(event.detail);
+    for (const file of this.files) bytes += 128 + stringBytes(file.path) + stringBytes(file.tool);
+    for (const command of this.commands) {
+      bytes += 224 + stringBytes(command.command) + stringBytes(command.cwd) + stringBytes(command.tool)
+        + (command.outputNodes?.length ?? 0) * 8;
+      for (const program of command.programs) bytes += 8 + stringBytes(program);
+    }
+    for (const epoch of this.toolEpochs) bytes += 96 + epoch.nodeIds.length * 8;
+    for (const map of [this.tools, this.skills, this.programs]) bytes += stringIndexBytes(map.keys()) + map.size * 64;
+    for (const map of [this.requestIds, this.toolResults, this.toolDurations, this.background, this.toolIntervals, this.calls]) {
+      bytes += stringIndexBytes(map.keys());
+    }
+    for (const call of this.calls.values()) bytes += 112 + call.files.length * 8 + stringBytes(call.skill);
+    bytes += this.toolIntervals.size * 64 + stringIndexBytes(this.turnIds) + stringIndexBytes(this.claudeNodes.keys());
+    for (const nodes of this.claudeNodes.values()) bytes += 80 + stringIndexBytes(nodes.keys());
+    return bytes;
   }
 
   constructor(readonly provider: string, readonly epoch: string = randomUUID()) {
@@ -111,6 +134,7 @@ export class ContextFold {
     if (!message.text && !message.tool && !message.images && !(this.antigravityCalls && message.callId)) return;
     if (!replayed && this.provider === "timeline" && message.category === "calls"
       && message.callId && this.calls.has(message.callId)) return;
+    const preview = detachPreview(message.text, 180);
     if (this.provider === "claude") {
       const key = text(record(row.message).id) || text(row.uuid);
       if (key) {
@@ -120,7 +144,7 @@ export class ContextFold {
         if (previous !== undefined) {
           const node = this.nodes[previous], tokens = message.images ? 1024 * message.images : estimateTextTokens(message.text);
           if (node.gone === undefined) this.active[node.category] += tokens - node.tokens;
-          node.tokens = tokens; node.preview = message.text.replace(/\s+/g, " ").slice(0, 180);
+          node.tokens = tokens; node.preview = preview;
           node.textLength = message.text.length;
           node.line = this.line; node.block = message.block;
           node.error = message.error;
@@ -131,16 +155,14 @@ export class ContextFold {
         this.claudeNodes.set(key, seen);
       }
     }
-    if (!replayed && message.category === "user") {
-      this.lastPrompt = message.text.replace(/\s+/g, " ").slice(0, 180);
-    }
+    if (!replayed && message.category === "user") this.lastPrompt = preview;
     if (!replayed && ["assistant", "reasoning", "calls"].includes(message.category) && this.pending === null) {
       this.pending = this.startRequest(at);
     }
     const tokens = metadataOnly ? 0 : message.images ? 1024 * message.images : estimateTextTokens(message.text);
     const node: ContextNode = {
       id: this.nodes.length, seq: this.line * 1_000_000 + this.slot++, line: this.line, block: message.block, category: message.category, time: at,
-      tokens, title: message.title || message.category, preview: message.text.replace(/\s+/g, " ").slice(0, 180),
+      tokens, title: message.title || message.category, preview,
       textLength: message.text.length,
       ...(message.images ? { images: message.images } : {}),
       ...(message.callId ? { callId: message.callId } : {}), ...(message.tool ? { tool: message.tool, source: this.toolSource(message.tool) } : {}),
@@ -192,7 +214,7 @@ export class ContextFold {
           c.outputNodes ??= [];
           if (!c.outputNodes.includes(node.id)) c.outputNodes.push(node.id);
           const processId = /Process running with session ID\s+([a-zA-Z0-9_-]+)/.exec(message.text)?.[1];
-          if (processId) this.background.set(processId, c);
+          if (processId) this.background.set(detachSlice(processId), c);
           if (!background) for (const [id, command] of this.background) if (command === c) this.background.delete(id);
         }
       }
@@ -209,7 +231,8 @@ export class ContextFold {
       if (message.category === "inject") this.event("inject", at, message.title, node.preview);
     }
     if (message.category === "tool" && loadedSkill) {
-      const name = /(?:^|\n)name:\s*([^\n]+)/.exec(message.text)?.[1]?.trim() ?? loadedSkill;
+      const captured = /(?:^|\n)name:\s*([^\n]+)/.exec(message.text)?.[1];
+      const name = captured === undefined ? loadedSkill : detachSlice(captured.trim());
       node.category = "skill";
       this.active.tool -= tokens;
       this.active.skill += tokens;
@@ -235,16 +258,16 @@ export class ContextFold {
     }));
     if (kind === "patch") {
       const patch = text(args.input) || message.text;
-      for (const file of patchFiles(patch)) files.push({ ...file, id: node.id, time: at, kind: "write", tool: name, error: false });
+      for (const file of patchFiles(patch)) files.push({ ...file, path: detachSlice(file.path), id: node.id, time: at, kind: "write", tool: name, error: false });
     }
     this.files.push(...files);
     let command: Command | undefined;
     if (kind === "bash" || kind === "pwsh") {
       const cmd = text(args.cmd ?? args.command);
       if (cmd) {
-        const programs = programsOfCommand(cmd, kind);
+        const programs = programsOfCommand(cmd, kind).map((program) => detachSlice(program));
         for (const program of programs) this.tally(this.programs, program, at);
-        command = { id: node.id, time: at, tool: name, command: cmd.slice(0, 2000), cwd: text(args.workdir ?? args.cwd),
+        command = { id: node.id, time: at, tool: name, command: detachSlice(cmd, 2000), cwd: text(args.workdir ?? args.cwd),
           programs, status: "running", exit: null, duration: null, outputNode: null };
         this.commands.push(command);
       }
@@ -253,8 +276,20 @@ export class ContextFold {
     const skillPath = files.find((f) => /(?:^|[/\\])SKILL\.md$/i.test(f.path))?.path
       ?? (command && /\b(?:cat|sed|head|bat)\b/.test(command.command) ? command.command.match(/(?:^|\s)([^\s'"]*SKILL\.md)\b/)?.[1] : undefined);
     const skill = skillPath ? skillPath.replace(/[/\\]SKILL\.md$/i, "").split(/[/\\]/).at(-1) : /(?:^|[._])skill$/i.test(name) ? text(args.name) || "skill" : undefined;
-    if (message.callId) this.calls.set(message.callId, { node, command, files, skill });
+    if (message.callId) this.calls.set(message.callId, { node, command, files, skill: skill === undefined ? undefined : detachSlice(skill) });
   }
+
+  private responsePreview(boundary: number) {
+    let preview = "", first = true;
+    for (let index = boundary; index < this.nodes.length && preview.length < 240; index++) {
+      const node = this.nodes[index];
+      if (node.category !== "assistant" && node.category !== "calls") continue;
+      preview += (first ? "" : " · ") + node.preview;
+      first = false;
+    }
+    return detachSlice(preview, 240);
+  }
+
   private request(observation: UsageObservation, at: number, model: string, timing: RequestTiming,
     native?: { start: number; checkpoint: boolean }) {
     const { id, usage, sources } = observation;
@@ -273,21 +308,16 @@ export class ContextFold {
       if (model) previous.model = model;
       if (!previous.usageAt && at > 0) previous.usageAt = at;
       Object.assign(previous, timing);
-      if (this.provider === "claude") {
-        previous.response = this.nodes.slice(previous.boundary).filter((n) => ["assistant", "calls"].includes(n.category)).map((n) => n.preview).join(" · ").slice(0, 240);
-        previous.duration = at > previous.time ? at - previous.time : null;
-        this.pending = null;
-      }
-      if (native) {
-        if (at > 0) previous.usageAt = at;
-        previous.response = this.nodes.slice(previous.boundary).filter((n) => ["assistant", "calls"].includes(n.category)).map((n) => n.preview).join(" · ").slice(0, 240);
-        previous.duration = timing.providerTiming?.modelMs ?? previous.duration;
+      if (native || this.provider === "claude") {
+        if (native && at > 0) previous.usageAt = at;
+        previous.response = this.responsePreview(previous.boundary);
+        previous.duration = native ? timing.providerTiming?.modelMs ?? previous.duration : at > previous.time ? at - previous.time : null;
         this.pending = null;
       }
       return;
     }
     const pending = this.pending ?? this.startRequest(at);
-    const response = this.nodes.slice(pending.boundary).filter((n) => ["assistant", "calls"].includes(n.category)).map((n) => n.preview).join(" · ").slice(0, 240);
+    const response = this.responsePreview(pending.boundary);
     const start = native ? native.start || at : pending.start || at;
     const duration = native ? timing.providerTiming?.modelMs ?? (at > start && start > 0 ? at - start : null)
       : at > pending.start ? at - pending.start : null;

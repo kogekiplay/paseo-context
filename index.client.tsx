@@ -29,6 +29,7 @@ export default function contribute(client: PluginClientContext) {
     const available = panel === "context" ? options && options.defaultPlacement !== "hide" : panel === "fleet" ? options?.fleetTab : true;
     if (workspace && available && !agentId.startsWith("native:")) {
       controller.select(workspace, agentId);
+      controller.activatePanel(workspace, panel);
       if (panel === "context" && options?.defaultPlacement === "sidebar") client.openPanel("context", { workspaceId: workspace, agentId, location: "explorer" });
       else client.openPanel(`workspace-${panel}`, { workspaceId: workspace, location: "workspace" });
     } else client.openScreen({ screenId: "context", params: { agentId, mode: panel } });

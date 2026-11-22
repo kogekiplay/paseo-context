@@ -20,6 +20,7 @@ import { makeStatisticsView } from "./statistics";
 import { reportedUsageOf } from "../shared/usage";
 import { hostMessage } from "./host-messages";
 import { PageLoader } from "./page-loader";
+import { fullMaxBytes, ImageUrlPool } from "./image-urls";
 import "../web/vendor/theme/theme.css";
 import "../.tmp/web/tailwind.css";
 import "../src/client/styles/base.css";
@@ -74,6 +75,17 @@ const CONTEXT_PREVIEW_KEYS = [
   "overviewAutoSteps", "defaultDeltaBase", "defaultToolSort", "defaultFileSort",
 ] as const;
 
+export function compactDigest(text: string): string {
+  let h1 = 0x811c9dc5 >>> 0;
+  let h2 = 0x01000193 >>> 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ ((c + i) & 0xffff), 0x85ebca6b) >>> 0;
+  }
+  return `${text.length.toString(36)}:${h1.toString(16)}:${h2.toString(16)}`;
+}
+
 function shallowEqualRecord(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
   const keysA = Object.keys(a), keysB = Object.keys(b);
   if (keysA.length !== keysB.length) return false;
@@ -88,9 +100,18 @@ function previewKeyFor(mode: string, preferences: Record<string, unknown>, previ
 }
 
 let state: State = { initialized: false, byId: {}, selected: null, current: "", locale: "en", mode: "context", preferences: {}, image: null };
+const imagePool = new ImageUrlPool();
+let lightboxGen = 0;
 const listeners = new Set<() => void>(), cleanups: Array<() => void> = [];
 const subscribe = (listener: () => void) => { listeners.add(listener); return () => { listeners.delete(listener); }; };
-const publish = (next: Partial<State>) => { state = { ...state, ...next }; for (const listener of listeners) listener(); };
+const publish = (next: Partial<State>) => {
+  if ("image" in next) {
+    if (!next.image) lightboxGen++;
+    imagePool.setLightboxUrl(next.image?.src ?? null);
+  }
+  state = { ...state, ...next };
+  for (const listener of listeners) listener();
+};
 const t = (key: string, params: Record<string, string | number> = {}) => {
   const dict = DICTS[state.locale.split("-")[0] as keyof typeof DICTS] ?? DICTS.en;
   let value = hostMessage(state.locale, key) ?? (dict as Record<string, string>)[key] ?? (DICTS.en as Record<string, string>)[key] ?? key;
@@ -106,7 +127,7 @@ const sessions = {
     if (!payload?.view) return;
     const mode = payload.view === "context-fleet" ? "fleet" : "context";
     if (state.preview) { action("previewPage", { mode }); return; }
-    familyRead?.abort(); familyRead = null;
+    familyRead?.abort(); familyRead = null; familyStamp = "";
     publish({ mode, selected: null, familyRevision: undefined });
     loader.configure({ agentId: state.current, mode });
   } }),
@@ -117,7 +138,7 @@ const sessions = {
     try {
       const family = await call("family", { agentId: sessionId, tasks: mode === "fleet" }, { signal: controller.signal });
       if (controller.signal.aborted || sessionId !== state.current || mode !== state.mode || stopped) return;
-      const stamp = JSON.stringify(family);
+      const stamp = compactDigest(JSON.stringify(family));
       if (stamp === familyStamp) return;
       familyStamp = stamp;
       publish({ byId: { ...state.byId, ...Object.fromEntries(family.map((row: any) => [row.id, row])) } });
@@ -126,6 +147,11 @@ const sessions = {
   },
 };
 let familyStamp = "";
+const loadThumbImage = (sessionId: string, attachment: { attachmentId: string }) =>
+  imagePool.resolveThumb(
+    `${sessionId}\0${attachment.attachmentId}`,
+    (maxBytes) => call("api/paseo-context/image", { sessionId, attachmentId: attachment.attachmentId, variant: "thumb", maxBytes }),
+  );
 const scope = {
   getSnapshot: () => ({ status: state.initialized ? "ready" : "loading", value: state.preferences, writable: !state.preview }),
   subscribe,
@@ -142,9 +168,14 @@ const context = {
     return ({ sessions, locale, paseoContextPreview: state.preview, connection: { isLoopback: false },
       uiWorkspace: { openSession: (id: string) => action("openAgent", { agentId: id }) },
       uiConversation: {
-        imageUrl: (sessionId: string, attachment: { attachmentId: string }) => call("api/paseo-context/image", { sessionId, attachmentId: attachment.attachmentId }),
+        imageUrl: loadThumbImage,
         openImage: async (sessionId: string, attachment: { attachmentId: string; name?: string }) => {
-          const src = await call("api/paseo-context/image", { sessionId, attachmentId: attachment.attachmentId });
+          const gen = ++lightboxGen;
+          const raw = await call("api/paseo-context/image", {
+            sessionId, attachmentId: attachment.attachmentId, variant: "full", maxBytes: fullMaxBytes(),
+          });
+          if (gen !== lightboxGen || stopped || sessionId !== state.current) return false;
+          const src = typeof raw === "string" ? imagePool.toLightboxUrl(raw) : "";
           publish({ image: { src, name: attachment.name || "Image" } }); return true;
         },
       },
@@ -158,9 +189,17 @@ const context = {
         const file = parseFileAddress(address);
         if (!file) throw new Error("Unsupported resource");
         const agentId = file.scope === "session" ? file.sessionId : state.current;
-        void call("api/paseo-context/file.preview", { agentId, path: file.path })
-          .then((image) => publish({ image }))
-          .catch((error: unknown) => publish({ image: { src: "", name: file.path, text: String(error) } }));
+        const gen = ++lightboxGen;
+        void call("api/paseo-context/file.preview", { agentId, path: file.path, maxBytes: fullMaxBytes() })
+          .then((preview) => {
+            if (gen !== lightboxGen || stopped) return;
+            const src = typeof preview?.src === "string" ? imagePool.toLightboxUrl(preview.src) : "";
+            publish({ image: preview ? { ...preview, src } : null });
+          })
+          .catch((error: unknown) => {
+            if (gen !== lightboxGen || stopped) return;
+            publish({ image: { src: "", name: file.path, text: String(error) } });
+          });
       } },
     } as Record<string, unknown>)[name];
   },
@@ -198,7 +237,7 @@ function App() {
   if (!s.current) return <div className="pc-status">{t("trend.empty")}</div>;
   if (!s.selected) return <div className="pc-status" role="status">{loadingLabel}</div>;
   const props = { sessionId: s.current, useProjection };
-  if (s.mode === "statistics") return <Statistics key={s.current} {...props} locale={s.locale} snapshot={s.selected?.statistics ?? null} />;
+  if (s.mode === "statistics") return <Statistics key={s.current} {...props} locale={s.locale} snapshot={s.selected?.statistics ?? null} loadImage={(attachment) => loadThumbImage(s.current, attachment)} />;
   if (s.mode === "modal") return <ContextModal {...props} useContextModal={(selector) => useSyncExternalStore(modalStoreOf(s.current).subscribe, () => selector(modalStoreOf(s.current).getSnapshot()))} />;
   return s.mode === "fleet" ? <FleetView {...props} /> : <ContextView key={previewKey === undefined ? undefined : `${s.current}:${previewKey}`}
     host={s.mode === "sidebar-context" ? "sidebar" : undefined} {...props} />;
@@ -288,6 +327,8 @@ window.addEventListener("message", (event) => {
   const targetChanged = !state.initialized || current !== state.current || mode !== state.mode;
   if (targetChanged) {
     familyRead?.abort(); familyRead = null; familyStamp = "";
+    lightboxGen++;
+    imagePool.clearThumbs();
   }
   document.body.toggleAttribute("data-pc-preview", preview);
   if (platform) document.documentElement.dataset.platform = platform;
@@ -330,7 +371,9 @@ document.addEventListener("visibilitychange", () => {
 });
 window.addEventListener("pagehide", () => {
   stopped = true; loader.dispose();
-  familyRead?.abort(); familyRead = null;
+  familyRead?.abort(); familyRead = null; familyStamp = "";
+  lightboxGen++;
+  imagePool.dispose();
   modalOff?.(); modalOff = null;
   if (modalSession) modalStoreOf(modalSession).set(false);
   for (const cleanup of cleanups.splice(0)) cleanup();

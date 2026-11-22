@@ -24,9 +24,9 @@ function session(id: string, sessionId: string, parentId: string | null = null) 
     data: () => ({ agent, fold, summary: fold.summary(agent), requests: fold.requests, revision: clock }),
     message: (role: "user" | "assistant", value: string, at?: number) =>
       emit({ type: "message", role, content: [{ type: role === "user" ? "input_text" : "output_text", text: value }] }, at),
-    call: (name: string, args: unknown) => {
+    call: (name: string, args: unknown, at?: number) => {
       const callId = `${id}-${serial++}`;
-      const nodeId = emit({ type: "function_call", name, arguments: JSON.stringify(args), call_id: callId });
+      const nodeId = emit({ type: "function_call", name, arguments: JSON.stringify(args), call_id: callId }, at);
       return { callId, nodeId };
     },
     result: (callId: string, value: unknown) =>
@@ -76,6 +76,57 @@ function harness(fixtures: Session[], unread: string[] = []) {
 }
 
 describe("Fleet communication contract", () => {
+  test("merges broadcast and directed messages in stable order without delivering to the sender", async () => {
+    const root = session("root", "root-native"), child = session("child", "child-native", "root");
+    const peer = session("peer", "peer-native", "root");
+    root.call("send_message", { type: "broadcast", message: "root broadcast" }, 3000);
+    child.call("send_message", { type: "broadcast", message: "child broadcast" }, 3000);
+    peer.call("send_message", { to: "child-native", message: "child only" }, 3000);
+    root.call("send_message", { to: "child-native", message: "root direct" }, 3000);
+    peer.call("send_message", { type: "broadcast", message: "peer broadcast" }, 4000);
+    const { fleet, paseo } = harness([root, child, peer]);
+    try {
+      const family = await fleet.read("root", paseo);
+      const preview = await fleet.detail(family, "child", "preview", paseo);
+      const history = await fleet.detail(family, "child", "history", paseo);
+      expect(preview?.messages.map((row) => row.text)).toEqual(["child only", "root broadcast", "root direct", "peer broadcast"]);
+      expect(history?.messages.map((row) => row.seq)).toEqual(preview?.messages.map((row) => row.seq));
+      const summary = await fleet.summary(family, paseo);
+      expect(summary.counts).toMatchObject({ root: { messagesTotal: 2 }, child: { messagesTotal: 4 }, peer: { messagesTotal: 2 } });
+      expect(summary.detail.messages.map((row) => row.text)).toEqual(["child broadcast", "peer broadcast"]);
+    } finally { fleet.clear(); }
+  });
+
+  test("distinguishes reports attached to the same source node in a 100,000-line log", async () => {
+    const root = session("root", "root-native");
+    const statuses = Object.fromEntries(Array.from({ length: 74 }, (_, index) => [`child-${index}`, { completed: `Report ${index}` }]));
+    const wait = root.call("wait_agent", { ids: Object.keys(statuses) });
+    const resultId = root.result(wait.callId, { status: statuses });
+    const base = 100_000_000_002;
+    root.fold.nodes[resultId].seq = base;
+    const { fleet, paseo } = harness([root]);
+    try {
+      const family = await fleet.read("root", paseo, undefined, false);
+      const detail = await fleet.detail(family, "root", "preview", paseo);
+      const sequences = detail?.messages.map((message) => message.seq) ?? [];
+      expect(sequences).toHaveLength(74);
+      expect(new Set(sequences).size).toBe(74);
+      expect(sequences.every((seq) => Math.floor(seq) === base)).toBe(true);
+    } finally { fleet.clear(); }
+  });
+
+  test("cancels recent-family timers on eviction, replacement and teardown", async () => {
+    vi.useFakeTimers();
+    const root = session("root", "root-native"), { fleet, paseo } = harness([root]);
+    try {
+      for (let index = 0; index < 5; index++) await fleet.read(`key-${index}`, paseo, undefined, false);
+      expect(vi.getTimerCount()).toBe(4);
+      await fleet.read("key-4", paseo, root.data(), false);
+      expect(vi.getTimerCount()).toBe(4);
+      fleet.clear();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { fleet.clear(); vi.useRealTimers(); }
+  });
   test("routes outgoing messages to canonical recipients and reports only explicit child completion", async () => {
     const root = session("paseo-root", "root-native");
     const child = session("native:codex:child-native", "child-native", root.agent.id);

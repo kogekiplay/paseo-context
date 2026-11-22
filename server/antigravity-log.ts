@@ -1,6 +1,6 @@
 import type { ProviderTiming, Usage } from "../shared/contracts";
 import type { Message } from "./normalize";
-import { parseArgs, printable, record, text, timestamp, type RecordValue } from "./value";
+import { parseArgs, printable, record, stringBytes, text, timestamp, type RecordValue } from "./value";
 
 const UUID = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
 
@@ -109,6 +109,12 @@ export class AntigravityCalls {
   private pending: string[] = [];
   private cursor = 0;
   private lastPlannerId = "";
+
+  get residentBytes() {
+    let bytes = 64 + stringBytes(this.lastPlannerId);
+    for (const id of this.pending) bytes += 8 + stringBytes(id);
+    return bytes;
+  }
 
   link(row: RecordValue, messages: Message[], line: number, step?: AntigravityStep) {
     const hasCalls = messages.some((message) => message.category === "calls");

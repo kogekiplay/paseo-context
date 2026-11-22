@@ -10,7 +10,8 @@ import { Metadata } from "./metadata";
 import type { PublicCache } from "./public-cache";
 import { UiFleet } from "./ui-fleet";
 import { uiDocument } from "./assets";
-import { imageUrlOf } from "./images";
+import { imageByteLimit, imageUrlOf } from "./images";
+import { MAX_IMAGE_THUMB_BYTES } from "../shared/limits";
 import { previewFile } from "./files";
 import { statisticsOf } from "./statistics";
 import { statisticsDetails } from "./statistics-details";
@@ -140,13 +141,14 @@ export class UiRoutes {
     if (name === "recom") return { ok: true, value: await this.metadata.recoms() };
     if (name === "file.preview") {
       const data = await this.service.load(await this.service.agent(id, paseo), paseo);
-      return previewFile(data.agent, data.fold.files, text(body.path));
+      return previewFile(data.agent, data.fold.files, text(body.path), imageByteLimit(body.maxBytes));
     }
     if (name === "image") {
       if (!id) throw new Error("An agent is required");
       const match = /^paseo-context-image:(\d+)$/.exec(text(body.attachmentId));
       if (!match) throw new Error("Unknown image");
-      const url = imageUrlOf(await this.service.content(id, Number(match[1]), paseo));
+      const maxBytes = imageByteLimit(body.maxBytes, body.variant === "thumb" ? MAX_IMAGE_THUMB_BYTES : undefined);
+      const url = imageUrlOf(await this.service.content(id, Number(match[1]), paseo), maxBytes);
       if (!url) throw new Error("Image bytes were not retained in this session");
       return url;
     }

@@ -6,6 +6,8 @@ import { statisticsOf } from "../server/statistics";
 import { UiRoutes } from "../server/ui-routes";
 import { UiFleet } from "../server/ui-fleet";
 import { scopeSchema } from "../shared/contracts";
+import { ReadBudget } from "../server/read-budget";
+import { SessionReader } from "../server/reader";
 
 const at = (millis: number) => new Date(millis).toISOString();
 const raw = (id: string, extra = {}) => ({ id, title: id, provider: "antigravity", cwd: "/fixture", status: "idle",
@@ -35,6 +37,43 @@ const deferred = <T>() => {
   const promise = new Promise<T>((done) => { resolve = done; });
   return { promise, resolve };
 };
+
+test("expires inactive timeline frames and still resolves bodies held by active readers", async () => {
+  vi.useFakeTimers();
+  const agent = raw("timeline"), service = serviceOf();
+  const refetch = vi.fn(async () => page([entry(1, { type: "user_message", text: "old snapshot" })], { endCursor: cursor(1) }));
+  const paseo = apiOf([agent], refetch);
+  try {
+    const first = await service.load(agent, paseo);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(vi.getTimerCount()).toBe(0);
+    const next = await service.load(agent, paseo);
+    expect(next.fold).not.toBe(first.fold);
+    expect(next.revision).toBe(first.revision);
+    expect(refetch.mock.calls.map(([, options]: any[]) => options.direction)).toEqual(["tail", "tail"]);
+    expect(await service.contents(first, [0])).toEqual(new Map([[0, "old snapshot"]]));
+  } finally { service.clear(); vi.useRealTimers(); }
+});
+
+test("shares admission between timeline and corpus RPCs and cancels both queued reads on teardown", async () => {
+  const budget = new ReadBudget(1024, 1), signal = new AbortController(), barrier = deferred<void>();
+  const pending = budget.run(1024, signal.signal, () => barrier.promise);
+  const budgetRun = vi.spyOn(budget, "run");
+  const agent = raw("timeline"), service = serviceOf(new SessionReader({}, budget));
+  const refetch = vi.fn(async () => page([])), paseo = apiOf([agent], refetch);
+  const directory = vi.spyOn(paseo.agents, "list");
+  try {
+    const timeline = expect(service.load(agent, paseo)).rejects.toThrow(/stopped/);
+    const corpus = expect(service.backfill(paseo)).rejects.toThrow(/stopped/);
+    await vi.waitFor(() => expect(budgetRun).toHaveBeenCalledTimes(2));
+    expect(refetch).not.toHaveBeenCalled();
+    expect(directory).not.toHaveBeenCalled();
+    service.clear();
+    await Promise.all([timeline, corpus]);
+    expect(refetch).not.toHaveBeenCalled();
+    expect(directory).not.toHaveBeenCalled();
+  } finally { service.clear(); barrier.resolve(); await pending; }
+});
 
 test("increments a complete timeline with its epoch cursor and batches Statistics bodies without a history reread", async () => {
   const agent = raw("antigravity"), service = serviceOf(), routes = new UiRoutes(service);

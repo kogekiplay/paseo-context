@@ -5,12 +5,13 @@ import type { ProviderTiming, Usage } from "../shared/contracts";
 import { antigravityStepIndex, mergeAntigravityUsage, type AntigravityStep } from "./antigravity-log";
 import { firstIndex, milliseconds, protobuf, protobufText } from "./antigravity-protobuf";
 import { ensureActive } from "./paging";
+import { RetainedCache } from "./retained-cache";
 
 const LIMIT = 32;
 const MAX_BYTES = 16 * 1024 * 1024;
 const USER = 14, PLANNER = 15, CHECKPOINT = 23, TOOL = 132;
 
-export interface AntigravityDatabaseFile { path: string; fingerprint: string }
+export interface AntigravityDatabaseFile { path: string; fingerprint: string; bytes: number }
 interface StoredStep { facts: AntigravityStep; key: string }
 export interface AntigravitySnapshot {
   fingerprint: string;
@@ -96,7 +97,8 @@ async function fingerprint(path: string) {
     }
   }));
   if (!main?.isFile() || wal && !wal.isFile() || shm && !shm.isFile()) return null;
-  return [main, wal].map((file) => file ? `${file.dev}:${file.ino}:${file.size}:${file.mtimeNs}:${file.ctimeNs}` : "").join("/");
+  return { bytes: Number(main.size + (wal?.size ?? 0n)),
+    fingerprint: [main, wal].map((file) => file ? `${file.dev}:${file.ino}:${file.size}:${file.mtimeNs}:${file.ctimeNs}` : "").join("/") };
 }
 
 function sqlite(): typeof Sqlite | undefined {
@@ -105,7 +107,7 @@ function sqlite(): typeof Sqlite | undefined {
 }
 
 export class AntigravityDatabase {
-  private cache = new Map<string, AntigravitySnapshot>();
+  private cache = new RetainedCache<AntigravitySnapshot>(LIMIT, MAX_BYTES);
 
   constructor(private root: string, private signal: AbortSignal) {}
 
@@ -117,31 +119,30 @@ export class AntigravityDatabase {
       ensureActive(this.signal);
       if (!key || !sqlite()) return null;
       if (await realpath(path) !== path) return null;
-      return { path, fingerprint: key };
+      return { path, ...key };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw error;
     }
   }
 
-  async read({ path, fingerprint: key }: AntigravityDatabaseFile): Promise<AntigravitySnapshot> {
+  // SessionReader reserves the database and transcript together while this snapshot is in use.
+  async read({ path, fingerprint: key }: AntigravityDatabaseFile, account: (bytes: number) => void): Promise<AntigravitySnapshot> {
     const module = sqlite();
     if (!module) throw new Error("Antigravity SQLite is unavailable");
     for (let attempt = 0; attempt < 2; attempt++) {
       ensureActive(this.signal);
       const cached = this.cache.get(path);
-      if (cached?.fingerprint === key) {
-        this.cache.delete(path);
-        this.cache.set(path, cached);
-        return cached;
-      }
-      if (await realpath(path) !== path || await fingerprint(path) !== key) {
-        const current = await fingerprint(path);
-        if (!current) break;
-        key = current;
+      if (cached?.fingerprint === key) return cached;
+      if (await realpath(path) !== path) break;
+      const current = await fingerprint(path);
+      if (!current) break;
+      if (current.fingerprint !== key) {
+        key = current.fingerprint;
         continue;
       }
       ensureActive(this.signal);
+      account(current.bytes);
       const db = new module.DatabaseSync(path, { readOnly: true, timeout: 250 });
       let facts: Map<number, AntigravityStep>;
       let begun = false;
@@ -153,10 +154,10 @@ export class AntigravityDatabase {
         if (begun) { try { db.exec("ROLLBACK"); } catch {} }
         db.close();
       }
-      const current = await fingerprint(path);
+      const after = await fingerprint(path);
       ensureActive(this.signal);
-      if (!current) break;
-      if (current !== key) { key = current; continue; }
+      if (!after) break;
+      if (after.fingerprint !== key) { key = after.fingerprint; continue; }
       const steps = new Map<number, StoredStep>();
       let bytes = 0;
       for (const [index, fact] of [...facts].sort(([a], [b]) => a - b)) {
@@ -165,22 +166,10 @@ export class AntigravityDatabase {
         bytes += 320 + stepKey.length * 2;
       }
       const snapshot = { fingerprint: key, steps, bytes };
-      this.remember(path, snapshot);
+      this.cache.set(path, snapshot, bytes);
       return snapshot;
     }
     throw new Error("Antigravity database changed while reading");
-  }
-
-  private remember(path: string, snapshot: AntigravitySnapshot) {
-    this.cache.delete(path);
-    if (snapshot.bytes > MAX_BYTES) return;
-    this.cache.set(path, snapshot);
-    let bytes = [...this.cache.values()].reduce((total, entry) => total + entry.bytes, 0);
-    for (const [file, entry] of this.cache) {
-      if (this.cache.size <= LIMIT && bytes <= MAX_BYTES) break;
-      this.cache.delete(file);
-      bytes -= entry.bytes;
-    }
   }
 
   clear() { this.cache.clear(); }

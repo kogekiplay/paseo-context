@@ -1,6 +1,6 @@
-import { createElement, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
+import { createElement, useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import { findNodeHandle, Linking, Platform, Pressable, Text, TurboModuleRegistry, UIManager, View } from "react-native";
-import type { TurboModule } from "react-native";
+import type { LayoutChangeEvent, TurboModule } from "react-native";
 import { useRpc, useSettings, useTranslation } from "@getpaseo/plugin/client";
 import { copyText, Modal } from "@getpaseo/plugin/client/ui";
 import { useQuery } from "@tanstack/react-query";
@@ -13,18 +13,25 @@ import {
 import type { FrameProps } from "./frame";
 import { messages } from "./messages";
 import { isNativeDocumentUrl, isNativeLoadEventUrl, nativeDocumentUrl } from "./native-navigation";
+import { HIDDEN_PAUSE_DELAY_MS, nativeWebViewPool, type NativeWebViewPoolEntry } from "./native-pool";
 
 interface WebViewModule extends TurboModule {
   shouldStartLoadWithLockIdentifier(allow: boolean, lock: number): void;
 }
-interface ChunkBuffer { total: number; parts: Array<string | undefined>; received: number }
+interface ChunkBuffer {
+  total: number;
+  parts: Array<string | undefined>;
+  received: number;
+  timer: ReturnType<typeof setTimeout>;
+}
 
 // Paseo 0.15.4 imports react-native-webview 13.16.1 for its native view.
 // Its codegen component is already registered; reuse that host registration.
 // Registering it again with requireNativeComponent would cause a duplicate view.
 const RNCWebView = "RNCWebView" as unknown as ComponentType<any>;
-const MAX_CHUNK_GROUPS = 16;
+const MAX_CHUNK_GROUPS = 4;
 const MAX_CHUNKS_PER_MESSAGE = 1024;
+const CHUNK_GROUP_TTL_MS = 30_000;
 const MAX_COMPLETED_GROUPS = 128;
 const MAX_SEEN_HISTORY_IDS = 256;
 const SINGLE_MARKER = "#paseo-context=";
@@ -88,34 +95,106 @@ function NativeFrameBody(props: FrameProps & { retry: () => void }) {
   const completedGroups = useRef(new Set<string>());
   const seenHistoryIds = useRef(new Set<string>());
   const seenHistorySeqs = useRef(new Set<string>());
+  const webViewGen = useRef(0);
   const latest = useRef({ props, settings, locale, rpc, previewRpc });
   latest.current = { props, settings, locale, rpc, previewRpc };
   const saveSetting = useMemo(() => createSettingsSaver(() => latest.current.settings as any), []);
   const nonce = useMemo(() => `native${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`, []);
   const baseUrl = useMemo(() => nativeDocumentUrl(nonce), [nonce]);
   const platform = platformNameOf(Platform.OS);
+  const pooled = !props.overlay;
   const [error, setError] = useState("");
   const [ready, setReady] = useState(false);
   const [slow, setSlow] = useState(false);
+  const [layoutVisible, setLayoutVisible] = useState(true);
+  const [paused, setPaused] = useState(false);
+  const layoutVisibleRef = useRef(true);
+  const pausedRef = useRef(false);
+  const hasRenderedWebView = useRef(false);
+  const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const prevActivationToken = useRef(props.activationToken);
+  layoutVisibleRef.current = layoutVisible;
+  pausedRef.current = paused;
+
+  const clearHideTimer = useCallback(() => {
+    if (hideTimer.current !== null) {
+      clearTimeout(hideTimer.current);
+      hideTimer.current = null;
+    }
+  }, []);
+
+  const clearAllChunks = useCallback(() => {
+    for (const entry of chunks.current.values()) clearTimeout(entry.timer);
+    chunks.current.clear();
+  }, []);
+
+  const resetBridgeState = useCallback(() => {
+    clearAllChunks();
+    completedGroups.current.clear();
+    seenHistoryIds.current.clear();
+    seenHistorySeqs.current.clear();
+    reported.current.clear();
+  }, [clearAllChunks]);
+
+  const pauseNow = useCallback(() => {
+    if (!mounted.current) return;
+    pausedRef.current = true;
+    hasRenderedWebView.current = false;
+    webViewGen.current++;
+    resetBridgeState();
+    setPaused(true);
+    setReady(false);
+    setSlow(false);
+  }, [resetBridgeState]);
+
+  const resumeNow = useCallback(() => {
+    if (!mounted.current) return;
+    if (pausedRef.current) {
+      webViewGen.current++;
+      resetBridgeState();
+      pausedRef.current = false;
+    }
+    setPaused(false);
+  }, [resetBridgeState]);
+
+  const poolEntryRef = useRef<NativeWebViewPoolEntry | null>(null);
+  if (!poolEntryRef.current) {
+    poolEntryRef.current = {
+      id: nonce,
+      isVisible: () => layoutVisibleRef.current,
+      pause: () => { pauseNow(); },
+      resume: () => { resumeNow(); },
+    };
+  }
+  poolEntryRef.current.pause = pauseNow;
+  poolEntryRef.current.resume = resumeNow;
+
+  const resumeFromUserOrFocus = useCallback(() => {
+    clearHideTimer();
+    resumeNow();
+    if (pooled && poolEntryRef.current) nativeWebViewPool.activate(poolEntryRef.current);
+  }, [clearHideTimer, resumeNow, pooled]);
 
   // Paseo supplies a query client per installation/host. All tabs reuse
   // the static markup without sharing session data across connections.
-  const markupQuery = useQuery(uiDocumentQueryOptions(rpc));
-  const html = useMemo(() => {
-    if (!markupQuery.data) return "";
-    const markup = markupQuery.data.replaceAll("%%PASEO_CONTEXT_NONCE%%", nonce);
-    return Platform.OS === "android"
-      ? markup.replace("globalThis.__PASEO_CONTEXT_NONCE__=", 'globalThis.__PASEO_CONTEXT_TRANSPORT__="history";globalThis.__PASEO_CONTEXT_NONCE__=')
-      : markup;
-  }, [markupQuery.data, nonce]);
-
+  const shouldMountWebView = !paused && (!pooled || layoutVisible || hasRenderedWebView.current);
+  const markupQuery = useQuery({ ...uiDocumentQueryOptions(rpc), enabled: shouldMountWebView });
   const chinese = locale.startsWith("zh");
   const docError = markupQuery.error ? (markupQuery.error instanceof Error ? markupQuery.error.message : String(markupQuery.error)) : "";
-  const loaded = ready && Boolean(html) && (!!props.preview || settings.status === "ready");
   const settingsError = !props.preview && (settings.status === "error" || settings.status === "invalid")
     ? (settings.error || (chinese ? "无法读取设置" : "Preferences unavailable")) : "";
   const failure = error || docError || settingsError;
   const failed = Boolean(failure);
+
+  const html = useMemo(() => {
+    if (!shouldMountWebView || failed || !markupQuery.data) return "";
+    const markup = markupQuery.data.replaceAll("%%PASEO_CONTEXT_NONCE%%", nonce);
+    return Platform.OS === "android"
+      ? markup.replace("globalThis.__PASEO_CONTEXT_NONCE__=", 'globalThis.__PASEO_CONTEXT_TRANSPORT__="history";globalThis.__PASEO_CONTEXT_NONCE__=')
+      : markup;
+  }, [shouldMountWebView, failed, markupQuery.data, nonce]);
+
+  const loaded = !paused && ready && Boolean(html) && (!!props.preview || settings.status === "ready");
 
   const report = (phase: string) => {
     if (latest.current.props.preview || reported.current.has(phase)) return;
@@ -129,6 +208,7 @@ function NativeFrameBody(props: FrameProps & { retry: () => void }) {
   };
   const send = (data: unknown) => inject(`globalThis.__PASEO_CONTEXT_RECEIVE__?.(${JSON.stringify(data)});true;`);
   const initialize = () => {
+    if (pausedRef.current) return;
     const { props, settings, locale } = latest.current;
     const values = props.preview?.values ?? (settings.status === "ready" ? settings.values : null);
     if (!values) return;
@@ -138,20 +218,34 @@ function NativeFrameBody(props: FrameProps & { retry: () => void }) {
   useEffect(() => {
     mounted.current = true;
     report("mounted");
+    const entry = poolEntryRef.current!;
+    if (pooled) {
+      nativeWebViewPool.register(entry);
+      if (layoutVisibleRef.current && !pausedRef.current) nativeWebViewPool.activate(entry);
+    }
     return () => {
       mounted.current = false;
-      chunks.current.clear();
-      completedGroups.current.clear();
-      seenHistoryIds.current.clear();
-      seenHistorySeqs.current.clear();
+      webViewGen.current++;
+      clearHideTimer();
+      resetBridgeState();
+      if (pooled) nativeWebViewPool.unregister(entry.id);
     };
-  }, []);
+  }, [pooled, clearHideTimer, resetBridgeState]);
+
+  useEffect(() => {
+    if (prevActivationToken.current === props.activationToken) return;
+    prevActivationToken.current = props.activationToken;
+    if (props.activationToken !== undefined && layoutVisibleRef.current) {
+      resumeFromUserOrFocus();
+    }
+  }, [props.activationToken, resumeFromUserOrFocus]);
 
   useEffect(() => {
     if (markupQuery.data && !markupQuery.error && error) setError("");
   }, [markupQuery.data, markupQuery.error]);
 
   useEffect(initialize, [
+    paused,
     settings.status,
     settings.status === "ready" ? settings.revision : "",
     props.preview?.values,
@@ -163,17 +257,50 @@ function NativeFrameBody(props: FrameProps & { retry: () => void }) {
   ]);
 
   useEffect(() => {
-    if (loaded || failed) return;
+    if (paused || loaded || failed || !shouldMountWebView) return;
     const timer = setTimeout(() => setSlow(true), 15000);
     return () => clearTimeout(timer);
-  }, [loaded, failed]);
+  }, [paused, loaded, failed, shouldMountWebView]);
+
+  const handleLayout = useCallback((event: LayoutChangeEvent) => {
+    const { width, height } = event.nativeEvent.layout;
+    const nextVisible = width > 0 && height > 0;
+    const wasVisible = layoutVisibleRef.current;
+    layoutVisibleRef.current = nextVisible;
+    setLayoutVisible(nextVisible);
+    if (!pooled) return;
+    if (!nextVisible) {
+      if (!hasRenderedWebView.current) {
+        clearHideTimer();
+        nativeWebViewPool.deactivate(nonce);
+        pauseNow();
+        return;
+      }
+      if (hideTimer.current === null && !pausedRef.current) {
+        hideTimer.current = setTimeout(() => {
+          hideTimer.current = null;
+          if (!mounted.current || layoutVisibleRef.current) return;
+          nativeWebViewPool.deactivate(nonce);
+          pauseNow();
+        }, HIDDEN_PAUSE_DELAY_MS);
+      }
+      return;
+    }
+    clearHideTimer();
+    if (!wasVisible) {
+      resumeFromUserOrFocus();
+    }
+  }, [pooled, nonce, clearHideTimer, pauseNow, resumeFromUserOrFocus]);
 
   const receive = (event: { nativeEvent: { data: string } }) => {
-    if (!mounted.current) return;
+    if (!mounted.current || pausedRef.current) return;
     let data: any;
     try { data = JSON.parse(event.nativeEvent.data); } catch { return; }
     if (data?.nonce !== nonce) return;
-    if (data.type === "paseo-context:ready") { setSlow(false); setReady(true); report("JavaScript ready"); initialize(); return; }
+    if (data.type === "paseo-context:ready") {
+      hasRenderedWebView.current = true;
+      setSlow(false); setReady(true); report("JavaScript ready"); initialize(); return;
+    }
     if (data.type === "paseo-context:status") { report("rendered"); return; }
     if (data.type === "paseo-context:fatal") { setError(String(data.message)); report("JavaScript error"); return; }
     if (data.type === "paseo-context:error") {
@@ -187,8 +314,11 @@ function NativeFrameBody(props: FrameProps & { retry: () => void }) {
       return;
     }
     if (data.type !== "paseo-context:rpc") return;
+    const gen = webViewGen.current;
     const reply = (value: unknown, err?: string) => {
-      if (mounted.current) send({ type: "paseo-context:result", nonce, id: data.id, value, error: err });
+      if (mounted.current && !pausedRef.current && webViewGen.current === gen) {
+        send({ type: "paseo-context:result", nonce, id: data.id, value, error: err });
+      }
     };
     void (async () => {
       try {
@@ -229,14 +359,33 @@ function NativeFrameBody(props: FrameProps & { retry: () => void }) {
     if (completedGroups.current.has(groupId)) return;
     const part = raw.slice(fourth + 1);
     let entry = chunks.current.get(groupId);
-    if (!entry || entry.total !== total) {
-      while (chunks.current.size >= MAX_CHUNK_GROUPS) chunks.current.delete(chunks.current.keys().next().value!);
-      entry = { total, parts: Array.from({ length: total }), received: 0 };
+    if (entry && entry.total !== total) {
+      clearTimeout(entry.timer);
+      chunks.current.delete(groupId);
+      entry = undefined;
+    }
+    if (!entry) {
+      while (chunks.current.size >= MAX_CHUNK_GROUPS) {
+        const oldestKey = chunks.current.keys().next().value!;
+        const oldest = chunks.current.get(oldestKey);
+        if (oldest) clearTimeout(oldest.timer);
+        chunks.current.delete(oldestKey);
+      }
+      entry = {
+        total,
+        parts: Array.from({ length: total }),
+        received: 0,
+        timer: setTimeout(() => { chunks.current.delete(groupId); }, CHUNK_GROUP_TTL_MS),
+      };
       chunks.current.set(groupId, entry);
+    } else {
+      clearTimeout(entry.timer);
+      entry.timer = setTimeout(() => { chunks.current.delete(groupId); }, CHUNK_GROUP_TTL_MS);
     }
     if (entry.parts[index] === undefined) entry.received++;
     entry.parts[index] = part;
     if (entry.received < entry.total) return;
+    clearTimeout(entry.timer);
     chunks.current.delete(groupId);
     rememberBounded(completedGroups.current, groupId, MAX_COMPLETED_GROUPS);
     const combined = entry.parts.join("");
@@ -245,7 +394,8 @@ function NativeFrameBody(props: FrameProps & { retry: () => void }) {
   };
 
   const handleBridgeFrame = (frame: NonNullable<ReturnType<typeof extractBridgeFrame>>) => {
-    if (!mounted.current) return false;
+    if (!mounted.current || pausedRef.current) return false;
+    const gen = webViewGen.current;
     const ackSeq = frame.seq;
     if (ackSeq !== undefined && seenHistorySeqs.current.has(ackSeq)) return false;
     if (ackSeq !== undefined) rememberBounded(seenHistorySeqs.current, ackSeq, MAX_SEEN_HISTORY_IDS);
@@ -263,7 +413,7 @@ function NativeFrameBody(props: FrameProps & { retry: () => void }) {
     } catch {
       // Malformed or truncated hash payloads must still release the bridge queue.
     } finally {
-      if (mounted.current) {
+      if (mounted.current && !pausedRef.current && webViewGen.current === gen) {
         inject(ackSeq !== undefined
           ? `globalThis.__PASEO_CONTEXT_ACK__?.(${JSON.stringify(ackSeq)});true;`
           : "globalThis.__PASEO_CONTEXT_ACK__?.();true;");
@@ -278,11 +428,34 @@ function NativeFrameBody(props: FrameProps & { retry: () => void }) {
   const source = useMemo(() => ({ html, baseUrl }), [html, baseUrl]);
   const accent = props.theme.colors.accent ?? props.theme.colors.foreground;
 
+  if (paused && !props.overlay) {
+    return <View onLayout={handleLayout} style={{ flex: 1, minHeight: 0, alignItems: "center", justifyContent: "center", padding: 24, backgroundColor: props.theme.colors.surface0 }}>
+      <Pressable
+        accessibilityRole="button"
+        onPress={resumeFromUserOrFocus}
+        style={{
+          paddingVertical: 14,
+          paddingHorizontal: 18,
+          borderRadius: 10,
+          borderWidth: 1,
+          borderColor: props.theme.colors.border ?? props.theme.colors.foregroundMuted,
+          backgroundColor: props.theme.colors.surface1 ?? props.theme.colors.surface0,
+        }}
+      >
+        <Text style={{ color: props.theme.colors.foreground, fontSize: 13 }}>
+          {chinese ? "已暂停以节省内存，点击恢复" : "Paused to save memory — tap to resume"}
+        </Text>
+      </Pressable>
+    </View>;
+  }
+
   const statusBanner = !loaded || failed ? <View style={{ padding: 24, gap: 10, backgroundColor: props.theme.colors.surface0 }}>
     <Text accessibilityRole={failed ? "alert" : undefined} style={{ color: failed ? props.theme.colors.foreground : props.theme.colors.foregroundMuted }}>
       {failed ? `Paseo Context: ${failure}` : slow ? (chinese ? "界面加载较慢…" : "The interface is taking longer than usual…") : (chinese ? "正在加载原版界面…" : "Loading interface…")}
     </Text>
     {failed || slow ? <Pressable accessibilityRole="button" onPress={() => {
+      webViewGen.current++;
+      resetBridgeState();
       setError("");
       if (markupQuery.error) void markupQuery.refetch().catch(() => {});
       if (settings.status !== "ready") void settings.reload().catch(() => {});
@@ -295,15 +468,20 @@ function NativeFrameBody(props: FrameProps & { retry: () => void }) {
     </Pressable> : null}
   </View> : null;
 
-  if (failed || !html) return statusBanner;
+  if (failed || !html) {
+    return <View onLayout={handleLayout} style={{ flex: 1, minHeight: 0, backgroundColor: props.theme.colors.surface0 }}>
+      {statusBanner}
+    </View>;
+  }
 
-  return <View style={{ flex: 1, minHeight: 0, backgroundColor: props.theme.colors.surface0 }}>
+  return <View onLayout={handleLayout} style={{ flex: 1, minHeight: 0, backgroundColor: props.theme.colors.surface0 }}>
     {statusBanner}
     {createElement(RNCWebView, {
       ref, source, newSource: source, style: { flex: 1, backgroundColor: props.theme.colors.surface0 },
       javaScriptEnabled: true, messagingEnabled: true, messagingModuleName: "",
       onMessage: receive,
       onLoadingFinish: (event: { nativeEvent: { url?: string; title?: string } }) => {
+        hasRenderedWebView.current = true;
         if (event.nativeEvent.title?.startsWith("Paseo Context error:")) {
           setError(event.nativeEvent.title); report(event.nativeEvent.title.slice(0, 150));
         }
@@ -330,6 +508,7 @@ function NativeFrameBody(props: FrameProps & { retry: () => void }) {
           const scheme = /^[a-z]+(?=:)/i.exec(url)?.[0] ?? "unknown";
           report(`unexpected navigation blocked (${scheme})`); return;
         }
+        hasRenderedWebView.current = true;
         const bridgeFrame = extractBridgeFrame(url, Platform.OS === "android" ? event.nativeEvent.title : undefined);
         if (!bridgeFrame) { report("navigation started"); return; }
         handleBridgeFrame(bridgeFrame);

@@ -1,7 +1,7 @@
 import { StatsView } from "./vendor/statistics/StatsView";
 import * as dictionaries from "./vendor/statistics/locales";
 import type { StatsKey, StatsTranslate } from "./vendor/statistics/locales";
-import type { StatsSnapshot, StatsRequestDetails as Details, StatsStepMetrics } from "../shared/core/stats-contract";
+import type { ImageAttachmentRef, StatsSnapshot, StatsRequestDetails as Details, StatsStepMetrics } from "../shared/core/stats-contract";
 import type { SessionStandardProps } from "../src/client/services";
 import type { ViewKit } from "../src/client/viewkit";
 import { call } from "./bridge";
@@ -11,11 +11,23 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 const noOlder = async () => "exhausted" as const;
 const cancel = () => {};
 const empty: StatsSnapshot = { turns: [], stepCount: 0 };
-const MAX_CACHED_DETAILS = 64;
+export const MAX_CACHED_DETAILS = 64;
+export const MAX_CACHED_DETAIL_CHARS = 3 * 1024 * 1024;
 
 type StatusEntry = { revision: string; status: "loading" | "error" };
 
-function setBounded<V>(previous: Map<string, V>, key: string, value: V): Map<string, V> {
+export function detailCharSize(detail: Details): number {
+  let chars = detail.answerBody?.length ?? 0;
+  for (const entry of detail.calls) {
+    chars += (entry.args?.length ?? 0)
+      + (entry.text?.length ?? 0)
+      + (entry.before?.length ?? 0)
+      + (entry.after?.length ?? 0);
+  }
+  return chars;
+}
+
+function setBoundedStatus(previous: Map<string, StatusEntry>, key: string, value: StatusEntry): Map<string, StatusEntry> {
   const next = new Map(previous);
   next.delete(key);
   next.set(key, value);
@@ -23,12 +35,42 @@ function setBounded<V>(previous: Map<string, V>, key: string, value: V): Map<str
   return next;
 }
 
+export function setBoundedDetails(
+  previous: Map<string, Details>,
+  key: string,
+  value: Details,
+  maxEntries = MAX_CACHED_DETAILS,
+  maxChars = MAX_CACHED_DETAIL_CHARS,
+  onEvict?: (keys: string[]) => void,
+): Map<string, Details> {
+  const next = new Map(previous);
+  next.delete(key);
+  next.set(key, value);
+  let totalChars = 0;
+  for (const entry of next.values()) totalChars += detailCharSize(entry);
+  const evicted: string[] = [];
+  while (next.size > maxEntries || (totalChars > maxChars && next.size > 1)) {
+    const oldestKey = next.keys().next().value!;
+    const oldest = next.get(oldestKey)!;
+    next.delete(oldestKey);
+    evicted.push(oldestKey);
+    totalChars -= detailCharSize(oldest);
+  }
+  if (evicted.length > 0 && onEvict) onEvict(evicted);
+  return next;
+}
+
 export function makeStatisticsView(_kit: ViewKit) {
-  return function Statistics(props: SessionStandardProps & { locale: string; snapshot: StatsSnapshot | null }) {
-    const [details, setDetails] = useState(new Map<string, Details>());
-    const [statuses, setStatuses] = useState(new Map<string, StatusEntry>());
+  return function Statistics(props: SessionStandardProps & {
+    locale: string;
+    snapshot: StatsSnapshot | null;
+    loadImage?: (attachment: ImageAttachmentRef) => Promise<string>;
+  }) {
+    const [details, setDetails] = useState(() => new Map<string, Details>());
+    const [statuses, setStatuses] = useState(() => new Map<string, StatusEntry>());
     const pending = useRef(new Map<string, { revision: string; controller: AbortController }>());
     const expanded = useRef(new Set<string>());
+    const prevSessionId = useRef(props.sessionId);
     const source = props.snapshot ?? empty;
 
     const stepIndex = useMemo(() => {
@@ -43,6 +85,16 @@ export function makeStatisticsView(_kit: ViewKit) {
 
     const latest = useRef({ stepIndex, details, sessionId: props.sessionId });
     latest.current = { stepIndex, details, sessionId: props.sessionId };
+
+    useEffect(() => {
+      if (prevSessionId.current === props.sessionId) return;
+      prevSessionId.current = props.sessionId;
+      for (const { controller } of pending.current.values()) controller.abort();
+      pending.current.clear();
+      expanded.current.clear();
+      setDetails(new Map());
+      setStatuses(new Map());
+    }, [props.sessionId]);
 
     useEffect(() => () => {
       for (const { controller } of pending.current.values()) controller.abort();
@@ -85,7 +137,7 @@ export function makeStatisticsView(_kit: ViewKit) {
       old?.controller.abort();
       const controller = new AbortController();
       pending.current.set(id, { revision, controller });
-      setStatuses((previous) => setBounded(previous, id, { revision, status: "loading" }));
+      setStatuses((previous) => setBoundedStatus(previous, id, { revision, status: "loading" }));
       void call("statistics.details", { agentId: latest.current.sessionId, requestId: id }, { signal: controller.signal })
         .then((detail: Details) => {
           const current = latest.current.stepIndex.get(id);
@@ -101,7 +153,16 @@ export function makeStatisticsView(_kit: ViewKit) {
             }
             return;
           }
-          setDetails((previous) => setBounded(previous, id, detail));
+          setDetails((previous) => setBoundedDetails(
+            previous, id, detail, MAX_CACHED_DETAILS, MAX_CACHED_DETAIL_CHARS,
+            (evictedKeys) => {
+              for (const evictedId of evictedKeys) {
+                expanded.current.delete(evictedId);
+                pending.current.get(evictedId)?.controller.abort();
+                pending.current.delete(evictedId);
+              }
+            },
+          ));
           setStatuses((previous) => {
             if (!previous.has(id)) return previous;
             const next = new Map(previous);
@@ -109,7 +170,7 @@ export function makeStatisticsView(_kit: ViewKit) {
             return next;
           });
         }).catch(() => {
-          if (!controller.signal.aborted) setStatuses((previous) => setBounded(previous, id, { revision, status: "error" }));
+          if (!controller.signal.aborted) setStatuses((previous) => setBoundedStatus(previous, id, { revision, status: "error" }));
         }).finally(() => { if (pending.current.get(id)?.controller === controller) pending.current.delete(id); });
     }, []);
 
@@ -150,11 +211,18 @@ export function makeStatisticsView(_kit: ViewKit) {
       load(id);
     };
 
+    const loadImage = useCallback(
+      (attachment: ImageAttachmentRef) => props.loadImage
+        ? props.loadImage(attachment)
+        : call("api/paseo-context/image", { sessionId: props.sessionId, attachmentId: attachment.attachmentId }),
+      [props.loadImage, props.sessionId],
+    );
+
     return <div className="pc-statistics" onClickCapture={(event) => loadDetails(event.target)}
       title="Paseo: provider fields that were not recorded remain unavailable.">
       <StatsView useStats={(select) => select(snapshot)} t={t} loadOlder={noOlder} cancel={cancel}
         useProjection={() => undefined}
-        loadImage={(attachment) => call("api/paseo-context/image", { sessionId: props.sessionId, attachmentId: attachment.attachmentId })} />
+        loadImage={loadImage} />
     </div>;
   };
 }

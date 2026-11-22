@@ -80,7 +80,6 @@ export function messagesOf(row: RecordValue, provider: string): Message[] {
     });
   }
   const type = text(row.type);
-  const content = printable(row.text ?? row.message ?? row.content ?? row.detail);
   if (type === "tool_call") {
     const detail = record(row.detail), kind = text(detail.type);
     const args = kind === "shell" ? { command: detail.command, workdir: detail.cwd }
@@ -102,6 +101,7 @@ export function messagesOf(row: RecordValue, provider: string): Message[] {
     return [call, { category: "tool", title: tool, text: result + exit || printable(row.error) || text(row.status),
       callId, error: row.status === "failed" || row.status === "canceled", durationMs, block: 1 }];
   }
+  const content = printable(row.text ?? row.message ?? row.content ?? row.detail);
   if (type === "tool_result") return [{ category: "tool", title: "Tool result", text: content, callId: text(row.callId), block: -1 }];
   const category: Category | null = type === "reasoning" ? "reasoning" : /assistant/.test(type) ? "assistant" : /user/.test(type) ? "user" : null;
   return category ? [{ category, title: type, text: content, block: -1 }] : [];

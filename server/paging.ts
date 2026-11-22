@@ -40,7 +40,8 @@ export async function* timelineHistory(timeline: AgentTimeline, signal: AbortSig
   } while (cursor);
 }
 
-export async function timelineAfter(timeline: AgentTimeline, start: TimelineCursor, signal: AbortSignal) {
+export async function timelineAfter(timeline: AgentTimeline, start: TimelineCursor, signal: AbortSignal,
+  onPage: (entries: TimelinePage["entries"]) => void) {
   const entries: TimelinePage["entries"] = [];
   const seen = new Set<string>([JSON.stringify(start)]);
   let cursor: TimelineCursor | undefined = start;
@@ -55,6 +56,7 @@ export async function timelineAfter(timeline: AgentTimeline, start: TimelineCurs
       }
       end = page.endCursor;
     } else if (page.entries.length) throw new Error("Timeline omitted its end cursor for new entries");
+    onPage(page.entries);
     entries.push(...page.entries);
     cursor = next;
   } while (cursor);

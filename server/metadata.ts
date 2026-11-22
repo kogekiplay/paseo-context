@@ -4,6 +4,7 @@ import { recommendations } from "../shared/recommendations";
 import { record, text } from "./value";
 import type { PublicCache } from "./public-cache";
 import { pluginVersion as VERSION } from "../shared/generated/ui-revision";
+import { readPublicJson } from "./bounded-json";
 
 export class Metadata {
   constructor(private publicCache?: PublicCache) {}
@@ -28,11 +29,12 @@ export class Metadata {
     const controller = new AbortController();
     this.controllers.add(controller);
     const timer = setTimeout(() => controller.abort(), 8000);
+    timer.unref();
     try {
       const response = await fetch(url, { signal: controller.signal, headers });
       if (response.status === 404) return null;
       if (!response.ok) throw new Error(`Metadata HTTP ${response.status}`);
-      return await response.json();
+      return await readPublicJson(response);
     } finally { clearTimeout(timer); this.controllers.delete(controller); }
   }
   version() {

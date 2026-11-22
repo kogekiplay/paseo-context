@@ -6,6 +6,7 @@ import { bridgeRpc, settingsPreviewRpc } from "./shared/bridge";
 import { SettingsPreview } from "./server/settings-preview";
 import { Pricing } from "./server/pricing";
 import { PublicCache } from "./server/public-cache";
+import { detachSlice } from "./server/value";
 
 export default function contribute(server: PluginServerContext) {
   const cache = new PublicCache();
@@ -32,7 +33,7 @@ export default function contribute(server: PluginServerContext) {
   });
   server.handle(contentRpc, async ({ agentId, nodeId, offset, revision }, { paseo }) => {
     const text = await service.content(agentId, nodeId, paseo, revision), end = Math.min(text.length, offset + 24000);
-    return { text: text.slice(offset, end), totalChars: text.length, nextOffset: end < text.length ? end : null };
+    return { text: detachSlice(text.slice(offset, end)), totalChars: text.length, nextOffset: end < text.length ? end : null };
   });
   server.handle(activityRpc, async ({ agentId, kind, query, filter, sort, offset, limit }, { paseo }) => {
     const { fold } = await service.load(await service.agent(agentId, paseo), paseo), q = query.toLowerCase();

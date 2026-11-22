@@ -1,6 +1,6 @@
 import type { CollaborationRecord } from "../shared/contracts";
 import type { Message } from "./normalize";
-import { parseArgs, printable, record, text, type RecordValue } from "./value";
+import { detachSlice, parseArgs, printable, record, stringBytes, text, type RecordValue } from "./value";
 
 type TaskStatus = "pending" | "in_progress" | "completed";
 export interface CapturedTask {
@@ -60,14 +60,17 @@ export class CollaborationLedger {
   private pending = new Map<string, Pending>();
 
   get residentBytes() {
-    const taskBytes = (task: Partial<Pick<CapturedTask, "subject" | "description" | "blockedBy" | "writeScopes">>) =>
-      256 + 2 * ((task.subject?.length ?? 0) + (task.description?.length ?? 0)
-      + (task.blockedBy?.reduce((n, id) => n + id.length + 16, 0) ?? 0)
-      + (task.writeScopes?.reduce((n, path) => n + path.length + 16, 0) ?? 0));
-    let bytes = this.records.length * 1200 + this.children.size * 512;
+    const stringsBytes = (values?: string[]) => values?.reduce((n, value) => n + 8 + stringBytes(value), 32) ?? 0;
+    const taskBytes = (task: TaskUpdate) => 256 + stringBytes(task.id) + stringBytes(task.subject) + stringBytes(task.description)
+      + stringBytes(task.owner) + stringsBytes(task.blockedBy) + stringsBytes(task.writeScopes)
+      + stringsBytes(task.addBlockedBy) + stringsBytes(task.removeBlockedBy);
+    let bytes = 320;
+    for (const row of this.records) bytes += 192 + stringBytes(row.id) + stringBytes(row.title) + stringBytes(row.to)
+      + stringBytes(row.from) + stringBytes(row.taskId) + stringsBytes(row.blockedBy);
+    for (const child of this.children.values()) bytes += 176 + stringBytes(child.sessionId) + stringBytes(child.title);
     for (const task of this.tasks.values()) bytes += taskBytes(task);
-    for (const call of this.pending.values()) {
-      bytes += 1200;
+    for (const [id, call] of this.pending) {
+      bytes += 224 + stringBytes(id) + stringBytes(call.title) + stringBytes(call.tool);
       for (const task of call.updates ?? []) bytes += taskBytes(task);
     }
     return bytes;
@@ -101,7 +104,7 @@ export class CollaborationLedger {
     }
     const returned = record(result.task);
     const returnedId = taskId(result.taskId ?? result.task_id ?? returned.id ?? result.id)
-      || /Task\s+#(\d+)\s+created/i.exec(content)?.[1];
+      || detachSlice(/Task\s+#(\d+)\s+created/i.exec(content)?.[1] ?? "");
     for (const update of pending.updates ?? []) {
       const id = update.id.startsWith("capture-") && returnedId ? returnedId : update.id;
       if (update.status === "deleted") { this.tasks.delete(id); continue; }
@@ -130,15 +133,16 @@ export class CollaborationLedger {
       if (!kind) return;
       const args = message.args ?? parseArgs(message.text);
       const title = text(args.message ?? args.content ?? args.prompt ?? args.description ?? args.subject ?? args.explanation) || tool;
+      const preview = detachSlice(title, 500);
       const to = text(args.agent_id ?? args.recipient ?? args.to ?? args.id ?? args.target) || (args.type === "broadcast" ? "*" : "");
-      const pending: Pending = { nodeId, title: title.slice(0, 500), tool, kind,
+      const pending: Pending = { nodeId, title: preview, tool, kind,
         ...(kind === "task" ? this.tasksOf(args, tool, nodeId) : {}),
         ...(kind === "delegation" ? { mode: args.mode === "one-shot" || args.mode === "continuable" ? args.mode
           : tool === "task" || tool === "agent" ? "one-shot" : "continuable",
           synchronous: (tool === "task" || tool === "agent") && args.run_in_background !== true } : {}) };
       if (kind !== "wait") {
         const status = taskStatus(args.status);
-        this.records.push({ id: `${nodeId}`, nodeId, time: at, kind, title: title.slice(0, 500), to,
+        this.records.push({ id: `${nodeId}`, nodeId, time: at, kind, title: preview, to,
           taskId: taskId(args.taskId ?? args.task_id), status: status === "deleted" ? "unknown" : status ?? "unknown",
           blockedBy: strings(args.blockedBy), textLength: title.length,
           ...(kind === "message" ? { contentKind: "message" as const } : {}) });
@@ -151,10 +155,11 @@ export class CollaborationLedger {
       const result = parseArgs(message.text), call = this.records.find((r) => r.nodeId === pending.nodeId);
       if (message.error && call) call.status = "failed";
       if (pending.kind === "delegation" && !message.error) {
-        const id = childId(result)
+        const captured = childId(result)
           || /(?:agentId|agent_id|session_id)["':=\s]+([a-zA-Z0-9_-]{8,})/.exec(message.text)?.[1] || "";
+        const id = detachSlice(captured);
         if (id && /^[a-zA-Z0-9_-]+$/.test(id)) {
-          this.children.set(id, { sessionId: id, title: pending.title.slice(0, 180), time: at, status: "unknown", mode: pending.mode });
+          this.children.set(id, { sessionId: id, title: detachSlice(pending.title, 180), time: at, status: "unknown", mode: pending.mode });
           if (call) call.to = id;
         }
       }
@@ -163,13 +168,14 @@ export class CollaborationLedger {
         const reports = agentReportsOf(message.text);
         const synchronous = pending.synchronous && call?.to && !message.error && result.isAsync !== true
           && result.status !== "running" && result.status !== "pending";
-        if (synchronous && reports.length === 0) {
+        const delegationResult = synchronous && reports.length === 0;
+        if (delegationResult) {
           reports.push({ from: call.to, text: delegationTextOf(message.text), status: "completed" });
         }
         for (const report of reports) {
           this.records.push({ id: `${nodeId}:${report.from}`, nodeId, time: at, kind: "report", from: report.from,
-            title: report.text.slice(0, 500), to: "", taskId: "", status: report.status, blockedBy: [],
-            textLength: report.text.length, contentKind: synchronous && agentReportsOf(message.text).length === 0 ? "delegation-result" : "report" });
+            title: detachSlice(report.text, 500), to: "", taskId: "", status: report.status, blockedBy: [],
+            textLength: report.text.length, contentKind: delegationResult ? "delegation-result" : "report" });
           const child = this.children.get(report.from);
           if (child) child.status = report.status;
         }

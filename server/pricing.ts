@@ -2,6 +2,7 @@ import { calculateSessionCost, pricesBookOf, priceSourceOf, type ModelBook } fro
 import type { Request, Usage } from "../shared/contracts";
 import { usageSourceOf } from "../shared/usage";
 import type { PublicCache } from "./public-cache";
+import { readPublicJson } from "./bounded-json";
 
 export class Pricing {
   constructor(private cache?: PublicCache) {}
@@ -31,10 +32,11 @@ export class Pricing {
     }
     const controller = this.controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 8000);
+    timer.unref();
     try {
       const response = await fetch("https://models.dev/api.json", { signal: controller.signal });
       if (!response.ok) throw new Error(`Pricing HTTP ${response.status}`);
-      const source = priceSourceOf(await response.json());
+      const source = priceSourceOf(await readPublicJson(response));
       const book = pricesBookOf(source);
       if (!source || !book || !Object.keys(book.prices).length) throw new Error("Invalid price catalog");
       if (this.closed) return;

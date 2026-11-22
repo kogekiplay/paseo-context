@@ -420,4 +420,44 @@ describe("Workspace tabs", () => {
     dispose();
     expect(staticCleanups.every((fn) => fn.mock.calls.length === 1)).toBe(true);
   });
+  test("WorkspacePanels bounds workspaceRevisions and scopes activationToken per workspace:mode", async () => {
+    const { WorkspacePanels } = await import("../client/workspace");
+    const panels = new WorkspacePanels();
+    for (let i = 0; i < 160; i++) {
+      panels.upsert({ id: `a-${i}`, workspaceId: `ws-${i}`, title: `Agent ${i}` });
+      panels.select(`ws-${i}`, `a-${i}`);
+      panels.activatePanel(`ws-${i}`, "context");
+    }
+    // Oldest workspaces (ws-0..ws-31) were evicted from bounded workspaceRevisions map.
+    expect(panels.workspaceSnapshot("ws-0")).toBe(0);
+    // Most recent workspaces remain tracked.
+    expect(panels.workspaceSnapshot("ws-159")).toBeGreaterThan(0);
+    expect(panels.panelActivation("ws-159", "context")).toBe(1);
+    // Switching agent does NOT bump sibling panel activation tokens.
+    panels.select("ws-159", "a-159-alt");
+    expect(panels.panelActivation("ws-159", "context")).toBe(1);
+    expect(panels.panelActivation("ws-159", "fleet")).toBe(0);
+    expect(panels.panelActivation("ws-159", "statistics")).toBe(0);
+    // Explicit panel activation wakes only the target panel mode.
+    panels.activatePanel("ws-159", "fleet");
+    expect(panels.panelActivation("ws-159", "fleet")).toBe(1);
+    expect(panels.panelActivation("ws-159", "context")).toBe(1);
+    expect(panels.panelActivation("ws-159", "statistics")).toBe(0);
+    panels.clear();
+
+    // End-to-end check via contribute(): opening fleet bumps only fleet's activationToken, not sibling context.
+    const h = setup(); h.resolve(); await h.snapshot();
+    const ctxPanel = await mountWorkspace(h, "context");
+    const fleetPanel = await mountWorkspace(h, "fleet");
+    const tokenOf = (mode: string) => {
+      const call = [...mocks.frame.mock.calls].reverse().find(([p]: any) => p.mode === mode) as any;
+      return call?.[0]?.activationToken;
+    };
+    const ctxBefore = tokenOf("context");
+    const fleetBefore = tokenOf("fleet");
+    await act(async () => { await h.submit("fleet"); });
+    expect(tokenOf("fleet")).toBeGreaterThan(fleetBefore);
+    expect(tokenOf("context")).toBe(ctxBefore);
+    await act(async () => { ctxPanel.panel.unmount(); fleetPanel.panel.unmount(); });
+  });
 });

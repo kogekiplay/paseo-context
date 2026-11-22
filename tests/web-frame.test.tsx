@@ -241,4 +241,72 @@ describe("WebFrame and shared bridge helpers", () => {
     await act(async () => root.findAllByType("Pressable" as any)[1].props.onPress());
     expect(onClose).toHaveBeenCalledOnce();
   });
+
+  test("lazily mounts iframe via IntersectionObserver, unmounts & revokes Blob after 60s hidden, and remounts when visible", async () => {
+    vi.useFakeTimers();
+    const callbacks: Array<(entries: Array<{ isIntersecting: boolean; boundingClientRect?: { width: number; height: number } }>) => void> = [];
+    const disconnect = vi.fn();
+    const originalIO = (globalThis as any).IntersectionObserver;
+    (globalThis as any).IntersectionObserver = class MockIO {
+      constructor(cb: any) { callbacks.push(cb); }
+      observe() {}
+      disconnect() { disconnect(); }
+    };
+    try {
+      queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const frameWindow = { postMessage: postMessageMock };
+      await act(async () => {
+        renderer = create(
+          createElement(QueryClientProvider, { client: queryClient },
+            createElement(WebFrame, baseProps as any)),
+          { createNodeMock: (el) => el.type === "iframe" ? { contentWindow: frameWindow } : el.type === "div" ? { tag: "div" } : null },
+        );
+      });
+      await act(async () => { await vi.advanceTimersByTimeAsync(10); });
+
+      // Initially hidden: no ui.document fetch, no Blob URL, no iframe.
+      expect(mocks.rpc).not.toHaveBeenCalled();
+      expect(createdBlobs).toHaveLength(0);
+      expect(renderer!.root.findAllByType("iframe" as any)).toHaveLength(0);
+
+      // Become visible -> mounts iframe & creates Blob URL.
+      await act(async () => {
+        callbacks[0]([{ isIntersecting: true, boundingClientRect: { width: 800, height: 600 } }]);
+      });
+      await act(async () => { await vi.advanceTimersByTimeAsync(10); });
+      expect(createdBlobs).toHaveLength(1);
+      expect(renderer!.root.findAllByType("iframe" as any)).toHaveLength(1);
+
+      // Hidden for 59s -> still mounted.
+      await act(async () => {
+        callbacks[0]([{ isIntersecting: false, boundingClientRect: { width: 0, height: 0 } }]);
+      });
+      await act(async () => { await vi.advanceTimersByTimeAsync(59_000); });
+      expect(renderer!.root.findAllByType("iframe" as any)).toHaveLength(1);
+      expect(revokedUrls).toHaveLength(0);
+
+      // Hidden reaches 60s -> unmounts iframe and revokes Blob URL.
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+      expect(renderer!.root.findAllByType("iframe" as any)).toHaveLength(0);
+      expect(revokedUrls).toEqual(["blob:mock-1"]);
+
+      // Visible again -> seamlessly remounts iframe with fresh Blob URL.
+      await act(async () => {
+        callbacks[0]([{ isIntersecting: true, boundingClientRect: { width: 800, height: 600 } }]);
+      });
+      await act(async () => { await vi.advanceTimersByTimeAsync(10); });
+      expect(createdBlobs).toHaveLength(2);
+      expect(renderer!.root.findAllByType("iframe" as any)).toHaveLength(1);
+
+      // Preview & overlay bypass IntersectionObserver and mount immediately.
+      await act(async () => renderer!.unmount());
+      renderer = null;
+      expect(disconnect).toHaveBeenCalled();
+      const overlayRes = await mount({ overlay: true });
+      expect(overlayRes.root.findAllByType("iframe" as any)).toHaveLength(1);
+    } finally {
+      if (originalIO === undefined) delete (globalThis as any).IntersectionObserver;
+      else (globalThis as any).IntersectionObserver = originalIO;
+    }
+  });
 });

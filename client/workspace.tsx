@@ -9,7 +9,7 @@ import { messages } from "./messages";
 export type PanelMode = "context" | "fleet" | "statistics";
 export interface PanelAgent { id: string; workspaceId?: string; title?: string | null; archivedAt?: string | null }
 const stateSchema = z.object({ agentId: z.string().optional() });
-const MAX_WORKSPACES = 128, MAX_INITIALIZED_AGENTS = 512;
+const MAX_WORKSPACES = 128, MAX_PANEL_ACTIVATIONS = MAX_WORKSPACES * 4, MAX_INITIALIZED_AGENTS = 512;
 function remember<T>(map: Map<string, T>, key: string, value: T, limit: number) {
   map.delete(key); map.set(key, value);
   while (map.size > limit) map.delete(map.keys().next().value!);
@@ -24,6 +24,7 @@ export class WorkspacePanels {
   private listeners = new Set<() => void>();
   private workspaceListeners = new Map<string, Set<() => void>>();
   private workspaceRevisions = new Map<string, number>();
+  private panelActivations = new Map<string, number>();
   private dirtyWorkspaces = new Set<string>();
   private batchDepth = 0;
   private revision = 0;
@@ -45,8 +46,20 @@ export class WorkspacePanels {
     return this.workspaceRevisions.get(workspaceId) ?? 0;
   }
 
+  panelActivation(workspaceId: string, mode: PanelMode) {
+    return this.panelActivations.get(`${workspaceId}:${mode}`) ?? 0;
+  }
+
+  activatePanel(workspaceId: string, mode: PanelMode) {
+    const key = `${workspaceId}:${mode}`;
+    const next = (this.panelActivations.get(key) ?? 0) + 1;
+    remember(this.panelActivations, key, next, MAX_PANEL_ACTIVATIONS);
+    this.notify(workspaceId);
+  }
+
   private emitWorkspace(workspaceId: string) {
-    this.workspaceRevisions.set(workspaceId, (this.workspaceRevisions.get(workspaceId) ?? 0) + 1);
+    const next = (this.workspaceRevisions.get(workspaceId) ?? 0) + 1;
+    remember(this.workspaceRevisions, workspaceId, next, MAX_WORKSPACES);
     const bucket = this.workspaceListeners.get(workspaceId);
     if (bucket) for (const fn of bucket) fn();
   }
@@ -119,7 +132,8 @@ export class WorkspacePanels {
   }
   clear() {
     this.agents.clear(); this.selected.clear(); this.initialized.clear(); this.initializing.clear();
-    this.listeners.clear(); this.workspaceListeners.clear(); this.workspaceRevisions.clear(); this.dirtyWorkspaces.clear();
+    this.listeners.clear(); this.workspaceListeners.clear(); this.workspaceRevisions.clear();
+    this.panelActivations.clear(); this.dirtyWorkspaces.clear();
   }
 }
 
@@ -143,13 +157,14 @@ export function WorkspaceSurface(props: PluginWorkspacePanelProps & {
   const agentId = agent?.workspaceId === workspaceId ? agent.id : undefined;
   useEffect(() => {
     if (!agentId) return;
-    controller.select(workspaceId, agentId);
+    if (controller.selection(workspaceId) !== agentId) controller.select(workspaceId, agentId);
     if (saved.agentId !== agentId) save({ agentId });
   }, [agentId, workspaceId, saved.agentId]);
+  const activationToken = controller.panelActivation(workspaceId, props.mode);
   return <View style={{ flex: 1, minHeight: 0 }}>
     <AgentPicker agents={agents} agentId={agentId} theme={theme}
       onSelect={(value) => controller.select(workspaceId, value)} />
-    {agentId ? <FrameSurface {...props} agentId={agentId} />
+    {agentId ? <FrameSurface {...props} agentId={agentId} activationToken={activationToken} />
       : <Text style={{ padding: 24, color: theme.colors.foregroundMuted }}>{t("selectAgent")}</Text>}
   </View>;
 }

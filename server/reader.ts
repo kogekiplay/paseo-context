@@ -8,18 +8,20 @@ import { NativePaths, type NativeLocation, type NativeRoots } from "./native-pat
 import { messagesOf } from "./normalize";
 import { antigravityStepIndex, type AntigravityStep } from "./antigravity-log";
 import type { AntigravitySnapshot } from "./antigravity-db";
-import { record } from "./value";
+import { detachSlice, record, stringBytes } from "./value";
+import { MIB, sessionReadBudget, type ReadBudget } from "./read-budget";
+import { RetainedCache } from "./retained-cache";
 
 const BOUNDARY_BYTES = 4_096;
 const MAX_RESIDENT_BYTES = 64 * 1024 * 1024;
-const RETAIN_MS = 120_000;
-const BODY_MAX_CHARS = 8 * 1024 * 1024;
+const BODY_MAX_BYTES = 16 * MIB;
+const logReadBytes = (bytes: number) => 5 * bytes;
 const digest = (bytes: Buffer) => createHash("sha256").update(bytes).digest("base64");
 
 interface Location { offset: number; length: number; digest: string }
 interface FileIdentity { dev: number; ino: number }
 interface Boundary { head: Buffer; tail: Buffer }
-interface FoldEntry { fold: ContextFold; touched: number; residentBytes: number }
+interface FoldEntry { fold: ContextFold; residentBytes: number }
 interface AppliedMetadata { index: number; type: AntigravityStep["type"]; key?: string }
 interface Entry extends FileIdentity, FoldEntry {
   offset: number; tail: Buffer; tailOffset: number; finalized: boolean;
@@ -104,12 +106,13 @@ function foldDatabase(snapshot: AntigravitySnapshot) {
 export class SessionReader {
   private lifetime = new AbortController();
   private paths: NativePaths;
-  private cache = new Map<string, Entry | DatabaseEntry>();
+  private cache = new RetainedCache<Entry | DatabaseEntry>(8, MAX_RESIDENT_BYTES);
   private pending = new Map<string, { fingerprint?: string; read: Promise<NativeRead> }>();
-  private bodies = new Map<string, string>();
-  private bodyTimer?: ReturnType<typeof setTimeout>;
+  private bodies = new RetainedCache<string>(4, BODY_MAX_BYTES, 30_000);
 
-  constructor(roots: NativeRoots = {}) { this.paths = new NativePaths(roots, this.lifetime.signal); }
+  constructor(roots: NativeRoots = {}, readonly budget: ReadBudget = sessionReadBudget) {
+    this.paths = new NativePaths(roots, this.lifetime.signal);
+  }
 
   locateSource(agent: Agent) { return this.paths.locate(agent); }
   async locate(agent: Agent) { return (await this.locateSource(agent))?.path ?? null; }
@@ -135,23 +138,45 @@ export class SessionReader {
 
   private async readSource(agent: Agent, source: NativeLocation): Promise<NativeRead> {
     const { path, antigravity } = source;
+    const signal = this.lifetime.signal;
+    const sealed = source.sealed || agent.archived && !agent.running;
+    const info = antigravity?.databaseOnly ? undefined : await stat(path);
+    const cached = this.cache.peek(path);
+    const unchanged = info && cached && "valid" in cached && cached.valid && sameFile(cached, info)
+      && info.size === cached.offset && sameTimes(cached, info) && !(sealed && cached.tail.length)
+      && cached.companion?.fingerprint === antigravity?.database?.fingerprint;
+    let logBytes = unchanged ? 0 : info?.size ?? 0;
+    let dbBytes = antigravity?.database?.bytes ?? 0;
+    const estimate = () => MIB + logReadBytes(logBytes) + 4 * dbBytes;
+    return this.budget.run(estimate(), signal, (account) => this.readReserved(agent, source, sealed, (bytes) => {
+      dbBytes = bytes;
+      account(estimate());
+    }, (bytes) => {
+      logBytes = bytes;
+      account(estimate());
+    }));
+  }
+
+  private async readReserved(agent: Agent, source: NativeLocation, sealed: boolean,
+    accountDatabase: (bytes: number) => void, accountLog: (bytes: number) => void): Promise<NativeRead> {
+    const { path, antigravity } = source;
     let snapshot: AntigravitySnapshot | undefined;
     if (antigravity?.database) {
-      try { snapshot = await this.paths.antigravity.read(antigravity.database); }
+      try { snapshot = await this.paths.antigravity.read(antigravity.database, accountDatabase); }
       catch (error) {
         if (antigravity.databaseOnly) throw error;
         ensureActive(this.lifetime.signal);
       }
     }
+    ensureActive(this.lifetime.signal);
     if (antigravity?.databaseOnly) {
       if (!snapshot) throw new Error("Antigravity SQLite is unavailable");
-      const cached = this.cache.get(path);
+      const cached = this.cache.peek(path);
       const entry = cached && "fingerprint" in cached && cached.fingerprint === snapshot.fingerprint ? cached : (() => {
         const fold = foldDatabase(snapshot);
-        return { fold, fingerprint: snapshot.fingerprint, touched: 0, residentBytes: fold.residentBytes };
+        return { fold, fingerprint: snapshot.fingerprint, residentBytes: fold.residentBytes };
       })();
-      entry.touched = Date.now();
-      this.remember(path, entry);
+      this.cache.set(path, entry, entry.residentBytes);
       return { path, entry, residentBytes: entry.residentBytes, metadataOnly: true, bodies: async (ids, project) => {
         ensureActive(this.lifetime.signal);
         return new Map([...new Set(ids)].map((id) => {
@@ -160,17 +185,16 @@ export class SessionReader {
         }));
       } };
     }
-    const sealed = source.sealed || agent.archived && !agent.running;
-    const data = await this.readFile(agent, path, sealed, snapshot);
+    const data = await this.readFile(agent, path, sealed, accountLog, snapshot);
     return antigravity?.database && !snapshot ? { ...data, companionFailed: true } : data;
   }
 
-  private async readFile(agent: Agent, path: string, sealed: boolean, snapshot?: AntigravitySnapshot): Promise<NativeRead> {
+  private async readFile(agent: Agent, path: string, sealed: boolean, account: (bytes: number) => void, snapshot?: AntigravitySnapshot): Promise<NativeRead> {
     const signal = this.lifetime.signal;
     for (let attempt = 0; ; attempt++) {
       ensureActive(signal);
       const file = await open(path, "r");
-      const cached = this.cache.get(path);
+      const cached = this.cache.peek(path);
       let entry = cached && "valid" in cached ? cached : undefined;
       try {
         const info = await file.stat();
@@ -182,11 +206,12 @@ export class SessionReader {
         }
         entry ??= {
           fold: new ContextFold(agent.provider), offset: 0, dev: info.dev, ino: info.ino, tail: Buffer.alloc(0), tailOffset: 0,
-          locations: [], finalized: false, touched: 0, valid: true, mtimeMs: info.mtimeMs, ctimeMs: info.ctimeMs, residentBytes: 0,
+          locations: [], finalized: false, valid: true, mtimeMs: info.mtimeMs, ctimeMs: info.ctimeMs, residentBytes: 0,
           ...(agent.provider === "antigravity" ? { companion: { applied: [], bytes: 0 } } : {}),
         };
         if (entry.companion) entry.companion.fingerprint = snapshot?.fingerprint;
         const growing = info.size > entry.offset;
+        if (growing || sealed) account(info.size - entry.offset + entry.tail.length);
         const proof = !entry.boundary || growing ? await boundaries(file, info.size) : entry.boundary;
         if (growing) await this.scan(file, info.size, entry, signal, snapshot);
         const finalize = sealed && entry.tail.length > 0 && !entry.finalized;
@@ -204,12 +229,11 @@ export class SessionReader {
         entry.mtimeMs = info.mtimeMs;
         entry.ctimeMs = info.ctimeMs;
         entry.boundary = proof;
-        entry.touched = Date.now();
         if (!entry.residentBytes || growing || finalize) {
-          entry.residentBytes = entry.fold.residentBytes + entry.tail.length + entry.locations.length * 128
+          entry.residentBytes = entry.fold.residentBytes + entry.tail.length + entry.locations.length * 168
             + proof.head.length + proof.tail.length + (entry.companion?.bytes ?? 0);
         }
-        this.remember(path, entry);
+        this.cache.set(path, entry, entry.residentBytes);
         return { path, entry, bodies: this.bodyReader({ path, entry }), residentBytes: entry.residentBytes };
       } catch (error) {
         if (entry) entry.valid = false;
@@ -258,33 +282,6 @@ export class SessionReader {
     entry.tailOffset += line.length;
   }
 
-  private remember(path: string, entry: Entry | DatabaseEntry) {
-    this.cache.delete(path);
-    if (entry.residentBytes > MAX_RESIDENT_BYTES) return;
-    this.cache.set(path, entry);
-    let weight = [...this.cache.values()].reduce((sum, value) => sum + value.residentBytes, 0);
-    for (const [key, value] of this.cache) {
-      if (this.cache.size <= 8 && weight <= MAX_RESIDENT_BYTES && Date.now() - value.touched < RETAIN_MS) break;
-      this.cache.delete(key);
-      weight -= value.residentBytes;
-    }
-  }
-
-  private rememberBody(key: string, body: string) {
-    if (body.length > BODY_MAX_CHARS) return;
-    this.bodies.delete(key);
-    this.bodies.set(key, body);
-    let chars = [...this.bodies.values()].reduce((n, text) => n + text.length, 0);
-    for (const [key, text] of this.bodies) {
-      if (this.bodies.size <= 4 && chars <= BODY_MAX_CHARS) break;
-      this.bodies.delete(key);
-      chars -= text.length;
-    }
-    clearTimeout(this.bodyTimer);
-    this.bodyTimer = setTimeout(() => { this.bodies.clear(); this.bodyTimer = undefined; }, 30_000);
-    this.bodyTimer.unref();
-  }
-
   private bodyReader({ path, entry }: { path: string; entry: Entry }, revision = entry.fold.revision): ReadBodies {
     return async (ids, project) => {
       const signal = this.lifetime.signal;
@@ -299,46 +296,52 @@ export class SessionReader {
       const result = new Map<number, ReturnType<typeof project>>();
       if (!sources.size) return result;
       if (!entry.valid || revision !== entry.fold.revision) throw new ChangedLog();
-      const file = await open(path, "r");
-      try {
-        const info = await file.stat();
-        if (!sameFile(entry, info)) throw new ChangedLog();
-        const canReuse = info.size === entry.offset && sameTimes(entry, info);
-        let reused = false;
-        for (const [line, group] of sources) {
-          ensureActive(signal);
-          const location = entry.locations[line - 1];
-          let messages: ReturnType<typeof messagesOf> | undefined;
-          for (const id of group) {
-            const node = entry.fold.nodes[id];
-            const key = `${entry.fold.epoch}:${line}:${node.block}:${location.digest}`;
-            let body = canReuse ? this.bodies.get(key) : undefined;
-            if (body !== undefined) reused = true;
-            else {
-              if (!messages) {
-                const bytes = await readExactly(file, location.offset, location.length);
-                ensureActive(signal);
-                if (digest(bytes) !== location.digest) {
-                  entry.valid = false;
-                  if (this.cache.get(path) === entry) this.cache.delete(path);
-                  throw new ChangedLog();
+      let bytes = MIB;
+      for (const line of sources.keys()) bytes += logReadBytes(entry.locations[line - 1].length);
+      return this.budget.run(bytes, signal, async () => {
+        if (!entry.valid || revision !== entry.fold.revision) throw new ChangedLog();
+        const file = await open(path, "r");
+        try {
+          const info = await file.stat();
+          if (!sameFile(entry, info)) throw new ChangedLog();
+          const canReuse = info.size === entry.offset && sameTimes(entry, info);
+          let reused = false;
+          for (const [line, group] of sources) {
+            ensureActive(signal);
+            const location = entry.locations[line - 1];
+            let messages: ReturnType<typeof messagesOf> | undefined;
+            for (const id of group) {
+              const node = entry.fold.nodes[id];
+              const key = `${entry.fold.epoch}:${line}:${node.block}:${location.digest}`;
+              let body = canReuse ? this.bodies.get(key) : undefined;
+              if (body !== undefined) reused = true;
+              else {
+                if (!messages) {
+                  const bytes = await readExactly(file, location.offset, location.length);
+                  ensureActive(signal);
+                  if (digest(bytes) !== location.digest) {
+                    entry.valid = false;
+                    if (this.cache.peek(path) === entry) this.cache.delete(path);
+                    throw new ChangedLog();
+                  }
+                  if (!entry.valid || revision !== entry.fold.revision) throw new ChangedLog();
+                  messages = messagesOf(JSON.parse(bytes.toString("utf8")), entry.fold.provider);
                 }
-                if (!entry.valid || revision !== entry.fold.revision) throw new ChangedLog();
-                messages = messagesOf(JSON.parse(bytes.toString("utf8")), entry.fold.provider);
+                body = messages.find((message) => message.block === node.block)?.text ?? "";
+                const weight = stringBytes(body) + stringBytes(key) + 64;
+                if (weight <= BODY_MAX_BYTES) this.bodies.set(key, detachSlice(body), weight);
               }
-              body = messages.find((message) => message.block === node.block)?.text ?? "";
+              result.set(id, project(id, body));
             }
-            this.rememberBody(key, body);
-            result.set(id, project(id, body));
           }
-        }
-        const linked = await stat(path);
-        if (!sameFile(entry, linked) || reused && !sameTimes(info, linked) || !entry.valid || revision !== entry.fold.revision) {
-          throw new ChangedLog();
-        }
-        ensureActive(signal);
-        return result;
-      } finally { await file.close(); }
+          const linked = await stat(path);
+          if (!sameFile(entry, linked) || reused && !sameTimes(info, linked) || !entry.valid || revision !== entry.fold.revision) {
+            throw new ChangedLog();
+          }
+          ensureActive(signal);
+          return result;
+        } finally { await file.close(); }
+      });
     };
   }
 
@@ -353,8 +356,6 @@ export class SessionReader {
     this.cache.clear();
     this.pending.clear();
     this.bodies.clear();
-    clearTimeout(this.bodyTimer);
-    this.bodyTimer = undefined;
     this.paths.clear();
   }
 }

@@ -4,8 +4,8 @@ import { ContextService } from "../server/service";
 import { SessionReader } from "../server/reader";
 import { scopeSchema } from "../shared/contracts";
 
-function fixture() {
-  const agents = Array.from({ length: 5 }, (_, i) => ({ id: `a${i}`, title: `A${i}`, labels: {}, cwd: "/demo",
+function fixture(size = 5) {
+  const agents = Array.from({ length: size }, (_, i) => ({ id: `a${i}`, title: `A${i}`, labels: {}, cwd: "/demo",
     provider: "codex", status: "idle", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
   })) as unknown as PaseoAgent[];
   let finish: () => void;
@@ -20,6 +20,36 @@ function fixture() {
   service.pricing.refresh = async () => {};
   return { service, paseo, list, refetch, finish: () => finish() };
 }
+
+test("shares an aggregation across pages, reuses unchanged ledgers, and expires idle insights", async () => {
+  vi.useFakeTimers();
+  const { service, paseo, list, refetch, finish } = fixture(30);
+  const scope = scopeSchema.parse({ range: "all" });
+  finish();
+  try {
+    const first = await service.overviewForScreen(scope, 0, paseo, "");
+    const second = await service.overviewForScreen(scope, 24, paseo, "");
+    expect(second.data?.sessions).toHaveLength(6);
+    expect(first.data?.sessions).toHaveLength(24);
+    expect(second.data?.sessions[0]).not.toBe(first.data?.sessions[0]);
+    expect(second.data?.groupCounts).toBe(first.data?.groupCounts);
+    expect(second.data?.projects).toBe(first.data?.projects);
+    expect(service["overviewCache"].size).toBe(1);
+    await service.backfill(paseo);
+    const refreshed = await service.overviewForScreen(scope, 0, paseo, "");
+    expect(refreshed.data?.sessions[0]).toBe(first.data?.sessions[0]);
+    expect(refetch).toHaveBeenCalledTimes(30);
+    expect(service["scanning"]).toBeNull();
+    await vi.advanceTimersByTimeAsync(180_000);
+    expect(service["corpus"]).toBeNull();
+    expect(service["overviewCache"].size).toBe(0);
+    expect(service["summaries"].peek("a0")).toBeUndefined();
+    expect(vi.getTimerCount()).toBe(0);
+    await service.overview(scope, 0, paseo);
+    expect(list).toHaveBeenCalledTimes(3);
+    expect(refetch).toHaveBeenCalledTimes(60);
+  } finally { service.clear(); vi.useRealTimers(); }
+});
 
 test("insights returns verified sessions before a slow session, then fills in the complete corpus", async () => {
   vi.useFakeTimers();

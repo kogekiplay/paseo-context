@@ -1,6 +1,7 @@
 import type { PaseoApi } from "@getpaseo/client";
 import { ensureActive, timelineHistory } from "./paging";
-import { record, text } from "./value";
+import { detachSlice, record, text } from "./value";
+import { sessionReadBudget, TIMELINE_PAGE_BYTES } from "./read-budget";
 
 export interface PaseoSubtask {
   callId: string; childId?: string; subject: string; description: string;
@@ -21,7 +22,7 @@ export class PaseoSubtasks {
     const key = JSON.stringify([agentId, revision]);
     const pending = this.pending.get(key);
     if (pending) return pending;
-    const read = this.fetch(agentId, paseo).then((tasks) => {
+    const read = sessionReadBudget.run(TIMELINE_PAGE_BYTES, signal, () => this.fetch(agentId, paseo, signal)).then((tasks) => {
       const current = this.cache.get(agentId);
       if (!signal.aborted && (!current || current.revision <= revision)) {
         const bytes = tasks.reduce((n, task) => n + 160 + 2 * (task.subject.length + task.description.length + task.callId.length + (task.childId?.length ?? 0)), 0);
@@ -39,9 +40,8 @@ export class PaseoSubtasks {
     this.pending.set(key, read);
     return read;
   }
-  private async fetch(agentId: string, paseo: PaseoApi): Promise<PaseoSubtask[]> {
+  private async fetch(agentId: string, paseo: PaseoApi, signal: AbortSignal): Promise<PaseoSubtask[]> {
     const tasks = new Map<string, PaseoSubtask>();
-    const signal = this.lifetime.signal;
     for await (const page of timelineHistory(paseo.agents.ref(agentId).timeline, signal)) {
       // Pages arrive newest first. Retain only task facts, and never let an
       // older running version replace a terminal version from a newer page.
@@ -53,8 +53,8 @@ export class PaseoSubtasks {
           : item.status === "completed" || item.status === "failed" || item.status === "canceled" ? item.status : null;
         if (!status) continue;
         const description = text(detail.description), childId = text(detail.childSessionId);
-        tasks.set(callId, { callId, subject: description.slice(0, 180) || text(item.name),
-          description: description.slice(0, 16000), status, ...(childId ? { childId } : {}) });
+        tasks.set(callId, { callId, subject: detachSlice(description, 180) || detachSlice(text(item.name)),
+          description: detachSlice(description, 16000), status, ...(childId ? { childId } : {}) });
       }
     }
     ensureActive(signal);

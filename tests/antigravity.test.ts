@@ -101,6 +101,25 @@ function generation(db: Sqlite.DatabaseSync, index: number, step: number, usage:
     proto({ 1: proto({ 4: usage, 11: time(ttft), 12: time(decode) }), 2: varint(step) }));
 }
 
+sqliteTest("evicts companion database snapshots after idle time and releases their timers on clear", async () => {
+  const { reader, database, agent } = await fixture();
+  const db = databaseAt(database, false);
+  step(db, 0, 14, proto({ 1: time(start) }));
+  const companion = reader["paths"].antigravity;
+  vi.useFakeTimers();
+  try {
+    const source = (await reader.locateSource(agent))!;
+    await reader.read(agent, source);
+    expect(companion["cache"].peek(database)).toBeDefined();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(companion["cache"].peek(database)).toBeUndefined();
+    expect(vi.getTimerCount()).toBe(0);
+    await reader.read(agent, source);
+    reader.clear();
+    expect(vi.getTimerCount()).toBe(0);
+  } finally { vi.useRealTimers(); }
+});
+
 test("resolves bare and versioned Antigravity UUIDs and rejects traversal and symlink escapes", async () => {
   const { agent, root, file, short, database, reader } = await fixture();
   expect(agent.sessionId).toBe(ID);

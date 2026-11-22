@@ -1,4 +1,5 @@
 import type { ContextNode } from "../shared/contracts";
+import { stringBytes, stringIndexBytes } from "./value";
 
 export interface StatisticsSpan {
   id: string; turn: number; start: number; boundary: number; endBoundary: number | null;
@@ -16,6 +17,11 @@ export class StatisticsSpans {
   private requests = new Map<string, StatisticsSpan>();
   private byId = new Map<string, StatisticsSpan>();
   private lastUsageAt = 0;
+  get residentBytes() {
+    let bytes = 320 + stringIndexBytes(this.byId.keys()) + stringIndexBytes(this.requests.keys()) + stringIndexBytes(this.responses.keys());
+    for (const row of this.rows) bytes += 224 + stringBytes(row.prompt) + row.nodeIds.length * 8;
+    return bytes;
+  }
   find(id: string) { return this.byId.get(id) ?? this.requests.get(id); }
   observe(input: {
     line: number; turn: number; at: number; firstNode: number; nodes: readonly ContextNode[];

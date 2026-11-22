@@ -3,7 +3,9 @@ import { ContextFold } from "./fold";
 import { messagesOf } from "./normalize";
 import { ensureActive, timelineAfter, timelineHistory } from "./paging";
 import type { ReadBodies } from "./reader";
-import { record } from "./value";
+import { record, stringBytes } from "./value";
+import { MIB, sessionReadBudget, TIMELINE_PAGE_BYTES, type AccountRead } from "./read-budget";
+import { RetainedCache } from "./retained-cache";
 
 type Page = Awaited<ReturnType<ReturnType<PaseoApi["agents"]["ref"]>["timeline"]["refetch"]>>;
 type TimelineEntry = Page["entries"][number];
@@ -13,43 +15,66 @@ interface Frame {
   cursor: Page["endCursor"];
   bytes: number;
   residentBytes: number;
-  at: number;
 }
 const RESIDENT_LIMIT = 48 * 1024 * 1024;
-const RETAIN_MS = 120_000;
 const rowOf = (entry: TimelineEntry) => ({ ...record(entry.item), timestamp: entry.timestamp });
+
+// Timeline items are JSON DTOs. Weigh their strings and containers without serializing a second copy.
+function itemBytes(value: unknown): number {
+  if (typeof value === "string") return stringBytes(value);
+  if (typeof value !== "object" || value === null) return 8;
+  let bytes = 48;
+  if (Array.isArray(value)) {
+    for (const item of value) bytes += 8 + itemBytes(item);
+    return bytes;
+  }
+  const row = record(value);
+  for (const key in row) if (Object.hasOwn(row, key)) bytes += 24 + stringBytes(key) + itemBytes(row[key]);
+  return bytes;
+}
 const sizeOf = (entries: readonly TimelineEntry[]) => entries.reduce((size, entry) =>
-  size + JSON.stringify(entry.item).length * 2 + 128, 0);
+  size + itemBytes(entry.item) + 128, 0);
 
 function applyEntries(fold: ContextFold, entries: readonly TimelineEntry[]) {
   for (const entry of entries) fold.apply(rowOf(entry));
 }
 
 export class TimelineReader {
-  private frames = new Map<string, Frame>();
+  private frames = new RetainedCache<Frame>(8, RESIDENT_LIMIT);
   private pending = new Map<string, Promise<Frame>>();
+  private lifetime = new AbortController();
+  private signal = this.lifetime.signal;
+  private stop = () => this.lifetime.abort();
 
-  constructor(private signal: AbortSignal) {}
+  constructor(private owner: AbortSignal, private budget = sessionReadBudget) {
+    if (owner.aborted) this.stop();
+    else owner.addEventListener("abort", this.stop, { once: true });
+  }
 
   async read(id: string, paseo: PaseoApi) {
     ensureActive(this.signal);
     const active = this.pending.get(id);
     if (active) return active;
-    const pending = this.fetch(id, paseo);
+    const estimate = TIMELINE_PAGE_BYTES + (this.frames.peek(id)?.residentBytes ?? 0);
+    const pending = this.budget.run(estimate, this.signal, (account) => this.fetch(id, paseo, account));
     this.pending.set(id, pending);
     try {
       const frame = await pending;
       ensureActive(this.signal);
-      this.remember(id, frame);
+      this.frames.set(id, frame, frame.residentBytes);
       return frame;
     } finally { if (this.pending.get(id) === pending) this.pending.delete(id); }
   }
 
-  private async fetch(id: string, paseo: PaseoApi): Promise<Frame> {
+  private async fetch(id: string, paseo: PaseoApi, account: AccountRead): Promise<Frame> {
     const timeline = paseo.agents.ref(id).timeline;
-    const cached = this.frames.get(id);
+    const cached = this.frames.peek(id);
     if (cached?.cursor) {
-      const append = await timelineAfter(timeline, cached.cursor, this.signal);
+      let bytes = 0;
+      const append = await timelineAfter(timeline, cached.cursor, this.signal, (entries) => {
+        bytes += sizeOf(entries);
+        account(TIMELINE_PAGE_BYTES + cached.residentBytes + bytes * 2);
+      });
       if (append) {
         if (!append.entries.length) { cached.cursor = append.end; return cached; }
         const last = cached.entries.at(-1)?.seqStart;
@@ -59,10 +84,9 @@ export class TimelineReader {
           const bySeq = new Map(cached.entries.map((entry) => [entry.seqStart, entry]));
           for (const entry of append.entries) bySeq.set(entry.seqStart, entry);
           const entries = [...bySeq.values()].sort((a, b) => a.seqStart - b.seqStart);
-          return this.frame(entries, append.end.epoch, append.end);
+          return this.frame(entries, append.end.epoch, append.end, sizeOf(entries));
         }
         try {
-          const bytes = sizeOf(append.entries);
           applyEntries(cached.fold, append.entries);
           for (const entry of append.entries) cached.entries.push(entry);
           cached.bytes += bytes;
@@ -76,29 +100,20 @@ export class TimelineReader {
       }
     }
     const pages: Page[] = [];
-    for await (const page of timelineHistory(timeline, this.signal)) pages.push(page);
+    let bytes = 0;
+    for await (const page of timelineHistory(timeline, this.signal)) {
+      bytes += sizeOf(page.entries);
+      account(TIMELINE_PAGE_BYTES + (cached?.residentBytes ?? 0) + bytes * 2);
+      pages.push(page);
+    }
     const tail = pages[0], entries = pages.reverse().flatMap((page) => page.entries);
-    return this.frame(entries, tail?.epoch ?? "timeline", tail?.endCursor ?? null);
+    return this.frame(entries, tail?.epoch ?? "timeline", tail?.endCursor ?? null, bytes);
   }
 
-  private frame(entries: TimelineEntry[], epoch: string, cursor: Page["endCursor"]): Frame {
+  private frame(entries: TimelineEntry[], epoch: string, cursor: Page["endCursor"], bytes: number): Frame {
     const fold = new ContextFold("timeline", epoch);
     applyEntries(fold, entries);
-    const bytes = sizeOf(entries);
-    return { entries, fold, cursor, bytes, residentBytes: bytes + fold.residentBytes, at: 0 };
-  }
-
-  private remember(id: string, frame: Frame) {
-    frame.at = Date.now();
-    this.frames.delete(id);
-    if (frame.residentBytes > RESIDENT_LIMIT) return;
-    this.frames.set(id, frame);
-    let weight = [...this.frames.values()].reduce((size, value) => size + value.residentBytes, 0);
-    for (const [key, value] of this.frames) {
-      if (this.frames.size <= 8 && weight <= RESIDENT_LIMIT && Date.now() - value.at < RETAIN_MS) break;
-      this.frames.delete(key);
-      weight -= value.residentBytes;
-    }
+    return { entries, fold, cursor, bytes, residentBytes: bytes + fold.residentBytes };
   }
 
   weight(frame: Frame) { return frame.residentBytes; }
@@ -107,21 +122,38 @@ export class TimelineReader {
     return async (ids, project) => {
       ensureActive(this.signal);
       if (revision !== frame.fold.revision) throw new Error("Timeline changed while reading content; refresh the session and retry");
-      const parsed = new Map<number, ReturnType<typeof messagesOf>>();
-      const result = new Map<number, ReturnType<typeof project>>();
+      const lines = new Map<number, number[]>();
+      let bytes = MIB;
       for (const id of new Set(ids)) {
         const node = frame.fold.nodes[id];
         if (!node) throw new Error("Context item is no longer available");
-        let messages = parsed.get(node.line);
-        if (!messages) {
-          messages = messagesOf(rowOf(frame.entries[node.line - 1]), "timeline");
-          parsed.set(node.line, messages);
+        const group = lines.get(node.line);
+        if (group) group.push(id);
+        else {
+          lines.set(node.line, [id]);
+          bytes += itemBytes(frame.entries[node.line - 1].item) * 2;
         }
-        result.set(id, project(id, messages.find((message) => message.block === node.block)?.text ?? ""));
       }
-      return result;
+      const result = new Map<number, ReturnType<typeof project>>();
+      if (!lines.size) return result;
+      return this.budget.run(bytes, this.signal, async () => {
+        if (revision !== frame.fold.revision) throw new Error("Timeline changed while reading content; refresh the session and retry");
+        for (const [line, group] of lines) {
+          const messages = messagesOf(rowOf(frame.entries[line - 1]), "timeline");
+          for (const id of group) {
+            const node = frame.fold.nodes[id];
+            result.set(id, project(id, messages.find((message) => message.block === node.block)?.text ?? ""));
+          }
+        }
+        return result;
+      });
     };
   }
 
-  clear() { this.frames.clear(); this.pending.clear(); }
+  clear() {
+    this.owner.removeEventListener("abort", this.stop);
+    this.stop();
+    this.frames.clear();
+    this.pending.clear();
+  }
 }

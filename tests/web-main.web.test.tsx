@@ -192,4 +192,16 @@ describe("web/main entry lifecycle", () => {
     await act(async () => { modalStoreOf("agent-modal").set(false); });
     expect(posted).toContainEqual(expect.objectContaining({ type: "paseo-context:action", nonce: "main-nonce", name: "close", payload: {}, aid: expect.any(Number) }));
   });
+
+  test("compactDigest produces a tiny fixed-size hash for large family payloads", async () => {
+    const { compactDigest } = await import("../web/main");
+    const largeA = JSON.stringify({ rows: Array.from({ length: 200 }, (_, i) => ({ id: `a-${i}`, text: "payload".repeat(20) })) });
+    const largeB = largeA.replace("a-199", "a-999");
+    const digestA1 = compactDigest(largeA);
+    const digestA2 = compactDigest(largeA);
+    const digestB = compactDigest(largeB);
+    expect(digestA1).toBe(digestA2);
+    expect(digestA1).not.toBe(digestB);
+    expect(digestA1.length).toBeLessThan(32);
+  });
 });

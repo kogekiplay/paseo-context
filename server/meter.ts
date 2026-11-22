@@ -3,7 +3,7 @@ import { emptyUsage, type ProviderTiming, type Usage } from "../shared/contracts
 import type { UsageSource, UsageSources } from "../shared/core/types";
 import { cumulativeDelta, requestUsage, sourcesOfUsage, usageBuckets, usageKeys, type NativeUsageProvider } from "./usage-fields";
 import { antigravityStepIndex, mergeAntigravityUsage, type AntigravityStep } from "./antigravity-log";
-import { count, record, text, timestamp, type RecordValue } from "./value";
+import { count, record, stringBytes, stringIndexBytes, text, timestamp, type RecordValue } from "./value";
 
 export interface UsageObservation {
   id: string;
@@ -42,6 +42,17 @@ export class SessionFold {
   private claudeTtft = new Set<string>();
   private antigravityResponses = new Map<string, string>();
   private antigravityTiming = new Map<string, ProviderTiming>();
+
+  get residentBytes() {
+    let bytes = 768 + stringBytes(this.turn) + stringBytes(this.lastLegacySignature)
+      + stringIndexBytes(this.turns) + stringIndexBytes(this.claudeTtft);
+    for (const map of [this.responses, this.pendingTools, this.timings, this.chain, this.claudeStarts,
+      this.antigravityResponses, this.antigravityTiming]) bytes += stringIndexBytes(map.keys());
+    for (const { parent } of this.chain.values()) bytes += 80 + stringBytes(parent);
+    for (const id of this.antigravityResponses.values()) bytes += stringBytes(id);
+    return bytes + this.responses.size * 320 + this.timings.size * 56
+      + this.claudeStarts.size * 56 + this.antigravityTiming.size * 96;
+  }
 
   constructor(readonly provider: NativeUsageProvider) {
     this.stats = emptyStats(provider);

@@ -11,7 +11,7 @@ vi.mock("../web/vendor/ui/index.js", () => ({
   SegmentedControl: "SegmentedControl", Switch: "Switch",
 }));
 vi.mock("../web/bridge", () => ({ call: vi.fn(async () => null) }));
-import { makeStatisticsView } from "../web/statistics";
+import { makeStatisticsView, setBoundedDetails } from "../web/statistics";
 import { call } from "../web/bridge";
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -116,4 +116,85 @@ test("expanded details refresh on content revision changes and ignore an old lat
   expect(requests).toHaveLength(3);
   await act(async () => renderer!.unmount());
   renderer = null;
+});
+
+test("setBoundedDetails enforces char budget LRU and switching sessionId clears cached details & aborts pending", async () => {
+  let cache = new Map<string, any>();
+  const makeDetail = (id: string, chars: number) => ({
+    requestId: id,
+    contentRevision: "r1",
+    answerBody: "x".repeat(chars),
+    answerTruncated: false,
+    calls: [],
+  });
+  cache = setBoundedDetails(cache, "s1", makeDetail("s1", 60), 64, 100);
+  cache = setBoundedDetails(cache, "s2", makeDetail("s2", 60), 64, 100);
+  // Total 120 > 100 -> oldest s1 evicted, s2 kept.
+  expect([...cache.keys()]).toEqual(["s2"]);
+  // Single entry larger than budget is still kept (size > 1 guard).
+  cache = setBoundedDetails(cache, "s3", makeDetail("s3", 150), 64, 100);
+  expect([...cache.keys()]).toEqual(["s3"]);
+
+  // Switching props.sessionId clears expanded/details and aborts in-flight fetch.
+  const requests: Array<{ resolve: (value: unknown) => void; signal: AbortSignal }> = [];
+  vi.mocked(call).mockImplementation((_route, _input, options) => new Promise((resolve) => requests.push({ resolve, signal: options!.signal! })));
+  const snap = (id: string): StatsSnapshot => {
+    const base = fixture(1);
+    const steps = base.turns[0].steps.map((step) => ({
+      ...step, sourceId: id, contentRevision: "rev-1", detailsState: "unloaded" as const,
+    }));
+    return { turns: [{ ...base.turns[0], steps }], stepCount: 1 };
+  };
+  const root = await mount(snap("step:sess-a"));
+  const target = { closest: () => ({ getAttribute: () => "step:sess-a" }) };
+  await act(async () => root.findByProps({ className: "pc-statistics" }).props.onClickCapture({ target }));
+  expect(requests).toHaveLength(1);
+  expect(requests[0].signal.aborted).toBe(false);
+
+  await act(async () => renderer!.update(createElement(Statistics, { sessionId: "agent-b", locale: "zh-CN", snapshot: snap("step:sess-a") })));
+  expect(requests[0].signal.aborted).toBe(true);
+  // Switching sessions cleared expanded, so no automatic refetch runs for agent-b.
+  expect(requests).toHaveLength(1);
+});
+
+test("budget-evicted details are removed from expanded so 5s polls do not thrash refetch", async () => {
+  const evicted: string[] = [];
+  let cache = new Map<string, any>();
+  const makeBig = (id: string, chars: number) => ({
+    requestId: id, contentRevision: "r1", answerBody: "a".repeat(chars), answerTruncated: false, calls: [],
+  });
+  cache = setBoundedDetails(cache, "s1", makeBig("s1", 60), 64, 100, (keys) => evicted.push(...keys));
+  cache = setBoundedDetails(cache, "s2", makeBig("s2", 60), 64, 100, (keys) => evicted.push(...keys));
+  expect(evicted).toEqual(["s1"]);
+
+  // Component-level regression: expand two >2MB steps so step 1 is evicted by 3MB char budget, then poll snapshot updates.
+  const huge = "x".repeat(2 * 1024 * 1024);
+  const fetched: string[] = [];
+  vi.mocked(call).mockImplementation(async (_route, input: any) => {
+    fetched.push(input.requestId);
+    return { requestId: input.requestId, contentRevision: "r1", answerBody: huge, answerTruncated: false, calls: [] };
+  });
+  const twoStepSnapshot = (rev2 = "r1"): StatsSnapshot => {
+    const base = fixture(2);
+    const steps = base.turns[0].steps.map((step, index) => ({
+      ...step,
+      sourceId: index === 0 ? "step:big1" : "step:big2",
+      contentRevision: index === 0 ? "r1" : rev2,
+      detailsState: "unloaded" as const,
+    }));
+    return { turns: [{ ...base.turns[0], steps }], stepCount: 2 };
+  };
+  const root = await mount(twoStepSnapshot());
+  await act(async () => root.findByProps({ className: "pc-statistics" }).props.onClickCapture({
+    target: { closest: () => ({ getAttribute: () => "step:big1" }) },
+  }));
+  await act(async () => root.findByProps({ className: "pc-statistics" }).props.onClickCapture({
+    target: { closest: () => ({ getAttribute: () => "step:big2" }) },
+  }));
+  expect(fetched).toEqual(["step:big1", "step:big2"]);
+
+  // Polling delivers a new snapshot reference -> evicted step:big1 MUST NOT be re-fetched.
+  fetched.length = 0;
+  await act(async () => renderer!.update(createElement(Statistics, { sessionId: "agent-a", locale: "zh-CN", snapshot: twoStepSnapshot() })));
+  expect(fetched).toEqual([]);
 });
