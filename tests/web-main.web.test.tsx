@@ -41,6 +41,7 @@ vi.mock("../src/client/components/richText", () => ({
 }));
 vi.mock("../web/statistics", () => ({ makeStatisticsView: () => () => "Statistics" }));
 vi.mock("../src/client/historyPage", () => ({ watchHistoryFaces: () => {} }));
+vi.mock("../.tmp/web/tailwind.css", () => ({}));
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
