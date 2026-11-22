@@ -222,4 +222,41 @@ describe("Native upstream UI container", () => {
     expect(injected.some((script) => script.includes('__PASEO_CONTEXT_ACK__?.("11")'))).toBe(true);
     expect(injected.some((script) => script.includes('__PASEO_CONTEXT_ACK__?.("12")'))).toBe(true);
   });
+
+  test("Android delivers bridge frames mirrored in title when loadDataWithBaseURL strips URL hash", async () => {
+    mocks.platform.OS = "android";
+    const root = await mount();
+    const view = root.findByType("RNCWebView" as any);
+    const nonce = /__PASEO_CONTEXT_NONCE__="([^"]+)"/.exec(view.props.source.html)![1];
+    const encoded1 = encodeURIComponent(JSON.stringify({ type: "paseo-context:rpc", nonce, id: 91, route: "clipboard.write", payload: { text: "from-title-start" } }));
+    const encoded2 = encodeURIComponent(JSON.stringify({ type: "paseo-context:rpc", nonce, id: 92, route: "clipboard.write", payload: { text: "from-title-finish" } }));
+    mocks.dispatch.mockClear();
+    mocks.copyText.mockClear();
+
+    await act(async () => view.props.onLoadingStart({
+      nativeEvent: { url: "data:text/html;charset=utf-8;base64,", title: `#paseo-context=21:${encoded1}` },
+    }));
+    await act(async () => view.props.onLoadingFinish({
+      nativeEvent: { url: "data:text/html;charset=utf-8;base64,", title: `#paseo-context=22:${encoded2}` },
+    }));
+    expect(mocks.copyText).toHaveBeenCalledWith("from-title-start");
+    expect(mocks.copyText).toHaveBeenCalledWith("from-title-finish");
+    const injected = mocks.dispatch.mock.calls.map(([, , args]) => args[0]);
+    expect(injected.some((script) => script.includes('__PASEO_CONTEXT_ACK__?.("21")'))).toBe(true);
+    expect(injected.some((script) => script.includes('__PASEO_CONTEXT_ACK__?.("22")'))).toBe(true);
+    expect(injected.some((script) => script.includes("paseo-context:init"))).toBe(false);
+
+    // Newer title seq beats stale retained url hash; duplicate seq across onLoadingProgress is deduplicated.
+    const encoded3 = encodeURIComponent(JSON.stringify({ type: "paseo-context:ready", nonce }));
+    mocks.dispatch.mockClear();
+    await act(async () => view.props.onLoadingProgress({
+      nativeEvent: { url: `${view.props.source.baseUrl}#paseo-context=21:${encoded1}`, title: `#paseo-context=23:${encoded3}` },
+    }));
+    await act(async () => view.props.onLoadingProgress({
+      nativeEvent: { url: `${view.props.source.baseUrl}#paseo-context=21:${encoded1}`, title: `#paseo-context=23:${encoded3}` },
+    }));
+    const progressInjected = mocks.dispatch.mock.calls.map(([, , args]) => args[0]);
+    expect(progressInjected.filter((script) => script.includes('__PASEO_CONTEXT_ACK__?.("23")'))).toHaveLength(1);
+    expect(progressInjected.filter((script) => script.includes("paseo-context:init"))).toHaveLength(1);
+  });
 });

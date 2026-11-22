@@ -24,9 +24,38 @@ interface ChunkBuffer { total: number; parts: Array<string | undefined>; receive
 // Registering it again with requireNativeComponent would cause a duplicate view.
 const RNCWebView = "RNCWebView" as unknown as ComponentType<any>;
 const MAX_CHUNK_GROUPS = 16;
-const MAX_CHUNKS_PER_MESSAGE = 256;
+const MAX_CHUNKS_PER_MESSAGE = 1024;
 const MAX_COMPLETED_GROUPS = 128;
 const MAX_SEEN_HISTORY_IDS = 256;
+const SINGLE_MARKER = "#paseo-context=";
+const CHUNK_MARKER = "#paseo-context-chunk=";
+
+function parseBridgeSource(text: string | undefined, channel: "url" | "title") {
+  if (!text) return null;
+  const singleAt = text.indexOf(SINGLE_MARKER);
+  if (singleAt >= 0) {
+    const raw = text.slice(singleAt + SINGLE_MARKER.length);
+    const colon = raw.indexOf(":");
+    const seq = colon >= 1 ? raw.slice(0, colon) : undefined;
+    return { kind: "single" as const, raw, channel, seq, seqNum: seq && /^\d+$/.test(seq) ? Number(seq) : -1 };
+  }
+  const chunkAt = text.indexOf(CHUNK_MARKER);
+  if (chunkAt >= 0) {
+    const raw = text.slice(chunkAt + CHUNK_MARKER.length);
+    const colon = raw.indexOf(":");
+    const seq = colon >= 1 ? raw.slice(0, colon) : undefined;
+    return { kind: "chunk" as const, raw, channel, seq, seqNum: seq && /^\d+$/.test(seq) ? Number(seq) : -1 };
+  }
+  return null;
+}
+
+function extractBridgeFrame(url?: string, title?: string) {
+  const fromUrl = parseBridgeSource(url, "url");
+  const fromTitle = parseBridgeSource(title, "title");
+  if (!fromUrl) return fromTitle;
+  if (!fromTitle) return fromUrl;
+  return fromTitle.seqNum >= fromUrl.seqNum ? fromTitle : fromUrl;
+}
 
 function rememberBounded(set: Set<string>, key: string, limit: number) {
   set.delete(key);
@@ -58,6 +87,7 @@ function NativeFrameBody(props: FrameProps & { retry: () => void }) {
   const chunks = useRef(new Map<string, ChunkBuffer>());
   const completedGroups = useRef(new Set<string>());
   const seenHistoryIds = useRef(new Set<string>());
+  const seenHistorySeqs = useRef(new Set<string>());
   const latest = useRef({ props, settings, locale, rpc, previewRpc });
   latest.current = { props, settings, locale, rpc, previewRpc };
   const saveSetting = useMemo(() => createSettingsSaver(() => latest.current.settings as any), []);
@@ -113,6 +143,7 @@ function NativeFrameBody(props: FrameProps & { retry: () => void }) {
       chunks.current.clear();
       completedGroups.current.clear();
       seenHistoryIds.current.clear();
+      seenHistorySeqs.current.clear();
     };
   }, []);
 
@@ -213,6 +244,34 @@ function NativeFrameBody(props: FrameProps & { retry: () => void }) {
     receiveHistory(message);
   };
 
+  const handleBridgeFrame = (frame: NonNullable<ReturnType<typeof extractBridgeFrame>>) => {
+    if (!mounted.current) return false;
+    const ackSeq = frame.seq;
+    if (ackSeq !== undefined && seenHistorySeqs.current.has(ackSeq)) return false;
+    if (ackSeq !== undefined) rememberBounded(seenHistorySeqs.current, ackSeq, MAX_SEEN_HISTORY_IDS);
+    report(`history bridge ready (${frame.channel})`);
+    const leadingColon = frame.raw.indexOf(":");
+    try {
+      if (frame.kind === "single") {
+        if (leadingColon >= 1) {
+          const message = decodeURIComponent(frame.raw.slice(leadingColon + 1));
+          receiveHistory(message);
+        }
+      } else {
+        handleChunkFrame(frame.raw);
+      }
+    } catch {
+      // Malformed or truncated hash payloads must still release the bridge queue.
+    } finally {
+      if (mounted.current) {
+        inject(ackSeq !== undefined
+          ? `globalThis.__PASEO_CONTEXT_ACK__?.(${JSON.stringify(ackSeq)});true;`
+          : "globalThis.__PASEO_CONTEXT_ACK__?.();true;");
+      }
+    }
+    return true;
+  };
+
   // Android's WebView may expose loadDataWithBaseURL("about:blank") as a
   // data: URL; a unique HTTPS origin avoids that alias and also supports
   // same-origin history state updates. The HTML is supplied locally, not fetched.
@@ -243,16 +302,26 @@ function NativeFrameBody(props: FrameProps & { retry: () => void }) {
     {createElement(RNCWebView, {
       ref, source, newSource: source, style: { flex: 1, backgroundColor: props.theme.colors.surface0 },
       javaScriptEnabled: true, messagingEnabled: true, messagingModuleName: "",
-      onMessage: receive, onLoadingFinish: (event: { nativeEvent: { title?: string } }) => {
+      onMessage: receive,
+      onLoadingFinish: (event: { nativeEvent: { url?: string; title?: string } }) => {
         if (event.nativeEvent.title?.startsWith("Paseo Context error:")) {
           setError(event.nativeEvent.title); report(event.nativeEvent.title.slice(0, 150));
         }
+        if (Platform.OS === "android" && (!event.nativeEvent.url || isNativeLoadEventUrl(event.nativeEvent.url, baseUrl, true))) {
+          const bridgeFrame = extractBridgeFrame(event.nativeEvent.url, event.nativeEvent.title);
+          if (bridgeFrame) { handleBridgeFrame(bridgeFrame); return; }
+        }
         report("document loaded"); initialize();
       },
+      onLoadingProgress: Platform.OS === "android" ? (event: { nativeEvent: { url?: string; title?: string } }) => {
+        if (event.nativeEvent.url && !isNativeLoadEventUrl(event.nativeEvent.url, baseUrl, true)) return;
+        const bridgeFrame = extractBridgeFrame(event.nativeEvent.url, event.nativeEvent.title);
+        if (bridgeFrame) handleBridgeFrame(bridgeFrame);
+      } : undefined,
       // Android routes WebView.postMessage through a host-owned JS emitter which
       // plugins cannot subscribe to. Local same-origin history events use the
       // native view's direct event channel and never load a network URL.
-      onLoadingStart: (event: { nativeEvent: { url: string } }) => {
+      onLoadingStart: (event: { nativeEvent: { url: string; title?: string } }) => {
         const url = event.nativeEvent.url;
         if (!isNativeLoadEventUrl(url, baseUrl, Platform.OS === "android")) {
           const tag = findNodeHandle(ref.current);
@@ -261,31 +330,9 @@ function NativeFrameBody(props: FrameProps & { retry: () => void }) {
           const scheme = /^[a-z]+(?=:)/i.exec(url)?.[0] ?? "unknown";
           report(`unexpected navigation blocked (${scheme})`); return;
         }
-        const singleMarker = "#paseo-context=";
-        const chunkMarker = "#paseo-context-chunk=";
-        const singleAt = url.indexOf(singleMarker);
-        const chunkAt = singleAt < 0 ? url.indexOf(chunkMarker) : -1;
-        if (singleAt < 0 && chunkAt < 0) { report("navigation started"); return; }
-        report("history bridge ready");
-        const raw = singleAt >= 0 ? url.slice(singleAt + singleMarker.length) : url.slice(chunkAt + chunkMarker.length);
-        const leadingColon = raw.indexOf(":");
-        const ackSeq = leadingColon >= 1 ? raw.slice(0, leadingColon) : undefined;
-        try {
-          if (singleAt >= 0) {
-            if (leadingColon >= 1) {
-              const message = decodeURIComponent(raw.slice(leadingColon + 1));
-              receiveHistory(message);
-            }
-          } else {
-            handleChunkFrame(raw);
-          }
-        } catch {
-          // Malformed or truncated hash payloads must still release the bridge queue.
-        } finally {
-          inject(ackSeq !== undefined
-            ? `globalThis.__PASEO_CONTEXT_ACK__?.(${JSON.stringify(ackSeq)});true;`
-            : "globalThis.__PASEO_CONTEXT_ACK__?.();true;");
-        }
+        const bridgeFrame = extractBridgeFrame(url, Platform.OS === "android" ? event.nativeEvent.title : undefined);
+        if (!bridgeFrame) { report("navigation started"); return; }
+        handleBridgeFrame(bridgeFrame);
       },
       onLoadingError: (event: { nativeEvent: { description?: string } }) => setError(event.nativeEvent.description ?? "Could not load the UI"),
       onShouldStartLoadWithRequest: (event: { nativeEvent: { url: string; lockIdentifier: number } }) => {

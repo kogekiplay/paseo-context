@@ -1,6 +1,6 @@
 {
   "name": "paseo-context",
-  "version": "0.2.10",
+  "version": "0.2.11",
   "description": "Context insights, request browser, usage analytics and agent fleet for Paseo.",
   "type": "module",
   "license": "Apache-2.0",

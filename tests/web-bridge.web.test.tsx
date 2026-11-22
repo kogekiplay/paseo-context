@@ -76,14 +76,16 @@ describe("web/bridge history transport & web/grammars backoff", () => {
     expect(historyHashes).toHaveLength(1);
     expect(historyHashes[0]).toContain("#paseo-context=");
 
-    // 2. Missing ACK retries once after 3000ms, then drops & unblocks third message.
+    // 2. Missing ACK probes fallback methods (600ms + 600ms) then times out after 3000ms & unblocks third message.
     const secondCheck = expect(second).rejects.toThrow("acknowledgement timed out");
     const third = bridge.call("bootstrap", { step: 3 });
-    await vi.advanceTimersByTimeAsync(3000);
-    expect(historyHashes).toHaveLength(2); // retried with fresh serial
+    await vi.advanceTimersByTimeAsync(600);
+    expect(historyHashes).toHaveLength(2); // probe retry 1
+    await vi.advanceTimersByTimeAsync(600);
+    expect(historyHashes).toHaveLength(3); // probe retry 2
     await vi.advanceTimersByTimeAsync(3000);
     await secondCheck;
-    expect(historyHashes).toHaveLength(3); // third message pumped
+    expect(historyHashes).toHaveLength(4); // third message pumped
 
     // Deliver ACK and result for third message.
     (globalThis as any).__PASEO_CONTEXT_ACK__();
@@ -91,27 +93,40 @@ describe("web/bridge history transport & web/grammars backoff", () => {
     await expect(third).resolves.toEqual({ ok: 3 });
   });
 
-  test("chunks large payloads, rejects oversized payloads > 2MiB, and resets nativeSending on pagehide", async () => {
-    const bridge = await import("../web/bridge");
+  test("chunks large payloads under Chromium title limit, rejects > 2MiB, mirrors title, and resets on pagehide", async () => {
+    const mockDoc = { title: "" };
+    const mockLoc = { hash: "" };
+    (globalThis as any).document = mockDoc;
+    (globalThis as any).location = mockLoc;
+    try {
+      const bridge = await import("../web/bridge");
 
-    // Oversized payload rejects immediately without touching history.
-    await expect(bridge.call("clipboard.write", { text: "x".repeat(2_200_000) })).rejects.toThrow("exceeds native bridge limit");
-    expect(historyHashes).toHaveLength(0);
+      // Oversized payload rejects immediately without touching history.
+      await expect(bridge.call("clipboard.write", { text: "x".repeat(2_200_000) })).rejects.toThrow("exceeds native bridge limit");
+      expect(historyHashes).toHaveLength(0);
 
-    // Multi-chunk payload (> 16KB) splits into #paseo-context-chunk= frames.
-    const chunked = bridge.call("clipboard.write", { text: "a".repeat(20_000) });
-    expect(historyHashes).toHaveLength(1);
-    expect(historyHashes[0]).toMatch(/^#paseo-context-chunk=\d+:\d+:0:2:/);
-    (globalThis as any).__PASEO_CONTEXT_ACK__();
-    expect(historyHashes).toHaveLength(2);
-    expect(historyHashes[1]).toMatch(/^#paseo-context-chunk=\d+:\d+:1:2:/);
+      // Multi-chunk payload (> 3KB) splits into <= 3072-byte encoded #paseo-context-chunk= frames.
+      const chunked = bridge.call("clipboard.write", { text: "a".repeat(5_000) });
+      expect(historyHashes).toHaveLength(1);
+      expect(historyHashes[0]).toMatch(/^#paseo-context-chunk=\d+:\d+:0:2:/);
+      expect(mockDoc.title).toBe(historyHashes[0]);
+      expect(mockDoc.title.length).toBeLessThan(4096);
+      (globalThis as any).__PASEO_CONTEXT_ACK__();
+      expect(historyHashes).toHaveLength(2);
+      expect(historyHashes[1]).toMatch(/^#paseo-context-chunk=\d+:\d+:1:2:/);
 
-    // pagehide rejects pending requests and resets nativeSending so subsequent sends work.
-    emit("pagehide", { type: "pagehide" });
-    await expect(chunked).rejects.toThrow("Context view closed");
+      // pagehide rejects pending requests and resets nativeSending so subsequent sends work.
+      emit("pagehide", { type: "pagehide" });
+      await expect(chunked).rejects.toThrow("Context view closed");
 
-    bridge.send({ type: "paseo-context:ready", nonce: "nonce-1" });
-    expect(historyHashes).toHaveLength(3);
+      bridge.send({ type: "paseo-context:ready", nonce: "nonce-1" });
+      expect(historyHashes).toHaveLength(3);
+      (globalThis as any).__PASEO_CONTEXT_ACK__();
+      expect(mockDoc.title).toBe("Paseo Context");
+    } finally {
+      delete (globalThis as any).document;
+      delete (globalThis as any).location;
+    }
   });
 
   test("enforces 128 pending RPC cap and web/grammars deduplicates in-flight + backs off on error", async () => {
@@ -156,8 +171,8 @@ describe("web/bridge history transport & web/grammars backoff", () => {
     expect(historyHashes).toHaveLength(1);
     const seq1 = /^#paseo-context=(\d+):/.exec(historyHashes[0])![1];
 
-    // Retry fires after 3000ms with seq2.
-    await vi.advanceTimersByTimeAsync(3000);
+    // Retry fires after initial 600ms probe with seq2.
+    await vi.advanceTimersByTimeAsync(600);
     expect(historyHashes).toHaveLength(2);
     const seq2 = /^#paseo-context=(\d+):/.exec(historyHashes[1])![1];
     expect(seq2).not.toBe(seq1);
@@ -180,5 +195,39 @@ describe("web/bridge history transport & web/grammars backoff", () => {
     (globalThis as any).__PASEO_CONTEXT_RECEIVE__({ type: "paseo-context:result", nonce: "nonce-1", id: 2, value: "two" });
     await expect(first).resolves.toBe("one");
     await expect(second).resolves.toBe("two");
+  });
+
+  test("rotates replace -> hash -> push during probe, locks confirmed method, and clears stale title on timeout", async () => {
+    vi.useFakeTimers();
+    const mockDoc = { title: "" };
+    const hashWrites: string[] = [];
+    const pushWrites: string[] = [];
+    (globalThis as any).document = mockDoc;
+    (globalThis as any).location = { set hash(v: string) { hashWrites.push(v); }, get hash() { return hashWrites.at(-1) ?? ""; } };
+    (globalThis as any).history.pushState = (_s: unknown, _t: string, url?: string | null) => { if (typeof url === "string") pushWrites.push(url); };
+    try {
+      const bridge = await import("../web/bridge");
+      const first = bridge.call("ping", { n: 1 });
+      expect(historyHashes).toHaveLength(1); // attempt 0: replaceState
+      await vi.advanceTimersByTimeAsync(600);
+      expect(hashWrites).toHaveLength(1); // attempt 1: location.hash
+      const hashSeq = /^#paseo-context=(\d+):/.exec(hashWrites[0])![1];
+      (globalThis as any).__PASEO_CONTEXT_ACK__(hashSeq);
+      expect(mockDoc.title).toBe("Paseo Context");
+      (globalThis as any).__PASEO_CONTEXT_RECEIVE__({ type: "paseo-context:result", nonce: "nonce-1", id: 1, value: "ok" });
+      await expect(first).resolves.toBe("ok");
+
+      // Subsequent frame reuses confirmed location.hash directly and clears title if it later times out.
+      const second = bridge.call("ping", { n: 2 });
+      expect(hashWrites).toHaveLength(2);
+      const secondCheck = expect(second).rejects.toThrow("acknowledgement timed out");
+      await vi.advanceTimersByTimeAsync(9000);
+      await secondCheck;
+      expect(mockDoc.title).toBe("Paseo Context");
+      expect(pushWrites).toHaveLength(0);
+    } finally {
+      delete (globalThis as any).document;
+      delete (globalThis as any).location;
+    }
   });
 });

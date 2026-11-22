@@ -2,10 +2,13 @@ interface Pending { resolve: (value: any) => void; reject: (error: Error) => voi
 interface NativeFrameItem { hash: (serial: number) => string; rpcId?: number; groupId?: number; retries: number }
 
 const MAX_PENDING = 128;
-const MAX_HISTORY_CHUNK = 16_384;
+// Stay below Chromium's 4096-char kMaxTitleChars so title mirroring never truncates chunks.
+const MAX_HISTORY_CHUNK = 3_072;
 const MAX_HISTORY_TOTAL = 2 * 1024 * 1024;
+const HISTORY_PROBE_TIMEOUT_MS = 600;
 const HISTORY_ACK_TIMEOUT_MS = 3000;
-const HISTORY_MAX_RETRIES = 1;
+const HISTORY_MAX_RETRIES = 2;
+const HISTORY_METHODS = ["replace", "hash", "push"] as const;
 
 const pending = new Map<number, Pending>();
 let serial = 0;
@@ -15,6 +18,7 @@ const isHistoryTransport = () => (globalThis as any).__PASEO_CONTEXT_TRANSPORT__
 const nativeQueue: NativeFrameItem[] = [];
 let nativeSending = false, nativeSerial = 0, nativeGroup = 0;
 let inFlightSeq: number | null = null;
+let historyConfirmed = false, nativeMethodIndex = 0;
 let nativeAckTimer: ReturnType<typeof setTimeout> | null = null;
 
 function clearAckTimer() {
@@ -34,6 +38,12 @@ function rejectPending(id: number | undefined, message: string) {
   request.reject(new Error(message));
 }
 
+function resetBridgeTitleIfIdle() {
+  if (!nativeQueue.length && typeof document !== "undefined" && document.title.startsWith("#paseo-context")) {
+    document.title = "Paseo Context";
+  }
+}
+
 function dropFrontFrame(reason: string) {
   const dropped = nativeQueue.shift();
   if (dropped?.groupId !== undefined) {
@@ -41,7 +51,21 @@ function dropFrontFrame(reason: string) {
       if (nativeQueue[i].groupId === dropped.groupId) nativeQueue.splice(i, 1);
     }
   }
+  resetBridgeTitleIfIdle();
   rejectPending(dropped?.rpcId, reason);
+}
+
+function writeHistoryFrame(frame: string, method: typeof HISTORY_METHODS[number]) {
+  if (typeof document !== "undefined") document.title = frame;
+  if (method === "hash" && typeof location !== "undefined") {
+    location.hash = frame;
+    return;
+  }
+  if (method === "push" && typeof history.pushState === "function") {
+    history.pushState(null, "", frame);
+    return;
+  }
+  history.replaceState(null, "", frame);
 }
 
 const pumpNative = () => {
@@ -51,21 +75,27 @@ const pumpNative = () => {
   const item = nativeQueue[0];
   const seq = ++nativeSerial;
   inFlightSeq = seq;
+  const method = HISTORY_METHODS[nativeMethodIndex % HISTORY_METHODS.length];
   try {
-    history.replaceState(null, "", item.hash(seq));
+    writeHistoryFrame(item.hash(seq), method);
   } catch {
     inFlightSeq = null;
+    if (!historyConfirmed) nativeMethodIndex = (nativeMethodIndex + 1) % HISTORY_METHODS.length;
     dropFrontFrame("Native bridge history write failed");
     nativeSending = false;
     if (nativeQueue.length) queueMicrotask(pumpNative);
     return;
   }
+  const timeoutMs = !historyConfirmed && item.retries < HISTORY_METHODS.length - 1
+    ? HISTORY_PROBE_TIMEOUT_MS
+    : HISTORY_ACK_TIMEOUT_MS;
   nativeAckTimer = setTimeout(() => {
     nativeAckTimer = null;
     if (!nativeSending || !nativeQueue.length) return;
     inFlightSeq = null;
     if (nativeQueue[0].retries < HISTORY_MAX_RETRIES) {
       nativeQueue[0].retries++;
+      if (!historyConfirmed) nativeMethodIndex = (nativeMethodIndex + 1) % HISTORY_METHODS.length;
       nativeSending = false;
       pumpNative();
       return;
@@ -73,15 +103,18 @@ const pumpNative = () => {
     dropFrontFrame("Native bridge acknowledgement timed out");
     nativeSending = false;
     pumpNative();
-  }, HISTORY_ACK_TIMEOUT_MS);
+  }, timeoutMs);
 };
 
 (globalThis as any).__PASEO_CONTEXT_ACK__ = (ackSeq?: string | number) => {
-  if (ackSeq !== undefined && inFlightSeq !== null && String(ackSeq) !== String(inFlightSeq)) return;
+  if (!nativeSending) return;
+  if (ackSeq !== undefined && String(ackSeq) !== String(inFlightSeq)) return;
   clearAckTimer();
-  if (nativeSending) nativeQueue.shift();
+  historyConfirmed = true;
+  nativeQueue.shift();
   inFlightSeq = null;
   nativeSending = false;
+  resetBridgeTitleIfIdle();
   pumpNative();
 };
 
@@ -154,6 +187,8 @@ window.addEventListener("pagehide", () => {
   pending.clear();
   nativeQueue.length = 0;
   inFlightSeq = null;
+  historyConfirmed = false;
+  nativeMethodIndex = 0;
   nativeSending = false;
 });
 export function action(name: string, payload: unknown = {}) {

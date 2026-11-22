@@ -1,2 +1,2 @@
-export const uiRevision = "29f85a808d845be8fe4abb780f012c09d8010e323d21262b8a532b002a0174c6";
-export const pluginVersion = "0.2.10";
+export const uiRevision = "34cd50f6f07b364821ce2ea8912104868b70794e8d6356c75ce30a97f1156849";
+export const pluginVersion = "0.2.11";
