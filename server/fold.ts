@@ -5,6 +5,7 @@ import { opsOfCall, opBearingTool, patchFiles, IMAGE_FILE_EXT } from "../shared/
 import { SessionFold, type UsageObservation } from "./meter";
 import { CollaborationLedger } from "./collaboration";
 import { messagesOf, toolKind, type Message } from "./normalize";
+import { AntigravityCalls, antigravityMessages, type AntigravityStep } from "./antigravity-log";
 import { count, parseArgs, record, text, timestamp, type RecordValue } from "./value";
 import { unionMs } from "./timing";
 import { usageKeys } from "./usage-fields";
@@ -12,6 +13,8 @@ import { StatisticsSpans } from "./statistics-spans";
 import { createHash, randomUUID } from "node:crypto";
 
 interface PendingRequest { boundary: number; seq: number; parts: Parts; start: number; anchor: number }
+type RequestTiming = Partial<Pick<Request,
+  "estimatedModelMs" | "estimatedTtftMs" | "estimatedModelStart" | "estimatedModelEnd" | "providerTiming">>;
 const nodeHash = (value: string) => createHash("sha256").update(value).digest("hex");
 
 export class ContextFold {
@@ -40,6 +43,8 @@ export class ContextFold {
   private active = emptyParts();
   private pending: PendingRequest | null = null;
   private calls = new Map<string, { node: ContextNode; command?: Command; files: FileActivity[]; skill?: string }>();
+  private toolCallCount = 0;
+  private antigravityCalls?: AntigravityCalls;
   private requestIds = new Map<string, number>();
   private claudeNodes = new Map<string, Map<string, number>>();
   private turnIds = new Set<string>();
@@ -64,7 +69,8 @@ export class ContextFold {
   }
 
   constructor(readonly provider: string, readonly epoch: string = randomUUID()) {
-    this.meter = new SessionFold(provider === "claude" ? "claude" : "codex");
+    this.meter = new SessionFold(provider === "claude" || provider === "antigravity" ? provider : "codex");
+    if (provider === "antigravity") this.antigravityCalls = new AntigravityCalls();
   }
   private tally(map: Map<string, Tally>, name: string, at: number) {
     if (!name) return;
@@ -101,8 +107,8 @@ export class ContextFold {
     return { boundary: this.nodes.length, seq: this.line * 1_000_000 + 1, parts: { ...this.active },
       start: anchor && this.boundaryAt > 0 ? this.boundaryAt : at, anchor };
   }
-  private add(message: Message, at: number, row: RecordValue, replayed: boolean) {
-    if (!message.text && !message.tool && !message.images) return;
+  private add(message: Message, at: number, row: RecordValue, replayed: boolean, metadataOnly: boolean) {
+    if (!message.text && !message.tool && !message.images && !(this.antigravityCalls && message.callId)) return;
     if (!replayed && this.provider === "timeline" && message.category === "calls"
       && message.callId && this.calls.has(message.callId)) return;
     if (this.provider === "claude") {
@@ -131,7 +137,7 @@ export class ContextFold {
     if (!replayed && ["assistant", "reasoning", "calls"].includes(message.category) && this.pending === null) {
       this.pending = this.startRequest(at);
     }
-    const tokens = message.images ? 1024 * message.images : estimateTextTokens(message.text);
+    const tokens = metadataOnly ? 0 : message.images ? 1024 * message.images : estimateTextTokens(message.text);
     const node: ContextNode = {
       id: this.nodes.length, seq: this.line * 1_000_000 + this.slot++, line: this.line, block: message.block, category: message.category, time: at,
       tokens, title: message.title || message.category, preview: message.text.replace(/\s+/g, " ").slice(0, 180),
@@ -143,28 +149,45 @@ export class ContextFold {
     let loadedSkill: string | undefined;
     if (message.category === "tool" && message.callId) {
       const call = this.calls.get(message.callId);
+      const start = message.toolTimes?.start, end = message.toolTimes?.end;
+      const explicit = start !== undefined && end !== undefined && end >= start;
+      const paired = !this.antigravityCalls && call && call.node.time > 0 && at >= call.node.time
+        && (this.provider !== "timeline" || call.node.line !== this.line);
+      const duration = message.durationMs ?? (explicit ? end - start : paired ? at - call.node.time : undefined);
+      if (start !== undefined) node.toolStartedAt = start;
+      if (end !== undefined && (start === undefined || end >= start)) node.toolEndedAt = end;
+      if (!replayed && !message.pending && duration !== undefined) {
+        node.toolDurationMs = duration;
+        this.toolDurations.set(message.callId, duration);
+        if (explicit) this.toolIntervals.set(message.callId, { start, end, kind: "tools" });
+        else if (paired) this.toolIntervals.set(message.callId, { start: call.node.time, end: at, kind: "tools" });
+      }
       if (call) {
         loadedSkill = call.skill;
         node.tool = call.node.tool;
         node.title = call.node.title;
         node.source = call.node.source;
-        const paired = !replayed && call.node.time > 0 && at >= call.node.time
-          && (this.provider !== "timeline" || call.node.line !== this.line);
-        const duration = message.durationMs ?? (paired ? at - call.node.time : undefined);
-        if (!replayed && duration !== undefined) {
-          node.toolDurationMs = duration;
-          this.toolDurations.set(message.callId, duration);
-          if (paired) this.toolIntervals.set(message.callId, { start: call.node.time, end: at, kind: "tools" });
+        if (!replayed && start !== undefined) {
+          call.node.toolStartedAt = start;
+          call.node.time = start;
+          if (call.command) call.command.time = start;
+          for (const file of call.files) file.time = start;
+          const tally = call.node.tool && this.tools.get(call.node.tool);
+          if (tally) tally.last = Math.max(tally.last, start);
+          for (const program of call.command?.programs ?? []) {
+            const tally = this.programs.get(program)!;
+            tally.last = Math.max(tally.last, start);
+          }
         }
-        if (!replayed) for (const file of call.files) file.error = message.error === true;
-        if (!replayed && call.command) {
+        if (!replayed && !message.pending) for (const file of call.files) file.error = message.error === true;
+        if (!replayed && !message.pending && call.command) {
           const c = call.command;
           const code = /(?:exit(?:ed)?(?:\s+with)?(?:\s+code)?[=: ]+|Process exited with code )(-?\d+)/i.exec(message.text);
           const background = /Process running with session ID|still running|background job/i.test(message.text);
           c.exit = code ? Number(code[1]) : null;
           c.status = background ? "running" : message.error || (c.exit !== null && c.exit !== 0) ? "failed" : "completed";
-          c.duration = background ? null : message.durationMs
-            ?? (c.time > 0 && at >= c.time && (this.provider !== "timeline" || paired) ? at - c.time : null);
+          c.duration = background ? null : duration
+            ?? (!this.antigravityCalls && c.time > 0 && at >= c.time && (this.provider !== "timeline" || paired) ? at - c.time : null);
           c.outputNode = node.id;
           c.outputNodes ??= [];
           if (!c.outputNodes.includes(node.id)) c.outputNodes.push(node.id);
@@ -181,8 +204,8 @@ export class ContextFold {
     if (!replayed) {
       this.images += message.images ?? 0;
       this.collaboration.apply(message, node.id, at);
-      if (message.category === "tool" && message.callId) this.toolResults.set(message.callId, node);
-      if (message.category === "calls" && message.tool) this.call(node, message, at);
+      if (message.category === "tool" && message.callId && !message.pending) this.toolResults.set(message.callId, node);
+      if (message.category === "calls" && (message.tool || this.antigravityCalls && message.callId)) this.call(node, message, at);
       if (message.category === "inject") this.event("inject", at, message.title, node.preview);
     }
     if (message.category === "tool" && loadedSkill) {
@@ -190,7 +213,7 @@ export class ContextFold {
       node.category = "skill";
       this.active.tool -= tokens;
       this.active.skill += tokens;
-      if (!replayed) {
+      if (!replayed && !message.pending) {
         this.tally(this.skills, name, at);
         this.event("skill", at, name, node.preview);
       }
@@ -203,7 +226,8 @@ export class ContextFold {
     return m ? `mcp:${m[1]}` : name.includes(".") ? name.split(".").slice(0, -1).join(".") : "provider";
   }
   private call(node: ContextNode, message: Message, at: number) {
-    const name = message.tool!, kind = toolKind(name), args = message.args ?? parseArgs(message.text);
+    const name = message.tool || "", kind = toolKind(name), args = message.args ?? parseArgs(message.text);
+    this.toolCallCount++;
     this.tally(this.tools, name, at);
     const files: FileActivity[] = opsOfCall({ seq: node.id, tool: kind, argsRaw: opBearingTool(kind) ? JSON.stringify(args) : undefined, time: at }).map((f) => ({
       id: node.id, time: at, path: f.path, kind: IMAGE_FILE_EXT.test(f.path) ? "image" : f.kind,
@@ -231,12 +255,13 @@ export class ContextFold {
     const skill = skillPath ? skillPath.replace(/[/\\]SKILL\.md$/i, "").split(/[/\\]/).at(-1) : /(?:^|[._])skill$/i.test(name) ? text(args.name) || "skill" : undefined;
     if (message.callId) this.calls.set(message.callId, { node, command, files, skill });
   }
-  private request(observation: UsageObservation, at: number, model: string, timing: Partial<Pick<Request, "estimatedModelMs" | "estimatedTtftMs" | "estimatedModelStart" | "estimatedModelEnd">>) {
+  private request(observation: UsageObservation, at: number, model: string, timing: RequestTiming,
+    native?: { start: number; checkpoint: boolean }) {
     const { id, usage, sources } = observation;
     const fields = usageKeys.filter((field) => sources[field] !== undefined);
     const previousIndex = this.requestIds.get(id);
     const index = previousIndex ?? this.requests.length;
-    if (sources.input === "reported" && index >= this.contextFloor && index >= this.contextRequest) {
+    if (!native?.checkpoint && sources.input === "reported" && index >= this.contextFloor && index >= this.contextRequest) {
       this.contextTokens = usage.input;
       this.contextRequest = index;
     }
@@ -253,25 +278,35 @@ export class ContextFold {
         previous.duration = at > previous.time ? at - previous.time : null;
         this.pending = null;
       }
+      if (native) {
+        if (at > 0) previous.usageAt = at;
+        previous.response = this.nodes.slice(previous.boundary).filter((n) => ["assistant", "calls"].includes(n.category)).map((n) => n.preview).join(" · ").slice(0, 240);
+        previous.duration = timing.providerTiming?.modelMs ?? previous.duration;
+        this.pending = null;
+      }
       return;
     }
     const pending = this.pending ?? this.startRequest(at);
     const response = this.nodes.slice(pending.boundary).filter((n) => ["assistant", "calls"].includes(n.category)).map((n) => n.preview).join(" · ").slice(0, 240);
-    const duration = at > pending.start ? at - pending.start : null;
-    this.requests.push({ id, index: this.requests.length + 1, turn: Math.max(1, this.turn), time: pending.start || at,
-      boundary: pending.boundary, seq: pending.seq, parts: pending.parts, usage, model: model || this.model,
+    const start = native ? native.start || at : pending.start || at;
+    const duration = native ? timing.providerTiming?.modelMs ?? (at > start && start > 0 ? at - start : null)
+      : at > pending.start ? at - pending.start : null;
+    this.requests.push({ id, index: this.requests.length + 1, turn: Math.max(1, this.turn), time: start,
+      boundary: pending.boundary, seq: pending.seq, parts: pending.parts, usage, model: model || (native?.checkpoint ? "" : this.model),
       duration, prompt: this.lastPrompt, response, costUsd: null, usageFields: fields, usageSources: sources,
       ...(at > 0 ? { usageAt: at } : {}), ...timing });
     this.requestIds.set(id, this.requests.length - 1);
     this.lastAnchor = Math.max(this.lastAnchor, pending.anchor);
     this.pending = null;
   }
-  apply(value: unknown) {
+  apply(value: unknown, native?: AntigravityStep, metadataOnly = false) {
     this.line++;
     this.slot = 2;
-    const row = record(value), p = record(row.payload), at = timestamp(row.timestamp ?? row.createdAt);
+    const row = record(value), p = record(row.payload);
+    const antigravity = this.antigravityCalls;
+    const at = native?.at ?? timestamp(row.timestamp ?? row.createdAt ?? row.created_at);
     if (this.provider === "claude" && (row.isSidechain === true || row.isApiErrorMessage === true)) return;
-    if (this.provider === "codex" || this.provider === "claude") this.meter.apply(row, this.line);
+    if (this.provider === "codex" || this.provider === "claude" || antigravity) this.meter.apply(row, this.line, native);
     if (row.type === "turn_context") {
       const turnId = text(p.turn_id) || `context:${this.line}`;
       this.turnIds.add(turnId); this.turn = this.turnIds.size;
@@ -295,16 +330,24 @@ export class ContextFold {
         this.event("prune", at, "Conversation rollback", `${n} turns removed from active context`);
       }
     }
+    const checkpoint = !!antigravity && row.type === "CHECKPOINT";
+    const checkpointRequest = checkpoint && this.meter.lastUsage ? this.startRequest(at) : null;
+    if (checkpointRequest) checkpointRequest.seq = this.line * 1_000_000 - 1;
+    const agyUsageAt = native?.type === "PLANNER_RESPONSE" || native?.type === "CHECKPOINT" ? native.usageAt : undefined;
     if (row.type === "compacted" || (row.type === "system" && row.subtype === "compact_boundary")
-      || (row.type === "compaction" && row.status === "completed")) this.compact(at);
+      || (row.type === "compaction" && row.status === "completed") || checkpoint) this.compact(checkpoint ? agyUsageAt ?? at : at);
     const info = record(p.info);
     if (count(info.model_context_window) > 0) this.contextWindow = count(info.model_context_window);
     if (count(p.model_context_window) > 0) this.contextWindow = count(p.model_context_window);
-    const messages = messagesOf(row, this.provider);
+    const providerTiming = this.meter.lastProviderTiming;
+    const messages = antigravity ? antigravity.link(row, antigravityMessages(row, metadataOnly), this.line, native)
+      : messagesOf(row, this.provider);
     const replayed = row.type === "compacted" && Array.isArray(p.replacement_history);
-    if (!replayed && messages.some((m) => m.category === "user")) {
+    const hasUser = !replayed && messages.some((message) => message.category === "user");
+    if (hasUser) {
       this.humanInputs++;
       if (this.provider !== "codex") this.turn++;
+      if (antigravity) this.lastPrompt = "";
     }
     if (this.provider === "claude" && row.type === "assistant" && text(record(row.message).id)) {
       const previous = this.requestIds.get(text(record(row.message).id));
@@ -320,44 +363,60 @@ export class ContextFold {
       this.active.tools = 0;
     }
     const firstNode = this.nodes.length;
-    for (const message of messages) this.add(message, at, row, replayed);
+    for (const message of messages) {
+      const time = message.toolTimes?.end ?? providerTiming?.end ?? (checkpoint ? agyUsageAt : undefined) ?? at;
+      this.add(message, time, row, replayed, metadataOnly);
+    }
     if (row.type === "turn_context" && Array.isArray(p.tools)) this.toolEpochs.push({
       seq: this.line * 1_000_000 + 1, time: at,
       nodeIds: this.nodes.slice(firstNode).filter((node) => node.category === "tools").map((node) => node.id),
     });
-    if (!replayed && messages.some((message) => message.category === "user" || message.category === "tool" && this.provider !== "timeline")) {
+    if (hasUser || !replayed && this.provider !== "timeline" && messages.some((message) => message.category === "tool")) {
       this.boundaryAt = at;
       this.boundaryLine = this.line;
     }
     const stats = this.meter.stats;
     this.modelMs = stats.modelMs;
     const measured = this.meter.lastTiming;
-    const timing = measured ? { estimatedModelMs: measured.modelMs, estimatedModelStart: measured.start,
+    const timing: RequestTiming = providerTiming ? { providerTiming } : measured ? { estimatedModelMs: measured.modelMs, estimatedModelStart: measured.start,
       estimatedModelEnd: measured.end, ...(measured.ttftMs === undefined ? {} : { estimatedTtftMs: measured.ttftMs }) } : {};
     const observation = this.meter.lastUsage;
+    const agyModel = antigravity ? text(row.model) : "";
+    if (agyModel) this.observeModel(agyModel, at);
     if (observation) {
-      const model = text(this.provider === "claude" ? record(row.message).model : p.model);
+      const model = antigravity ? agyModel : text(this.provider === "claude" ? record(row.message).model : p.model);
       if (this.provider === "claude") this.observeModel(model, at);
-      this.request(observation, at, model, timing);
+      if (checkpointRequest) this.pending = checkpointRequest;
+      this.request(observation, antigravity ? agyUsageAt ?? providerTiming?.end ?? timestamp(row.completed_at) : at,
+        model, timing, antigravity ? { start: providerTiming?.start ?? at, checkpoint } : undefined);
     }
     if (row.type === "event_msg" && p.type === "thread_settings_applied") this.observeModel(text(p.model), at);
     const close = row.type === "event_msg" && ["task_complete", "task_completed", "turn_aborted"].includes(text(p.type))
       ? p.type === "turn_aborted" ? "abort" : "complete"
       : row.type === "system" && row.subtype === "turn_duration" ? "complete" : undefined;
-    this.statistics.observe({ line: this.line, at, turn: this.turn, firstNode,
+    const statisticsAt = messages.reduce((latest, message) => Math.max(latest, message.toolTimes?.end ?? 0),
+      Math.max(at, providerTiming?.end ?? 0, agyUsageAt ?? 0));
+    this.statistics.observe({ line: this.line, at: statisticsAt,
+      turn: this.turn, firstNode,
       nodes: replayed ? [] : this.nodes.slice(firstNode), requestId: observation?.id,
       responseKey: this.provider === "claude" && row.type === "assistant" ? text(record(row.message).id) || undefined : undefined,
-      turnStart: row.type === "turn_context" || row.type === "event_msg" && p.type === "task_started", close });
+      turnStart: row.type === "turn_context" || row.type === "event_msg" && p.type === "task_started"
+        || !!antigravity && hasUser,
+      close: close ?? (antigravity && row.type === "ERROR_MESSAGE" ? "interrupt" : undefined) });
   }
   summary(agent: Agent, source: Summary["source"] = "native"): Summary {
     const s = this.meter.stats, usage = { ...this.meter.usage }, usageSources = { ...this.meter.usageSources };
     const sorted = (map: Map<string, Tally>) => [...map.values()].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
-    const intervals: NonNullable<Summary["intervals"]> = [...this.toolIntervals.values(),
-      ...this.requests.filter((r) => r.estimatedModelStart !== undefined && r.estimatedModelEnd !== undefined)
-        .map((r) => ({ start: r.estimatedModelStart!, end: r.estimatedModelEnd!, kind: "model" as const }))];
+    const intervals: NonNullable<Summary["intervals"]> = [...this.toolIntervals.values()];
+    for (const request of this.requests) {
+      const start = request.providerTiming?.start ?? request.estimatedModelStart;
+      const end = request.providerTiming?.end ?? request.estimatedModelEnd;
+      if (start !== undefined && end !== undefined && end >= start) intervals.push({ start, end, kind: "model" });
+    }
     return { agent: { ...agent, model: this.model || agent.model }, source, usage, usageSources,
-      turns: s.turns || this.turn || this.humanInputs, steps: s.steps || this.requests.length, humanInputs: this.humanInputs,
-      toolCalls: [...this.tools.values()].reduce((n, t) => n + t.count, 0), images: this.images,
+      turns: this.antigravityCalls ? this.humanInputs || s.turns : s.turns || this.turn || this.humanInputs,
+      steps: s.steps || this.requests.length, humanInputs: this.humanInputs,
+      toolCalls: this.toolCallCount, images: this.images,
       contextTokens: this.contextTokens, contextWindow: this.contextWindow, maxOutput: this.maxOutput,
       ...(this.contextTokens === null ? {} : { contextSource: "reported" }),
       parts: { ...this.active }, costUsd: null, costComplete: false,
@@ -372,6 +431,7 @@ export class ContextFold {
   private activity(): Summary["activity"] {
     const days = new Map<number, { time: number; tools: Map<string, Tally>; skills: Map<string, Tally>; programs: Map<string, Tally> }>();
     const add = (kind: "tools" | "skills" | "programs", name: string, at: number) => {
+      if (!(at > 0)) return;
       const date = new Date(at); date.setHours(0, 0, 0, 0); const time = date.getTime();
       const day = days.get(time) ?? { time, tools: new Map(), skills: new Map(), programs: new Map() };
       this.tally(day[kind], name, at); days.set(time, day);

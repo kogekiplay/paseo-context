@@ -1,7 +1,8 @@
 import { emptyStats, type Stats } from "./meter-stats";
-import { emptyUsage, type Usage } from "../shared/contracts";
+import { emptyUsage, type ProviderTiming, type Usage } from "../shared/contracts";
 import type { UsageSource, UsageSources } from "../shared/core/types";
-import { cumulativeDelta, requestUsage, sourcesOfUsage, usageBuckets, usageKeys } from "./usage-fields";
+import { cumulativeDelta, requestUsage, sourcesOfUsage, usageBuckets, usageKeys, type NativeUsageProvider } from "./usage-fields";
+import { antigravityStepIndex, mergeAntigravityUsage, type AntigravityStep } from "./antigravity-log";
 import { count, record, text, timestamp, type RecordValue } from "./value";
 
 export interface UsageObservation {
@@ -18,6 +19,7 @@ export class SessionFold {
   readonly usage = emptyUsage();
   readonly usageSources: UsageSources = {};
   lastTiming: { start: number; end: number; modelMs: number; ttftMs?: number } | null = null;
+  lastProviderTiming: ProviderTiming | null = null;
   lastUsage: UsageObservation | null = null;
   private turn = "initial";
   private turns = new Set<string>();
@@ -38,8 +40,10 @@ export class SessionFold {
   private chain = new Map<string, { parent: string | null; at: number; attachment: boolean }>();
   private claudeStarts = new Map<string, { start: number; first: number | null }>();
   private claudeTtft = new Set<string>();
+  private antigravityResponses = new Map<string, string>();
+  private antigravityTiming = new Map<string, ProviderTiming>();
 
-  constructor(readonly provider: "codex" | "claude") {
+  constructor(readonly provider: NativeUsageProvider) {
     this.stats = emptyStats(provider);
   }
 
@@ -104,12 +108,43 @@ export class SessionFold {
     return usage;
   }
 
-  apply(value: unknown, line: number) {
+  apply(value: unknown, line: number, native?: AntigravityStep) {
     this.lastTiming = null;
+    this.lastProviderTiming = null;
     this.lastUsage = null;
     const row = record(value);
     if (this.provider === "codex") this.codex(row, line);
-    else this.claudeRow(row, line);
+    else if (this.provider === "claude") this.claudeRow(row, line);
+    else this.antigravityRow(row, line, native);
+  }
+
+  private antigravityRow(row: RecordValue, line: number, native?: AntigravityStep) {
+    const index = antigravityStepIndex(row.step_index) ?? `line:${line}`;
+    if (row.type === "USER_INPUT") {
+      if (!row.source || row.source === "USER_EXPLICIT") this.turn = `agy:${index}`;
+      return;
+    }
+    if (row.type !== "PLANNER_RESPONSE" && row.type !== "CHECKPOINT") return;
+    const facts = native?.type === "PLANNER_RESPONSE" || native?.type === "CHECKPOINT" ? native : undefined;
+    const buckets = mergeAntigravityUsage(usageBuckets(row, "antigravity"), facts?.usage);
+    if (row.type === "CHECKPOINT" && !Object.keys(buckets).length) return;
+    const responseId = facts?.responseId || text(row.response_id);
+    const stepId = `agy:${index}`;
+    const id = responseId ? this.antigravityResponses.get(responseId) ?? stepId : stepId;
+    if (responseId) this.antigravityResponses.set(responseId, id);
+    const usage = this.recordUsage(id, buckets, "reported");
+    const prior = this.antigravityTiming.get(id), timing = facts?.timing;
+    if (!timing && !prior) return;
+    const modelMs = timing?.modelMs ?? prior?.modelMs;
+    const start = timing?.start ?? prior?.start ?? (timestamp(row.created_at) || undefined);
+    const end = timing?.end ?? (start !== undefined && timing?.modelMs !== undefined ? start + timing.modelMs : prior?.end);
+    const first = timing?.ttftMs ?? prior?.ttftMs;
+    const ttftMs = first !== undefined && (modelMs === undefined || first <= modelMs) ? first : undefined;
+    if (modelMs !== undefined) this.updateTiming(id, modelMs, usage.output);
+    this.stats.ttftMs += (ttftMs ?? 0) - (prior?.ttftMs ?? 0);
+    this.stats.ttftSteps += Number(ttftMs !== undefined) - Number(prior?.ttftMs !== undefined);
+    this.lastProviderTiming = { start, end, modelMs, ttftMs };
+    this.antigravityTiming.set(id, this.lastProviderTiming);
   }
   private codex(row: RecordValue, line: number) {
     const p = record(row.payload),

@@ -34,8 +34,10 @@ export function spansOf(intervals: readonly Interval[]): TimingSpan[] {
 }
 export function timingOf(s: Summary): TimingTotals {
   const tools = (s.intervals ?? []).filter((row) => row.kind === "tools");
-  const toolBusyMs = unionMs(tools), modelMs = Math.min(s.modelMs, Math.max(0, s.wallMs - toolBusyMs));
-  const ttftMs = Math.min(modelMs, s.ttftMs ?? 0);
+  const toolBusyMs = unionMs(tools);
+  const providerTiming = s.agent.provider === "antigravity" && s.source === "native";
+  const modelMs = providerTiming ? s.modelMs : Math.min(s.modelMs, Math.max(0, s.wallMs - toolBusyMs));
+  const ttftMs = providerTiming ? s.ttftMs ?? 0 : Math.min(modelMs, s.ttftMs ?? 0);
   return { wallMs: s.wallMs, ttftMs, genMs: Math.max(0, modelMs - ttftMs), calls: s.steps,
     toolsMs: s.toolMs, toolBusyMs, toolCalls: s.toolCalls, tools: {},
     speedTokens: s.timedOutputTokens ?? 0, speedMs: s.modelMs };

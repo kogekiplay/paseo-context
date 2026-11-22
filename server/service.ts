@@ -13,16 +13,20 @@ import { ensureActive, nextCursor } from "./paging";
 import { TimelineReader } from "./timeline";
 import type { NativeLocation } from "./native-paths";
 import type { NativeChild } from "./collaboration";
+import { antigravityConversationId } from "./antigravity-log";
 
 const CORPUS_TTL_MS = 10_000;
 const FIRST_PAINT_BUDGET_MS = 400;
 const SCAN_CONCURRENCY = 4;
 const DERIVED_BYTES = 48 * 1024 * 1024;
 type LedgerRequest = Pick<Request, "time" | "usageAt" | "turn" | "usage" | "usageFields" | "usageSources" | "parts" | "costUsd">;
-interface Ledger { at: number; key: string; summary: Summary; requests: LedgerRequest[] }
+interface Ledger { at: number; key: string; summary: Summary; requests: LedgerRequest[]; retry?: boolean }
 interface Reader {
-  read(agent: Agent, location?: NativeLocation | null): Promise<{ entry: { fold: ContextFold }; bodies?: ReadBodies; residentBytes?: number } | null>;
+  read(agent: Agent, location?: NativeLocation | null): Promise<{
+    entry: { fold: ContextFold }; bodies?: ReadBodies; residentBytes?: number; metadataOnly?: boolean; companionFailed?: boolean;
+  } | null>;
   locate(agent: Agent): Promise<string | null>;
+  locateSource?(agent: Agent): Promise<NativeLocation | null>;
   locateForScan?(agents: readonly Agent[]): Promise<(agent: Agent) => Promise<NativeLocation | null>>;
   content(agent: Agent, nodeId: number): Promise<string>;
   clear(): void;
@@ -36,6 +40,7 @@ export interface LoadedSession {
   foldRevision?: number;
   bodies?: ReadBodies;
   residentBytes?: number;
+  companionFailed?: boolean;
 }
 const PARENT = "paseo.parent-agent-id";
 const nativeId = (provider: string, sessionId: string) => `native:${provider}:${sessionId}`;
@@ -67,9 +72,10 @@ interface Corpus {
 }
 
 export function agentOf(a: PaseoAgent): Agent {
+  const handle = a.persistence?.nativeHandle ?? a.persistence?.sessionId ?? a.runtimeInfo?.sessionId ?? null;
   return { id: a.id, workspaceId: a.workspaceId ?? null, parentId: a.labels[PARENT] ?? null,
     title: a.title || a.id, cwd: a.cwd, provider: a.provider, model: a.runtimeInfo?.model ?? a.model ?? "",
-    sessionId: a.persistence?.nativeHandle ?? a.persistence?.sessionId ?? a.runtimeInfo?.sessionId ?? null,
+    sessionId: a.provider === "antigravity" ? antigravityConversationId(handle) ?? handle : handle,
     createdAt: timestamp(a.createdAt), updatedAt: timestamp(a.updatedAt),
     archived: !!a.archivedAt, running: a.status === "running" || a.status === "initializing" };
 }
@@ -138,7 +144,8 @@ export class ContextService {
     const fold = native?.entry.fold ?? timeline!.fold;
     ensureActive(this.lifetime.signal);
     const cached = this.derived.get(agent.id);
-    if (cached?.fold === fold && cached.foldRevision === fold.revision && cached.key === key) {
+    if (cached?.fold === fold && cached.foldRevision === fold.revision && cached.key === key
+      && cached.data.companionFailed === native?.companionFailed) {
       cached.at = Date.now();
       this.derived.delete(agent.id);
       this.derived.set(agent.id, cached);
@@ -148,11 +155,12 @@ export class ContextService {
     const summary = fold.summary(agent, native ? "native" : "timeline");
     const last = raw.lastUsage;
     if (last?.contextWindowMaxTokens !== undefined) summary.contextWindow = last.contextWindowMaxTokens;
-    if (last?.contextWindowUsedTokens !== undefined) {
+    if (last?.contextWindowUsedTokens !== undefined && (agent.provider !== "antigravity" || summary.contextTokens === null)) {
       summary.contextTokens = last.contextWindowUsedTokens;
       summary.contextSource = "paseo";
     }
     if (!native) summary.notices.push("usage-unavailable");
+    if (native?.metadataOnly) summary.notices.push("native-metadata-only");
     const requests = this.pricing.priceRequests(agent.provider, fold.requests);
     const complete = requests.every((r) => r.costUsd !== null);
     summary.costUsd = requests.length && complete ? requests.reduce((n, r) => n + r.costUsd!, 0) : null;
@@ -172,7 +180,7 @@ export class ContextService {
     }
     const bytes = native?.residentBytes ?? (timeline ? this.timeline.weight(timeline) : fold.residentBytes);
     const data: LoadedSession = { agent, fold, summary, requests, revision, foldRevision: fold.revision, residentBytes: bytes,
-      bodies: native?.bodies ?? (timeline ? this.timeline.bodyReader(timeline) : undefined) };
+      bodies: native?.bodies ?? (timeline ? this.timeline.bodyReader(timeline) : undefined), companionFailed: native?.companionFailed };
     if (!this.closed) {
       this.derived.delete(agent.id);
       if (bytes <= DERIVED_BYTES) this.derived.set(agent.id, { fold, foldRevision: fold.revision, key, at: Date.now(), data, bytes });
@@ -210,19 +218,19 @@ export class ContextService {
   }
   private async ledger(raw: PaseoAgent, paseo: PaseoApi, previous?: Ledger, locate?: (agent: Agent) => Promise<NativeLocation | null>) {
     const agent = agentOf(raw);
-    const location = locate ? await locate(agent) : undefined;
+    const location = locate ? await locate(agent) : await this.reader.locateSource?.(agent);
     const path = location === undefined ? await this.reader.locate(agent) : location?.path;
     const source = path ? await stat(path) : null;
     ensureActive(this.lifetime.signal);
     const key = JSON.stringify([agent, raw.lastUsage, path, source?.dev, source?.ino, source?.size,
-      source?.mtimeMs, source?.ctimeMs, this.pricing.revision]);
+      source?.mtimeMs, source?.ctimeMs, location?.antigravity?.database?.fingerprint, this.pricing.revision]);
     const ttl = path ? 600_000 : 15_000;
-    const valid = (entry: Ledger | undefined): entry is Ledger => entry?.key === key && Date.now() - entry.at < ttl;
+    const valid = (entry: Ledger | undefined): entry is Ledger => entry?.key === key && !entry.retry && Date.now() - entry.at < ttl;
     const cached = this.summaries.get(raw.id);
     if (valid(previous)) return previous;
     if (valid(cached)) return cached;
     const data = await this.load(raw, paseo, location);
-    const value: Ledger = { at: Date.now(), key, summary: data.summary,
+    const value: Ledger = { at: Date.now(), key, summary: data.summary, retry: data.companionFailed,
       requests: data.requests.map(({ time, usageAt, turn, usage, usageFields, usageSources, parts, costUsd }) =>
         ({ time, usageAt, turn, usage, usageFields, usageSources, parts, costUsd })) };
     if (!this.closed) {

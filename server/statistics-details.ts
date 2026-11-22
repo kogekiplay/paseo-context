@@ -4,6 +4,7 @@ import { parseArgs, text } from "./value";
 import type { StatsRequestDetails } from "../shared/core/stats-contract";
 import { statisticsRow } from "./statistics-rows";
 import { CALL_LIMIT } from "../shared/core/stats-tools";
+import { antigravityArgs } from "./antigravity-log";
 
 const PREVIEW_LIMIT = 16000;
 
@@ -19,6 +20,11 @@ export async function statisticsDetails(data: Loaded, requestId: string, content
   if (!row) throw new Error("Request is no longer available");
   const { nodes, results, revision } = row;
   const selected = nodes.filter((node) => node.category === "calls").slice(0, CALL_LIMIT);
+  if (data.summary.notices.includes("native-metadata-only")) {
+    return { requestId, contentRevision: revision, answerBody: null, answerTruncated: false,
+      calls: selected.map((node) => ({ callId: node.callId ?? `node:${node.id}`, args: null, text: null,
+        chars: null, lines: null, truncated: false, before: null, after: null })) };
+  }
   const argsIds = new Set(selected.map((node) => node.id));
   const answerNodes = nodes.filter((node) => node.category === "assistant");
   const answerIds: number[] = [];
@@ -33,8 +39,9 @@ export async function statisticsDetails(data: Loaded, requestId: string, content
     return result ? [result.id] : [];
   });
   const ids = [...argsIds, ...resultIds, ...answerIds];
+  const parseCall = data.fold.provider === "antigravity" ? antigravityArgs : parseArgs;
   const project = (id: number, body: string) => {
-    const parsed = argsIds.has(id) ? parseArgs(body) : {};
+    const parsed = argsIds.has(id) ? parseCall(body) : {};
     return {
       text: body.slice(0, argsIds.has(id) ? 2000 : PREVIEW_LIMIT), chars: body.length,
       lines: argsIds.has(id) ? null : lineCount(body),

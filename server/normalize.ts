@@ -1,19 +1,22 @@
 import type { Category } from "../shared/contracts";
+import { antigravityMessages, type ToolTimes } from "./antigravity-log";
 import { parseArgs, printable, record, text, type RecordValue } from "./value";
 
 export interface Message {
   category: Category; title: string; text: string; block: number;
   tool?: string; callId?: string; args?: RecordValue; error?: boolean; images?: number; durationMs?: number;
+  toolTimes?: ToolTimes; pending?: boolean;
 }
 export function toolKind(name: string): string {
   const n = name.split(".").at(-1)!.replace(/^mcp__[^_]+__/, "").toLowerCase();
-  if (["exec_command", "shell_command", "shell", "bash", "terminal"].includes(n)) return "bash";
+  if (["exec_command", "shell_command", "shell", "bash", "terminal", "run_command"].includes(n)) return "bash";
   if (["powershell", "pwsh"].includes(n)) return "pwsh";
   return ({ readfile: "read", read_file: "read", read: "read", write: "write", writefile: "write",
     write_file: "write", edit: "edit", edit_file: "edit", multiedit: "edit", grep: "grep",
     glob: "glob", view_image: "read_image", apply_patch: "patch" } as Record<string, string>)[n] ?? n;
 }
 export function messagesOf(row: RecordValue, provider: string): Message[] {
+  if (provider === "antigravity") return antigravityMessages(row);
   const payload = record(row.payload);
   if (provider === "codex") {
     if (row.type === "session_meta") {

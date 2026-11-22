@@ -8,6 +8,7 @@ import { observedUsage, usageSourceOf } from "../shared/usage";
 /** Project captured Paseo/native facts onto the original table's static model. */
 export function statisticsOf(data: Loaded): StatsSnapshot {
   const { fold, summary } = data;
+  const antigravity = summary.source === "native" && summary.agent.provider === "antigravity";
   const hasUsage = !summary.notices.includes("usage-unavailable") && summary.source !== "unavailable";
   const commands = new Map(fold.commands.map((command) => [command.id, command]));
   const filesByNode = new Map<number, typeof fold.files>();
@@ -37,8 +38,9 @@ export function statisticsOf(data: Loaded): StatsSnapshot {
         before: null, after: null, args: null, inner: false,
         text: null, truncated: false,
         ms: duration,
-        startedAt: node.time > 0 && (summary.source !== "timeline" || paired) ? node.time : null,
-        endedAt: paired ? result.time : null,
+        startedAt: result?.toolStartedAt ?? node.toolStartedAt
+          ?? (!antigravity && node.time > 0 && (summary.source !== "timeline" || paired) ? node.time : null),
+        endedAt: result?.toolEndedAt ?? (!antigravity && paired ? result.time : null),
       };
     });
     const measuredTools = calls.filter((call) => call.ms !== null);
@@ -49,13 +51,16 @@ export function statisticsOf(data: Loaded): StatsSnapshot {
     for (const call of calls) if (call.name) counts.set(call.name, (counts.get(call.name) ?? 0) + 1);
     const previous = steps.get(span.turn) ?? [];
     const startTime = request?.time || span.start || null;
-    const end = span.end ?? (request?.duration !== null && request?.duration !== undefined && request.time > 0 ? request.time + request.duration : null);
+    const requestEnd = request?.duration !== null && request?.duration !== undefined && request.time > 0 ? request.time + request.duration : null;
+    const end = antigravity ? request?.providerTiming?.end ?? request?.usageAt ?? requestEnd : span.end ?? requestEnd;
     const toolEnd = calls.reduce<number | null>((max, call) => call.endedAt === null ? max : Math.max(max ?? call.endedAt, call.endedAt), null);
-    const endTime = end === null ? null : Math.max(end, toolEnd ?? end);
-    const model = request?.estimatedModelMs ?? null, ttft = request?.estimatedTtftMs ?? null;
+    const endTime = end === null ? antigravity ? toolEnd : null : Math.max(end, toolEnd ?? end);
+    const model = request?.providerTiming?.modelMs ?? request?.estimatedModelMs ?? null;
+    const ttft = request?.providerTiming?.ttftMs ?? request?.estimatedTtftMs ?? null;
     const decode = model !== null && ttft !== null && model >= ttft ? model - ttft : null;
     const step: StatsStepMetrics = {
-      sourceId: span.id, contentRevision: revision, detailsState: "unloaded", timingSource: model === null ? undefined : "session-estimate",
+      sourceId: span.id, contentRevision: revision, detailsState: "unloaded",
+      timingSource: request?.estimatedModelMs === undefined ? undefined : "session-estimate",
       ...(hasUsage && request?.usageSources ? { usageSources: request.usageSources } : {}),
       turn: span.turn, step: previous.length + 1, startTime, endTime,
       context, output, cacheRead: read, cacheWrite: field("cacheWrite"),

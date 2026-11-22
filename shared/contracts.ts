@@ -23,9 +23,15 @@ export const nodeSchema = z.object({
   category: categorySchema, time: z.number(), tokens: z.number(),
   title: z.string(), preview: z.string(), textLength: z.number().int().nonnegative().optional(), callId: z.string().optional(),
   error: z.boolean().optional(), replayed: z.boolean().optional(), toolDurationMs: z.number().nonnegative().optional(),
+  toolStartedAt: z.number().optional(), toolEndedAt: z.number().optional(),
   tool: z.string().optional(), source: z.string().optional(), gone: z.number().optional(),
 });
 export type ContextNode = z.infer<typeof nodeSchema>;
+const providerTimingSchema = z.object({
+  modelMs: z.number().nonnegative().optional(), ttftMs: z.number().nonnegative().optional(),
+  start: z.number().optional(), end: z.number().optional(),
+});
+export type ProviderTiming = z.infer<typeof providerTimingSchema>;
 export const requestSchema = z.object({
   id: z.string(), index: z.number(), turn: z.number(), time: z.number(), boundary: z.number(), seq: z.number().optional(),
   parts: partsSchema, usage: usageSchema, model: z.string(), duration: z.number().nullable(),
@@ -35,6 +41,7 @@ export const requestSchema = z.object({
   usageAt: z.number().optional(),
   estimatedModelMs: z.number().nonnegative().optional(), estimatedTtftMs: z.number().nonnegative().optional(),
   estimatedModelStart: z.number().optional(), estimatedModelEnd: z.number().optional(),
+  providerTiming: providerTimingSchema.optional(),
 });
 export type Request = z.infer<typeof requestSchema>;
 export const eventSchema = z.object({

@@ -96,6 +96,8 @@ export function upstreamOf(data: Loaded, graph = false): { head: ContextTimeline
     };
   });
   const last = data.requests.at(-1), cost = hasUsage ? costOf(s.agent.provider, data.requests) : undefined;
+  const hasTiming = fold.hasToolTiming || s.source !== "timeline" &&
+    (s.agent.provider !== "antigravity" || s.modelMs > 0 || (s.ttftMs ?? 0) > 0);
   const head: ContextTimeline = {
     ok: true, model: s.agent.model, provider: s.agent.provider,
     ...(s.contextWindow === null ? {} : { contextWindow: s.contextWindow }),
@@ -121,7 +123,7 @@ export function upstreamOf(data: Loaded, graph = false): { head: ContextTimeline
       ...(c.outputNode === null ? {} : { resultSeq: nodeSeq(fold, c.outputNode) }) })),
     commandStats: { runs: fold.commands.length, failed: fold.commands.filter((c) => c.status === "failed").length,
       ms: fold.commands.reduce((n, c) => n + (c.duration ?? 0), 0), bg: fold.commands.filter((c) => c.status === "running").length },
-    ...(s.source === "timeline" && !fold.hasToolTiming ? {} : { timing: timingOf(s) }),
+    ...(hasTiming ? { timing: timingOf(s) } : {}),
     spans: graph ? [] : spansOf(s.intervals ?? []),
     ...(hasUsage && s.usageSources ? { usageSources: s.usageSources } : {}),
     ...(cost ? { cost } : {}), costRead: { usd: s.costUsd, ready: true }, ...(graph ? {} : { detailRev: data.revision }),

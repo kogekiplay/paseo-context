@@ -3,29 +3,31 @@ import type { UsageSource, UsageSources } from "../shared/core/types";
 import { record } from "./value";
 
 export const usageKeys = ["input", "cacheRead", "cacheWrite", "output", "reasoning"] as const;
+export type NativeUsageProvider = "codex" | "claude" | "antigravity";
 
 function token(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
-// Keep the raw input lane separate so a sparse Claude block can update any
-// lane without erasing the others or repeatedly adding cache tokens to input.
-export function usageBuckets(value: unknown, provider: "codex" | "claude"): Partial<Usage> {
+// Keep uncached input separate so updates to cache lanes can be merged independently.
+export function usageBuckets(value: unknown, provider: NativeUsageProvider): Partial<Usage> {
   const raw = record(value);
   const claude = provider === "claude";
+  const antigravity = provider === "antigravity";
   const buckets = {
     input: token(raw.input_tokens),
-    cacheRead: claude ? token(raw.cache_read_input_tokens) : token(raw.cached_input_tokens) ?? token(raw.cache_read_input_tokens),
-    cacheWrite: token(claude ? raw.cache_creation_input_tokens : raw.cache_write_input_tokens),
+    cacheRead: antigravity ? token(raw.cache_read_tokens)
+      : claude ? token(raw.cache_read_input_tokens) : token(raw.cached_input_tokens) ?? token(raw.cache_read_input_tokens),
+    cacheWrite: token(antigravity ? raw.cache_write_tokens : claude ? raw.cache_creation_input_tokens : raw.cache_write_input_tokens),
     output: token(raw.output_tokens),
-    reasoning: token(claude ? raw.reasoning_tokens : raw.reasoning_output_tokens),
+    reasoning: token(claude || antigravity ? raw.reasoning_tokens : raw.reasoning_output_tokens),
   };
   return Object.fromEntries(usageKeys.flatMap((key) => buckets[key] === undefined ? [] : [[key, buckets[key]]]));
 }
 
-export function requestUsage(buckets: Partial<Usage>, provider: "codex" | "claude"): Usage {
+export function requestUsage(buckets: Partial<Usage>, provider: NativeUsageProvider): Usage {
   const usage = { ...emptyUsage(), ...buckets };
-  if (provider === "claude" && buckets.input !== undefined) usage.input += usage.cacheRead + usage.cacheWrite;
+  if (provider !== "codex" && buckets.input !== undefined) usage.input += usage.cacheRead + usage.cacheWrite;
   return usage;
 }
 

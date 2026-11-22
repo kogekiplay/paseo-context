@@ -1,7 +1,10 @@
 import { ensureActive } from "./paging";
-import { readdir, stat } from "node:fs/promises";
+import { readdir, realpath, stat } from "node:fs/promises";
+import { homedir } from "node:os";
 import { basename, isAbsolute, join } from "node:path";
 import type { Agent } from "../shared/contracts";
+import { antigravityConversationId } from "./antigravity-log";
+import { AntigravityDatabase, type AntigravityDatabaseFile } from "./antigravity-db";
 
 const DIRECTORY_TTL_MS = 4_000;
 const PATH_LIMIT = 512;
@@ -9,7 +12,12 @@ const INDEX_MAX_CHARS = 4 * 1024 * 1024;
 const SESSION_ID = /^[a-zA-Z0-9_-]+$/;
 const ROLLOUT_DATE = /^(?:rollout-)\d{4}-\d{2}-\d{2}T\d{2}[-:]\d{2}[-:]\d{2}-/;
 
-export interface NativeLocation { path: string; sealed: boolean }
+export interface NativeRoots { codex?: string; claude?: string; antigravity?: string }
+export interface NativeLocation {
+  path: string;
+  sealed: boolean;
+  antigravity?: { database: AntigravityDatabaseFile | null; databaseOnly: boolean };
+}
 
 async function contents(path: string, recursive = false) {
   try { return await readdir(path, { recursive }); }
@@ -27,6 +35,20 @@ async function isFile(path: string) {
   }
 }
 
+async function antigravityTranscript(root: string, id: string) {
+  try {
+    const brain = await realpath(join(root, "brain"));
+    const directory = join(brain, id, ".system_generated", "logs");
+    for (const name of ["transcript_full.jsonl", "transcript.jsonl"]) {
+      const path = join(directory, name);
+      if (await isFile(path) && await realpath(path) === path) return path;
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  return null;
+}
+
 interface Directory {
   locations: NativeLocation[];
   byId: Map<string, NativeLocation>;
@@ -38,7 +60,17 @@ export class NativePaths {
   private codexIndex?: { at: number; directory: Directory };
   private indexing?: Promise<Directory>;
 
-  constructor(private roots: { codex: string; claude: string }, private signal: AbortSignal) {}
+  private roots: Required<NativeRoots>;
+  readonly antigravity: AntigravityDatabase;
+
+  constructor(roots: NativeRoots, private signal: AbortSignal) {
+    this.roots = {
+      codex: roots.codex ?? (process.env.CODEX_HOME || join(homedir(), ".codex")),
+      claude: roots.claude ?? (process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude")),
+      antigravity: roots.antigravity ?? (process.env.ANTIGRAVITY_HOME || join(homedir(), ".gemini", "antigravity-cli")),
+    };
+    this.antigravity = new AntigravityDatabase(this.roots.antigravity, signal);
+  }
 
   private async codexDirectory() {
     if (this.codexIndex && Date.now() - this.codexIndex.at < DIRECTORY_TTL_MS) return this.codexIndex.directory;
@@ -87,6 +119,20 @@ export class NativePaths {
   async locate(agent: Agent, directory?: Directory): Promise<NativeLocation | null> {
     ensureActive(this.signal);
     const { provider, sessionId, cwd } = agent;
+    if (provider === "antigravity") {
+      const id = antigravityConversationId(sessionId);
+      if (!id) return null;
+      const [log, db] = await Promise.allSettled([
+        antigravityTranscript(this.roots.antigravity, id), this.antigravity.locate(id),
+      ]);
+      ensureActive(this.signal);
+      if (log.status === "rejected") throw log.reason;
+      const transcript = log.value;
+      if (db.status === "rejected" && !transcript) throw db.reason;
+      const database = db.status === "fulfilled" ? db.value : null;
+      if (transcript) return { path: transcript, sealed: false, antigravity: { database, databaseOnly: false } };
+      return database ? { path: database.path, sealed: false, antigravity: { database, databaseOnly: true } } : null;
+    }
     if (!sessionId || !SESSION_ID.test(sessionId)) return null;
     const key = `${provider}:${sessionId}`;
     const hit = this.cached.get(key);
@@ -135,5 +181,6 @@ export class NativePaths {
     this.cached.clear();
     this.codexIndex = undefined;
     this.indexing = undefined;
+    this.antigravity.clear();
   }
 }
