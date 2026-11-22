@@ -1,23 +1,62 @@
 import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 import { stat } from "node:fs/promises";
-import { emptyParts, type Agent, type Scope, type Summary, type Tally } from "../shared/contracts";
+import { emptyParts, type Agent, type Request, type Scope, type Summary, type Tally } from "../shared/contracts";
 import { ContextFold } from "./fold";
-import { SessionReader } from "./reader";
+import { SessionReader, type ReadBodies } from "./reader";
 import { Pricing } from "./pricing";
-import { count, printable, record, text, timestamp } from "./value";
+import { timestamp } from "./value";
 import { createHash } from "node:crypto";
-import { messagesOf } from "./normalize";
 import { scopedIntervals, sumTiming, unionMs } from "./timing";
 import { dayKeyOf, shiftDayKey, startOfDayKey } from "../shared/core/days";
+import { usageSourceOf } from "../shared/usage";
+import { ensureActive, nextCursor } from "./paging";
+import { TimelineReader } from "./timeline";
+import type { NativeLocation } from "./native-paths";
+import type { NativeChild } from "./collaboration";
 
 const CORPUS_TTL_MS = 10_000;
 const FIRST_PAINT_BUDGET_MS = 400;
 const SCAN_CONCURRENCY = 4;
+const DERIVED_BYTES = 48 * 1024 * 1024;
+type LedgerRequest = Pick<Request, "time" | "usageAt" | "turn" | "usage" | "usageFields" | "usageSources" | "parts" | "costUsd">;
+interface Ledger { at: number; key: string; summary: Summary; requests: LedgerRequest[] }
+interface Reader {
+  read(agent: Agent, location?: NativeLocation | null): Promise<{ entry: { fold: ContextFold }; bodies?: ReadBodies; residentBytes?: number } | null>;
+  locate(agent: Agent): Promise<string | null>;
+  locateForScan?(agents: readonly Agent[]): Promise<(agent: Agent) => Promise<NativeLocation | null>>;
+  content(agent: Agent, nodeId: number): Promise<string>;
+  clear(): void;
+}
+export interface LoadedSession {
+  agent: Agent;
+  fold: ContextFold;
+  summary: Summary;
+  requests: Request[];
+  revision: number;
+  foldRevision?: number;
+  bodies?: ReadBodies;
+  residentBytes?: number;
+}
+const PARENT = "paseo.parent-agent-id";
+const nativeId = (provider: string, sessionId: string) => `native:${provider}:${sessionId}`;
+const identityOf = (raw: PaseoAgent) => {
+  const sessionId = agentOf(raw).sessionId;
+  return JSON.stringify([raw.provider, sessionId === null ? "agent" : "session", sessionId ?? raw.id]);
+};
+interface FleetData {
+  rootId: string;
+  agents: Agent[];
+  aliases: ReadonlyMap<string, string>;
+  members: Summary[];
+  loaded: Map<string, LoadedSession>;
+  failed: number;
+}
 interface Corpus {
   at: number;
   pricingRevision: number;
   all: Summary[];
-  requests: Map<string, ContextFold["requests"]>;
+  requests: Map<string, LedgerRequest[]>;
+  ledgers: Map<string, Ledger>;
   scanned: number;
   failed: number;
   unreadable: number;
@@ -28,7 +67,7 @@ interface Corpus {
 }
 
 export function agentOf(a: PaseoAgent): Agent {
-  return { id: a.id, workspaceId: a.workspaceId ?? null, parentId: a.labels["paseo.parent-agent-id"] ?? null,
+  return { id: a.id, workspaceId: a.workspaceId ?? null, parentId: a.labels[PARENT] ?? null,
     title: a.title || a.id, cwd: a.cwd, provider: a.provider, model: a.runtimeInfo?.model ?? a.model ?? "",
     sessionId: a.persistence?.nativeHandle ?? a.persistence?.sessionId ?? a.runtimeInfo?.sessionId ?? null,
     createdAt: timestamp(a.createdAt), updatedAt: timestamp(a.updatedAt),
@@ -39,114 +78,80 @@ export async function listAgents(paseo: PaseoApi, signal?: AbortSignal) {
   let cursor: string | undefined;
   const seen = new Set<string>();
   do {
-    if (signal?.aborted) throw new Error("Plugin was stopped");
+    ensureActive(signal);
     const page = await paseo.agents.list({ filter: { includeArchived: true, includeBackground: true },
       includeBackground: true, signal, page: { limit: 200, ...(cursor ? { cursor } : {}) } });
-    agents.push(...page.entries.map((e) => e.agent));
-    cursor = page.pageInfo.hasMore ? page.pageInfo.nextCursor ?? undefined : undefined;
-    if (cursor && seen.has(cursor)) throw new Error("Agent directory returned a repeated cursor");
-    if (cursor) seen.add(cursor);
+    ensureActive(signal);
+    for (const entry of page.entries) agents.push(entry.agent);
+    cursor = nextCursor(page.pageInfo.hasMore, page.pageInfo.nextCursor, seen, "Agent directory");
   } while (cursor);
   return [...new Map(agents.map((a) => [a.id, a])).values()];
 }
 export class ContextService {
-  constructor(readonly reader: {
-    read(agent: Agent): Promise<{ entry: { fold: ContextFold } } | null>;
-    locate(agent: Agent): Promise<string | null>;
-    content(agent: Agent, nodeId: number): Promise<string>;
-    clear(): void;
-  } = new SessionReader(), readonly pricing = new Pricing()) {}
-  private summaries = new Map<string, { at: number; key: string; summary: Summary; requests: ContextFold["requests"] }>();
+  constructor(readonly reader: Reader = new SessionReader(), readonly pricing = new Pricing()) {}
+  private summaries = new Map<string, Ledger>();
   private corpus: Corpus | null = null;
   private scanning: Corpus | null = null;
   private corpusBusy: Promise<Corpus> | null = null;
   private corpusRevision = 0;
-  private scanLifetime = new AbortController();
+  private lifetime = new AbortController();
+  private timeline = new TimelineReader(this.lifetime.signal);
   private retryCorpusAt = 0;
   private refreshIssues: Corpus["failedSessions"] = [];
   private overviewCache = new Map<string, ReturnType<typeof aggregate>>();
   private overviewCacheRevision = "";
-  private closed = false;
+  private get closed() { return this.lifetime.signal.aborted; }
   private nativeMembers = new Map<string, PaseoAgent>();
   private revisions = new Map<string, { fingerprint: string; revision: number }>();
   private serial = 0;
-  private derived = new Map<string, { fold: ContextFold; foldRevision: number; key: string; at: number;
-    data: { agent: Agent; fold: ContextFold; summary: Summary; requests: ReturnType<Pricing["priceRequests"]>; revision: number } }>();
-  private loading = new Map<string, Promise<{ agent: Agent; fold: ContextFold; summary: Summary; requests: ReturnType<Pricing["priceRequests"]>; revision: number }>>();
+  private derived = new Map<string, { fold: ContextFold; foldRevision: number; key: string; at: number; bytes: number; data: LoadedSession }>();
+  private loading = new Map<string, Promise<LoadedSession>>();
   async directory(paseo: PaseoApi) {
-    const agents = await listAgents(paseo);
+    const agents = await listAgents(paseo, this.lifetime.signal);
     const sessions = new Set(agents.map((raw) => `${raw.provider}:${agentOf(raw).sessionId}`));
     return [...agents, ...[...this.nativeMembers.values()].filter((raw) => !sessions.has(`${raw.provider}:${agentOf(raw).sessionId}`))];
   }
   async agent(id: string, paseo: PaseoApi) {
+    ensureActive(this.lifetime.signal);
     const native = this.nativeMembers.get(id);
     if (native) return native;
     const result = await paseo.agents.ref(id).refresh();
+    ensureActive(this.lifetime.signal);
     if (!result) throw new Error("Agent is no longer available");
     return result.agent;
   }
-  private async timeline(agent: Agent, paseo: PaseoApi, targetNodeId?: number) {
-    const pages: Array<Awaited<ReturnType<ReturnType<PaseoApi["agents"]["ref"]>["timeline"]["refetch"]>>> = [];
-    let cursor;
-    let epoch: string | undefined;
-    const seen = new Set<string>();
-    do {
-      if (this.closed) throw new Error("Plugin was stopped");
-      const page = await paseo.agents.ref(agent.id).timeline.refetch({ direction: cursor ? "before" : "tail", limit: 200, ...(cursor ? { cursor } : {}) });
-      if (this.closed) throw new Error("Plugin was stopped");
-      if (page.error) throw new Error(page.error);
-      if (epoch !== undefined && page.epoch !== epoch) throw new Error("Timeline changed while reading history");
-      epoch = page.epoch;
-      pages.push(page);
-      cursor = page.hasOlder ? page.startCursor ?? undefined : undefined;
-      const key = JSON.stringify(cursor);
-      if (cursor && seen.has(key)) throw new Error("Timeline returned a repeated cursor");
-      if (cursor) seen.add(key);
-    } while (cursor);
-    const fold = new ContextFold("timeline", epoch ?? "timeline");
-    let line = 0, content = "";
-    for (const page of pages.reverse()) for (const entry of page.entries) {
-      const item = record(entry.item);
-      const row = { ...item, timestamp: entry.timestamp };
-      fold.apply(row);
-      line++;
-      const node = targetNodeId === undefined ? null : fold.nodes[targetNodeId];
-      if (node?.line === line) content = messagesOf(row, "timeline").find((m) => m.block === node.block && m.category === node.category)?.text ?? "";
-    }
-    return { fold, content };
-  }
-  async load(raw: PaseoAgent, paseo: PaseoApi) {
+  async load(raw: PaseoAgent, paseo: PaseoApi, location?: NativeLocation | null): Promise<LoadedSession> {
     // Simultaneous surfaces share a read. Different agent metadata must never
     // inherit an in-flight result from an older snapshot.
     const key = JSON.stringify([agentOf(raw), raw.lastUsage, this.pricing.revision]);
     const busy = this.loading.get(key);
     if (busy) return busy;
-    const pending = this.loadSession(raw, paseo, key);
+    const pending = this.loadSession(raw, paseo, key, location);
     this.loading.set(key, pending);
     try { return await pending; } finally { if (this.loading.get(key) === pending) this.loading.delete(key); }
   }
-  private async loadSession(raw: PaseoAgent, paseo: PaseoApi, key: string) {
-    if (this.closed) throw new Error("Plugin was stopped");
+  private async loadSession(raw: PaseoAgent, paseo: PaseoApi, key: string, location?: NativeLocation | null): Promise<LoadedSession> {
+    ensureActive(this.lifetime.signal);
     const agent = agentOf(raw);
-    const native = await this.reader.read(agent);
-    const fold = native?.entry.fold ?? (await this.timeline(agent, paseo)).fold;
-    if (this.closed) throw new Error("Plugin was stopped");
+    const native = await this.reader.read(agent, location);
+    const timeline = native ? null : await this.timeline.read(agent.id, paseo);
+    const fold = native?.entry.fold ?? timeline!.fold;
+    ensureActive(this.lifetime.signal);
     const cached = this.derived.get(agent.id);
     if (cached?.fold === fold && cached.foldRevision === fold.revision && cached.key === key) {
-      cached.at = Date.now(); return cached.data;
+      cached.at = Date.now();
+      this.derived.delete(agent.id);
+      this.derived.set(agent.id, cached);
+      return cached.data;
     }
-    for (const child of fold.collaboration.children.values()) {
-      const id = `native:${raw.provider}:${child.sessionId}`;
-      if (this.nativeMembers.size >= 512) this.nativeMembers.delete(this.nativeMembers.keys().next().value!);
-      this.nativeMembers.set(id, { ...raw, id, title: child.title, status: "idle",
-        createdAt: new Date(child.time).toISOString(), updatedAt: raw.updatedAt, lastUsage: undefined,
-        labels: { ...raw.labels, "paseo.parent-agent-id": raw.id },
-        persistence: { provider: raw.provider, sessionId: child.sessionId, nativeHandle: child.sessionId } });
-    }
+    for (const child of fold.collaboration.children.values()) this.rememberChild(raw, child);
     const summary = fold.summary(agent, native ? "native" : "timeline");
     const last = raw.lastUsage;
     if (last?.contextWindowMaxTokens !== undefined) summary.contextWindow = last.contextWindowMaxTokens;
-    if (last?.contextWindowUsedTokens !== undefined) summary.contextTokens = last.contextWindowUsedTokens;
+    if (last?.contextWindowUsedTokens !== undefined) {
+      summary.contextTokens = last.contextWindowUsedTokens;
+      summary.contextSource = "paseo";
+    }
     if (!native) summary.notices.push("usage-unavailable");
     const requests = this.pricing.priceRequests(agent.provider, fold.requests);
     const complete = requests.every((r) => r.costUsd !== null);
@@ -156,22 +161,25 @@ export class ContextService {
       summary.costUsd = last.totalCostUsd;
       summary.notices.push("last-turn-cost");
     }
-    const fingerprint = createHash("sha256").update(JSON.stringify([summary, fold.revision, fold.epoch,
-      fold.contentHashes, fold.statistics.rows, fold.nodes, fold.events, fold.commands, requests])).digest("hex");
+    const fingerprint = createHash("sha256").update(JSON.stringify(native
+      ? [key, fold.epoch, fold.revision]
+      : [key, summary, fold.revision, fold.epoch, fold.contentHashes, fold.statistics.rows, fold.nodes, fold.events, fold.commands, requests])).digest("hex");
     const previous = this.revisions.get(agent.id);
     const revision = previous?.fingerprint === fingerprint ? previous.revision : ++this.serial;
     if (!this.closed) {
       this.revisions.delete(agent.id); this.revisions.set(agent.id, { fingerprint, revision });
       if (this.revisions.size > 512) this.revisions.delete(this.revisions.keys().next().value!);
     }
-    const data = { agent, fold, summary, requests, revision };
+    const bytes = native?.residentBytes ?? (timeline ? this.timeline.weight(timeline) : fold.residentBytes);
+    const data: LoadedSession = { agent, fold, summary, requests, revision, foldRevision: fold.revision, residentBytes: bytes,
+      bodies: native?.bodies ?? (timeline ? this.timeline.bodyReader(timeline) : undefined) };
     if (!this.closed) {
       this.derived.delete(agent.id);
-      this.derived.set(agent.id, { fold, foldRevision: fold.revision, key, at: Date.now(), data });
-      let weight = [...this.derived.values()].reduce((n, entry) => n + entry.fold.nodes.length + entry.data.requests.length, 0);
+      if (bytes <= DERIVED_BYTES) this.derived.set(agent.id, { fold, foldRevision: fold.revision, key, at: Date.now(), data, bytes });
+      let weight = [...this.derived.values()].reduce((n, entry) => n + entry.bytes, 0);
       for (const [id, entry] of this.derived) {
-        if (this.derived.size > 8 || weight > 100000 || Date.now() - entry.at > 120000) {
-          this.derived.delete(id); weight -= entry.fold.nodes.length + entry.data.requests.length;
+        if (this.derived.size > 8 || weight > DERIVED_BYTES || Date.now() - entry.at > 120000) {
+          this.derived.delete(id); weight -= entry.bytes;
         }
       }
     }
@@ -182,33 +190,47 @@ export class ContextService {
     const data = await this.load(await this.agent(id, paseo), paseo);
     return { summary: data.summary, requests: data.requests, events: data.fold.events };
   }
-  async content(id: string, nodeId: number, paseo: PaseoApi) {
-    const agent = agentOf(await this.agent(id, paseo));
-    if (await this.reader.locate(agent)) return this.reader.content(agent, nodeId);
-    const data = await this.timeline(agent, paseo, nodeId);
-    const node = data.fold.nodes[nodeId];
-    if (!node) throw new Error("Context item is no longer available");
-    return data.content;
+  async content(id: string, nodeId: number, paseo: PaseoApi, revision?: number) {
+    const data = await this.load(await this.agent(id, paseo), paseo);
+    if (revision !== undefined && revision !== data.revision) throw new Error("Context revision changed; refresh the session and retry");
+    return (await this.contents(data, [nodeId])).get(nodeId)!;
+  }
+  async contents(data: LoadedSession, ids: readonly number[]) {
+    ensureActive(this.lifetime.signal);
+    if (data.bodies) return data.bodies(ids, (_id, body) => body);
+    const contents = new Map<number, string>();
+    for (const id of new Set(ids)) {
+      contents.set(id, await this.reader.content(data.agent, id));
+      ensureActive(this.lifetime.signal);
+    }
+    return contents;
   }
   async summary(raw: PaseoAgent, paseo: PaseoApi) {
     return (await this.ledger(raw, paseo)).summary;
   }
-  private async ledger(raw: PaseoAgent, paseo: PaseoApi) {
-    const path = await this.reader.locate(agentOf(raw));
+  private async ledger(raw: PaseoAgent, paseo: PaseoApi, previous?: Ledger, locate?: (agent: Agent) => Promise<NativeLocation | null>) {
+    const agent = agentOf(raw);
+    const location = locate ? await locate(agent) : undefined;
+    const path = location === undefined ? await this.reader.locate(agent) : location?.path;
     const source = path ? await stat(path) : null;
-    if (this.closed) throw new Error("Plugin was stopped");
-    const key = JSON.stringify([raw.updatedAt, raw.status, raw.lastUsage, raw.title, raw.labels, raw.archivedAt,
-      source?.ino, source?.size, source?.mtimeMs, this.pricing.revision]);
+    ensureActive(this.lifetime.signal);
+    const key = JSON.stringify([agent, raw.lastUsage, path, source?.dev, source?.ino, source?.size,
+      source?.mtimeMs, source?.ctimeMs, this.pricing.revision]);
+    const ttl = path ? 600_000 : 15_000;
+    const valid = (entry: Ledger | undefined): entry is Ledger => entry?.key === key && Date.now() - entry.at < ttl;
     const cached = this.summaries.get(raw.id);
-    if (cached?.key === key && Date.now() - cached.at < (path ? 600_000 : 15_000)) return cached;
-    const data = await this.load(raw, paseo);
-    const value = { at: Date.now(), key, summary: data.summary,
-      requests: data.requests.map((r) => ({ ...r, prompt: "", response: "" })) };
+    if (valid(previous)) return previous;
+    if (valid(cached)) return cached;
+    const data = await this.load(raw, paseo, location);
+    const value: Ledger = { at: Date.now(), key, summary: data.summary,
+      requests: data.requests.map(({ time, usageAt, turn, usage, usageFields, usageSources, parts, costUsd }) =>
+        ({ time, usageAt, turn, usage, usageFields, usageSources, parts, costUsd })) };
     if (!this.closed) {
-      this.summaries.delete(raw.id); this.summaries.set(raw.id, value);
+      this.summaries.delete(raw.id);
+      if (value.requests.length <= 50000) this.summaries.set(raw.id, value);
       let weight = [...this.summaries.values()].reduce((n, v) => n + v.requests.length, 0);
       for (const [id, old] of this.summaries) {
-        if (id !== raw.id && (this.summaries.size > 256 || weight > 50000 || Date.now() - old.at > 600_000)) {
+        if (this.summaries.size > 256 || weight > 50000 || Date.now() - old.at > 600_000) {
           this.summaries.delete(id); weight -= old.requests.length;
         }
       }
@@ -227,22 +249,30 @@ export class ContextService {
       if (Date.now() >= this.retryCorpusAt) void this.readCorpus(paseo).catch(() => {});
     } else {
       const refresh = this.readCorpus(paseo);
+      const signal = this.lifetime.signal;
       let timer: ReturnType<typeof setTimeout> | undefined;
+      let stop: (() => void) | undefined;
       try {
         corpus = await Promise.race([
           refresh,
           new Promise<Corpus | null>((resolve) => {
             timer = setTimeout(() => resolve(this.corpus ?? this.scanning), FIRST_PAINT_BUDGET_MS);
+            stop = () => resolve(null);
+            signal.addEventListener("abort", stop);
+            if (signal.aborted) stop();
           }),
         ]);
-      } finally { clearTimeout(timer); }
+      } finally {
+        clearTimeout(timer);
+        if (stop) signal.removeEventListener("abort", stop);
+      }
     }
     if (!corpus || this.closed) throw new Error("Plugin was stopped");
     const running = this.scanning !== null;
     const refreshFailed = this.retryCorpusAt !== 0;
     const covered = corpus.all.length, remaining = corpus.scanned - covered - corpus.failed - corpus.unreadable;
     const version = `${corpus.revision}:${running}:${this.retryCorpusAt}:${new Date().toDateString()}`;
-    const coverage = { complete: !corpus.running && corpus.failed === 0, remaining,
+    const coverage = { complete: !corpus.running && remaining === 0 && corpus.failed === 0 && corpus.unreadable === 0, remaining,
       failed: corpus.failed, running: corpus.running, total: corpus.scanned, covered, unsupported: 0,
       unreadable: corpus.unreadable, failedSessions: corpus.failedSessions, unreadableSessions: corpus.unreadableSessions,
       refreshIssues: this.refreshIssues };
@@ -262,7 +292,7 @@ export class ContextService {
   }
   async backfill(paseo: PaseoApi) {
     const corpus = await this.readCorpus(paseo, true);
-    return { complete: corpus.failed === 0, remaining: 0, failed: corpus.failed, running: false,
+    return { complete: corpus.failed === 0 && corpus.unreadable === 0, remaining: 0, failed: corpus.failed, running: false,
       total: corpus.scanned, covered: corpus.all.length, unsupported: 0, unreadable: corpus.unreadable,
       failedSessions: corpus.failedSessions, unreadableSessions: corpus.unreadableSessions };
   }
@@ -272,7 +302,7 @@ export class ContextService {
     if (!force && this.corpus && this.corpus.pricingRevision === this.pricing.revision
       && Date.now() - this.corpus.at < CORPUS_TTL_MS) return this.corpus;
     const corpus = this.scanning = { at: 0, pricingRevision: this.pricing.revision, all: [],
-      requests: new Map(), scanned: 0, failed: 0, unreadable: 0, failedSessions: [], unreadableSessions: [],
+      requests: new Map(), ledgers: new Map(), scanned: 0, failed: 0, unreadable: 0, failedSessions: [], unreadableSessions: [],
       running: true, revision: ++this.corpusRevision };
     this.corpusBusy = this.scanCorpus(paseo, corpus);
     try { return await this.corpusBusy; }
@@ -286,8 +316,11 @@ export class ContextService {
     finally { this.corpusBusy = null; this.scanning = null; }
   }
   private async scanCorpus(paseo: PaseoApi, corpus: Corpus) {
-    const signal = this.scanLifetime.signal;
+    const signal = this.lifetime.signal;
     const agents = await listAgents(paseo, signal);
+    const previous = this.corpus?.ledgers;
+    const locate = await this.reader.locateForScan?.(agents.map(agentOf)).catch(() => undefined);
+    ensureActive(signal);
     const order = new Map(agents.map((agent, index) => [agent.id, index]));
     agents.sort((a, b) => timestamp(b.updatedAt) - timestamp(a.updatedAt));
     corpus.scanned = agents.length;
@@ -297,10 +330,11 @@ export class ContextService {
       while (!signal.aborted && cursor < agents.length) {
         const raw = agents[cursor++];
         try {
-          const data = await this.ledger(raw, paseo);
+          const data = await this.ledger(raw, paseo, previous?.get(raw.id), locate);
           if (signal.aborted) return;
           corpus.all.push(data.summary);
           corpus.requests.set(raw.id, data.requests);
+          corpus.ledgers.set(raw.id, data);
         } catch (error) {
           if (signal.aborted) return;
           const code = (error as NodeJS.ErrnoException | undefined)?.code;
@@ -328,52 +362,111 @@ export class ContextService {
     this.refreshIssues = [];
     return corpus;
   }
-  async fleet(id: string, paseo: PaseoApi) {
-    const agents = await listAgents(paseo);
-    const map = new Map([...agents, ...this.nativeMembers.values()].map((a) => [a.id, a]));
-    if (!map.has(id)) throw new Error("Agent is no longer available");
-    let root = map.get(id)!;
+  private rememberChild(parent: PaseoAgent, child: NativeChild): PaseoAgent {
+    const id = nativeId(parent.provider, child.sessionId);
+    const agent: PaseoAgent = { ...parent, id, title: child.title, status: "idle",
+      createdAt: new Date(child.time).toISOString(), updatedAt: parent.updatedAt, lastUsage: undefined,
+      labels: { ...parent.labels, [PARENT]: parent.id },
+      persistence: { provider: parent.provider, sessionId: child.sessionId, nativeHandle: child.sessionId } };
+    this.nativeMembers.delete(id);
+    this.nativeMembers.set(id, agent);
+    if (this.nativeMembers.size > 512) this.nativeMembers.delete(this.nativeMembers.keys().next().value!);
+    return agent;
+  }
+
+  async fleet(id: string, paseo: PaseoApi, options?: { details?: boolean; seed?: LoadedSession }): Promise<FleetData> {
+    const signal = this.lifetime.signal;
+    const listed = await listAgents(paseo, signal);
+    const directory = new Map([...listed, ...this.nativeMembers.values()].map((agent) => [agent.id, agent]));
+    const selected = directory.get(id);
+    if (!selected) throw new Error("Agent is no longer available");
+    let root = selected;
     const visited = new Set<string>();
-    while (root.labels["paseo.parent-agent-id"] && map.has(root.labels["paseo.parent-agent-id"]) && !visited.has(root.id)) {
-      visited.add(root.id); root = map.get(root.labels["paseo.parent-agent-id"])!;
+    while (root.labels[PARENT] && directory.has(root.labels[PARENT]) && !visited.has(root.id)) {
+      visited.add(root.id);
+      root = directory.get(root.labels[PARENT])!;
     }
-    const ids = new Set([root.id]);
-    for (let pass = 0; pass < agents.length; pass++) {
-      const before = ids.size;
-      for (const a of agents) if (a.labels["paseo.parent-agent-id"] && ids.has(a.labels["paseo.parent-agent-id"])) ids.add(a.id);
-      if (before === ids.size) break;
+
+    const canonical = new Map<string, PaseoAgent>([[identityOf(root), root]]);
+    const aliases = new Map<string, string>();
+    for (const raw of directory.values()) {
+      const identity = identityOf(raw), existing = canonical.get(identity);
+      if (!existing || existing.id.startsWith("native:") && !raw.id.startsWith("native:")) canonical.set(identity, raw);
     }
+    for (const raw of directory.values()) {
+      const primary = canonical.get(identityOf(raw))!, sessionId = agentOf(raw).sessionId;
+      aliases.set(raw.id, primary.id);
+      if (sessionId) aliases.set(nativeId(raw.provider, sessionId), primary.id);
+    }
+    root = canonical.get(identityOf(root))!;
+    const children = new Map<string, PaseoAgent[]>();
+    for (const raw of directory.values()) {
+      const parent = aliases.get(raw.labels[PARENT]);
+      if (!parent || aliases.get(raw.id) === parent) continue;
+      const rows = children.get(parent) ?? [];
+      rows.push(canonical.get(identityOf(raw))!);
+      children.set(parent, rows);
+    }
+
     void this.pricing.refresh();
-    const members: Summary[] = [];
+    const members: Summary[] = [], agents: Agent[] = [];
+    const loaded = new Map<string, LoadedSession>();
     let failed = 0;
-    const visitedSessions = new Set<string>();
-    const queue = agents.filter((a) => ids.has(a.id));
-    if (!queue.length) queue.push(root);
-    while (queue.length) {
-      const a = queue.shift()!, key = `${a.provider}:${agentOf(a).sessionId ?? a.id}`;
-      if (visitedSessions.has(key)) continue;
-      visitedSessions.add(key);
-      try { members.push(await this.summary(a, paseo)); } catch { failed++; }
-      for (const child of this.nativeMembers.values()) if (child.labels["paseo.parent-agent-id"] === a.id) queue.push(child);
+    const queued = new Set([root.id]);
+    const queue: Array<{ raw: PaseoAgent; parent: string | null }> = [{ raw: root, parent: null }];
+    for (let index = 0; index < queue.length; index++) {
+      ensureActive(signal);
+      const { raw, parent } = queue[index];
+      const agent = { ...agentOf(raw), parentId: parent };
+      agents.push(agent);
+      const descendants = children.get(raw.id) ?? [];
+      try {
+        const seed = options?.seed;
+        const data = seed?.agent.id === raw.id && (seed.foldRevision === undefined || seed.foldRevision === seed.fold.revision)
+          ? seed : await this.load(raw, paseo);
+        ensureActive(signal);
+        const summary = { ...data.summary, agent: { ...data.summary.agent, parentId: parent } };
+        members.push(summary);
+        if (options?.details) loaded.set(raw.id, { ...data, agent, summary });
+        for (const child of data.fold.collaboration.children.values()) {
+          const native = this.rememberChild(raw, child);
+          const key = identityOf(native), primary = canonical.get(key) ?? native;
+          canonical.set(key, primary);
+          aliases.set(native.id, primary.id);
+          descendants.push(primary);
+        }
+      } catch {
+        ensureActive(signal);
+        failed++;
+      }
+      for (const child of descendants) {
+        if (queued.has(child.id)) continue;
+        queued.add(child.id);
+        queue.push({ raw: child, parent: raw.id });
+      }
     }
-    return { rootId: root.id, members, failed };
+    for (const [alias, primary] of aliases) if (!queued.has(primary)) aliases.delete(alias);
+    return { rootId: root.id, agents, aliases, members, loaded, failed };
   }
   async collaboration(id: string, paseo: PaseoApi) {
-    const family = await this.fleet(id, paseo), records = [];
-    let failed = family.failed;
-    for (const member of family.members) {
-      try {
-        const data = await this.load(await this.agent(member.agent.id, paseo), paseo);
-        records.push(...data.fold.collaboration.records.map((r) => ({ ...r, agentId: member.agent.id,
-          to: family.members.find((m) => m.agent.sessionId === r.to || m.agent.id === r.to)?.agent.id ?? r.to })));
-      } catch { failed++; }
+    const family = await this.fleet(id, paseo, { details: true }), records = [];
+    for (const { fold, agent } of family.loaded.values()) for (const record of fold.collaboration.records) {
+      records.push({ ...record, agentId: agent.id,
+        to: family.aliases.get(record.to) ?? family.aliases.get(nativeId(agent.provider, record.to)) ?? record.to });
     }
-    return { records: records.sort((a, b) => a.time - b.time), failed };
+    return { records: records.sort((a, b) => a.time - b.time), failed: family.failed };
   }
-  clear() { this.closed = true; this.scanLifetime.abort(); this.reader.clear(); this.pricing.clear(); this.summaries.clear(); this.nativeMembers.clear(); this.revisions.clear(); this.derived.clear(); this.loading.clear(); this.overviewCache.clear(); this.refreshIssues = []; this.corpus = null; this.scanning = null; }
+  clear() {
+    this.lifetime.abort();
+    this.reader.clear(); this.timeline.clear(); this.pricing.clear();
+    this.summaries.clear(); this.nativeMembers.clear(); this.revisions.clear(); this.derived.clear(); this.loading.clear();
+    this.overviewCache.clear(); this.refreshIssues = []; this.corpus = null; this.scanning = null;
+    this.corpusBusy = null;
+  }
 }
 
-export function aggregate(all: Summary[], requests: Map<string, ContextFold["requests"]>, scope: Scope, offset: number, scanned: number, failed: number, now = Date.now()) {
+const accountingTime = (request: LedgerRequest) => request.usageAt ?? request.time;
+export function aggregate(all: Summary[], requests: ReadonlyMap<string, LedgerRequest[]>, scope: Scope, offset: number, scanned: number, failed: number, now = Date.now()) {
   const today = dayKeyOf(now) ?? "";
   const day = startOfDayKey(scope.day) === null ? "" : scope.day;
   const from = day || (scope.range === "custom" ? scope.start : scope.range === "all" ? ""
@@ -391,7 +484,7 @@ export function aggregate(all: Summary[], requests: Map<string, ContextFold["req
   });
   const inScope = eligible.filter((s) => {
     const rows = requests.get(s.agent.id) ?? [];
-    return rows.some((r) => r.time >= start && r.time < end)
+    return rows.some((r) => accountingTime(r) >= start && accountingTime(r) < end)
       || (!rows.length && s.agent.updatedAt >= start && s.agent.updatedAt < end)
       || s.activity.some((d) => d.time >= start && d.time < end);
   });
@@ -400,7 +493,7 @@ export function aggregate(all: Summary[], requests: Map<string, ContextFold["req
   const matchesFilters = (s: Summary) => (!scope.group || projectKey(s) === scope.group) && matchesPick(s);
   const selected = inScope.filter(matchesFilters);
   const filtered = eligible.filter(matchesFilters);
-  let tokens = 0, input = 0, cacheRead = 0, cost = 0, priced = 0, total = 0, turns = 0;
+  let tokens = 0, input = 0, cacheRead = 0, pairedInput = 0, pairedRead = 0, cost = 0, priced = 0, total = 0, turns = 0;
   const days = new Map<string, { day: string; tokens: number; costUsd: number | null; sessions: Set<string> }>();
   const parts = emptyParts();
   const partKeys = Object.keys(parts) as Array<keyof typeof parts>;
@@ -422,18 +515,23 @@ export function aggregate(all: Summary[], requests: Map<string, ContextFold["req
   for (const s of filtered) {
     const turnIds = new Set<number>();
     for (const r of requests.get(s.agent.id) ?? []) {
-      const date = new Date(r.time);
-      const day = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+      const at = accountingTime(r), day = at > 0 ? dayKeyOf(at) : null;
+      if (day === null) continue;
+      const hasInput = usageSourceOf(r, "input"), hasOutput = usageSourceOf(r, "output"), hasRead = usageSourceOf(r, "cacheRead");
+      const measured = hasInput || hasOutput || hasRead || usageSourceOf(r, "cacheWrite") || usageSourceOf(r, "reasoning");
       const d = days.get(day) ?? { day, tokens: 0, costUsd: 0, sessions: new Set<string>() };
       d.tokens += r.usage.input + r.usage.output; d.sessions.add(s.agent.id);
       d.costUsd = d.costUsd === null || r.costUsd === null ? null : d.costUsd + r.costUsd;
       days.set(day, d);
-      if (r.time < start || r.time >= end) continue;
-      const usage = rangeUsage.get(s.agent.id) ?? { tokens: 0, complete: true };
-      usage.tokens += r.usage.input + r.usage.output;
-      usage.complete &&= r.costUsd !== null;
-      rangeUsage.set(s.agent.id, usage);
+      if (at < start || at >= end) continue;
+      if (measured) {
+        const usage = rangeUsage.get(s.agent.id) ?? { tokens: 0, complete: true };
+        usage.tokens += r.usage.input + r.usage.output;
+        usage.complete &&= r.costUsd !== null;
+        rangeUsage.set(s.agent.id, usage);
+      }
       total++; turnIds.add(r.turn); input += r.usage.input; cacheRead += r.usage.cacheRead;
+      if (hasInput && hasRead) { pairedInput += r.usage.input; pairedRead += r.usage.cacheRead; }
       tokens += r.usage.input + r.usage.output;
       if (r.costUsd !== null) { cost += r.costUsd; priced++; }
       const sum = Object.values(r.parts).reduce((a, b) => a + b, 0);
@@ -468,7 +566,7 @@ export function aggregate(all: Summary[], requests: Map<string, ContextFold["req
     toolsMs += intervals.filter((row) => row.kind === "tools").reduce((n, row) => n + row.end - row.start, 0);
   }
   return { sessions: selected.slice(offset, offset + 24), total: selected.length, scopeTotal: inScope.length, scanned, failed,
-    tokens, input, cacheRead, turns, calls: total, toolCalls: tools.reduce((n, t) => n + t.count, 0),
+    tokens, input, cacheRead, pairedInput, pairedRead, turns, calls: total, toolCalls: tools.reduce((n, t) => n + t.count, 0),
     wallMs, toolsMs, timing: sumTiming(selected), costUsd: priced ? cost : null,
     costComplete: total > 0 && priced === total, parts, groups,
     groupCounts, projects, window: { start, end: Number.isFinite(end) ? end - 1 : null, from: from || null, to: to || today || null },

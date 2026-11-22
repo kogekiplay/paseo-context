@@ -59,6 +59,25 @@ export function linesOf(s: string): number {
   return s.endsWith('\n') ? n : n + 1
 }
 
+export function patchFiles(patch: string): Array<{ path: string; added: number; removed: number }> {
+  const files: Array<{ path: string; added: number; removed: number }> = []
+  let file: typeof files[number] | undefined
+  for (const line of patch.split(/\r?\n/)) {
+    const header = /^\*\*\* (?:Add|Update|Delete) File: (.+)$/.exec(line)
+    if (header) {
+      file = { path: header[1], added: 0, removed: 0 }
+      files.push(file)
+    } else if (file && line.startsWith('+')) {
+      file.added++
+    } else if (file && line.startsWith('-')) {
+      file.removed++
+    } else if (line === '*** End Patch') {
+      break
+    }
+  }
+  return files
+}
+
 function pairOf(added: unknown, removed: unknown): { added: number; removed: number } {
   return {
     added: typeof added === 'string' ? linesOf(added) : 0,

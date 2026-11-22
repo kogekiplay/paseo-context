@@ -42,6 +42,27 @@ test("history gaps and epoch replacements never masquerade as a complete task li
     source.clear();
   }
 });
+
+test("shares requests for the same revision and prevents an older completion from replacing a newer one", async () => {
+  let finishOld!: (page: unknown) => void;
+  const oldPage = new Promise((resolve) => { finishOld = resolve; });
+  const refetch = vi.fn()
+    .mockReturnValueOnce(oldPage)
+    .mockResolvedValueOnce({ epoch: "a", entries: [entry("one", "completed")], hasOlder: false });
+  const paseo = { agents: { ref: () => ({ timeline: { refetch } }) } } as unknown as PaseoApi;
+  const source = new PaseoSubtasks();
+  try {
+    const oldRead = source.read("root", 1, paseo);
+    expect(source.read("root", 1, paseo)).toBe(oldRead);
+    const newer = source.read("root", 2, paseo);
+    expect(newer).not.toBe(oldRead);
+    await expect(newer).resolves.toMatchObject([{ status: "completed" }]);
+    finishOld({ epoch: "a", entries: [entry("one", "running")], hasOlder: false });
+    await expect(oldRead).resolves.toMatchObject([{ status: "in_progress" }]);
+    await expect(source.read("root", 2, paseo)).resolves.toMatchObject([{ status: "completed" }]);
+    expect(refetch).toHaveBeenCalledTimes(2);
+  } finally { source.clear(); }
+});
 test("Paseo subtasks resolve existing native children without adding another agent or losing failed/canceled tasks", () => {
   const agents = [
     { id: "root", sessionId: "root-native", provider: "codex", title: "Root" },

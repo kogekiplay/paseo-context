@@ -1,43 +1,29 @@
 import { emptyStats, type Stats } from "./meter-stats";
+import { emptyUsage, type Usage } from "../shared/contracts";
+import type { UsageSource, UsageSources } from "../shared/core/types";
+import { cumulativeDelta, requestUsage, sourcesOfUsage, usageBuckets, usageKeys } from "./usage-fields";
+import { count, record, text, timestamp, type RecordValue } from "./value";
 
-type RecordValue = Record<string, unknown>;
-const record = (value: unknown): RecordValue =>
-  typeof value === "object" && value !== null && !Array.isArray(value)
-    ? (value as RecordValue)
-    : {};
-const count = (value: unknown): number =>
-  typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
-const time = (value: unknown): number => (typeof value === "string" ? Date.parse(value) : NaN);
-
-interface Usage {
-  input: number;
-  cached: number;
-  write: number;
-  output: number;
+export interface UsageObservation {
+  id: string;
+  usage: Usage;
+  sources: UsageSources;
 }
-function codexUsage(value: unknown): Usage {
-  const u = record(value);
-  return {
-    input: count(u.input_tokens),
-    cached: count(u.cached_input_tokens ?? u.cache_read_input_tokens),
-    write: count(u.cache_write_input_tokens),
-    output: count(u.output_tokens),
-  };
-}
+type ResponseUsage = UsageObservation & { buckets: Partial<Usage> };
+const rowTime = (row: RecordValue) => timestamp(row.timestamp ?? row.createdAt) || NaN;
 
 /** Folds complete JSONL lines; content and tool arguments are never retained. */
 export class SessionFold {
   readonly stats: Stats;
+  readonly usage = emptyUsage();
+  readonly usageSources: UsageSources = {};
   lastTiming: { start: number; end: number; modelMs: number; ttftMs?: number } | null = null;
-  lastUsageRecord: RecordValue | null = null;
+  lastUsage: UsageObservation | null = null;
   private turn = "initial";
   private turns = new Set<string>();
-  private responses = new Set<string>();
+  private responses = new Map<string, ResponseUsage>();
   private modern = false;
-  private legacySteps = 0;
-  private legacyUsage: Usage = { input: 0, cached: 0, write: 0, output: 0 };
-  private modernUsage: Usage = { input: 0, cached: 0, write: 0, output: 0 };
-  private lastCumulative: Usage | null = null;
+  private lastCumulative: Partial<Usage> | null = null;
   private lastLegacySignature = "";
   private requestGeneration = 0;
   private boundary = NaN;
@@ -48,8 +34,7 @@ export class SessionFold {
   private lastModelOutput = NaN;
   private toolsAfterOutput = false;
   private pendingTools = new Map<string, number>();
-  private claude = new Map<string, Usage>();
-  private claudeTimings = new Map<string, { tokens: number; ms: number }>();
+  private timings = new Map<string, { tokens: number; ms: number }>();
   private chain = new Map<string, { parent: string | null; at: number; attachment: boolean }>();
   private claudeStarts = new Map<string, { start: number; first: number | null }>();
   private claudeTtft = new Set<string>();
@@ -62,7 +47,7 @@ export class SessionFold {
     this.turns.add(this.turn);
     this.stats.turns = this.turns.size;
   }
-  private timed(output: number, end: number) {
+  private timed(id: string, output: number, end: number) {
     const usageAt = end;
     const start = this.requestStart ?? this.boundary;
     // Older Codex can flush usage after waiting for tools. Its last model
@@ -70,8 +55,7 @@ export class SessionFold {
     if (this.toolsAfterOutput) end = this.lastModelOutput;
     const ms = end - start;
     if (Number.isFinite(ms) && ms >= 100 && ms <= 3_600_000 && output > 0) {
-      this.stats.modelMs += ms;
-      this.stats.timedOutputTokens += output;
+      this.updateTiming(id, ms, output);
       const first = this.firstOutput === null ? NaN : this.firstOutput - start;
       this.lastTiming = { start, end, modelMs: ms };
       if (this.firstKind === "text" && first > 0 && first <= ms) {
@@ -80,7 +64,11 @@ export class SessionFold {
         this.lastTiming.ttftMs = first;
       }
     }
-    this.boundary = Math.max(usageAt, Number.isFinite(this.boundary) ? this.boundary : usageAt);
+    // When a flush follows a tool result, that result remains the next
+    // observable inference boundary even if the flush was recorded later.
+    if (!this.toolsAfterOutput || !Number.isFinite(this.boundary)) {
+      this.boundary = Math.max(usageAt, Number.isFinite(this.boundary) ? this.boundary : usageAt);
+    }
     this.lastUsageAt = usageAt;
     this.requestStart = null;
     this.firstOutput = null;
@@ -88,22 +76,44 @@ export class SessionFold {
     this.lastModelOutput = NaN;
     this.toolsAfterOutput = false;
   }
-  private setUsage(u: Usage) {
-    this.stats.inputTokens = u.input;
-    this.stats.cachedTokens = u.cached;
-    this.stats.cacheWriteTokens = u.write;
-    this.stats.outputTokens = u.output;
+  private updateTiming(id: string, ms: number, output: number) {
+    const prior = this.timings.get(id);
+    this.stats.modelMs += ms - (prior?.ms ?? 0);
+    this.stats.timedOutputTokens += output - (prior?.tokens ?? 0);
+    this.timings.set(id, { tokens: output, ms });
   }
-  apply(value: unknown) {
+
+  private recordUsage(id: string, patch: Partial<Usage>, source: UsageSource) {
+    const previous = this.responses.get(id);
+    const buckets = { ...previous?.buckets, ...patch };
+    const sources = { ...previous?.sources, ...sourcesOfUsage(patch, source) };
+    const usage = requestUsage(buckets, this.provider);
+    this.responses.set(id, { id, buckets, usage, sources });
+    this.lastUsage = { id, usage, sources };
+    for (const key of usageKeys) {
+      this.usage[key] += usage[key] - (previous?.usage[key] ?? 0);
+      const lane = sources[key], prior = this.usageSources[key];
+      if (lane) this.usageSources[key] = prior && prior !== lane ? "mixed" : lane;
+    }
+    this.stats.inputTokens = this.usage.input;
+    this.stats.cachedTokens = this.usage.cacheRead;
+    this.stats.cacheWriteTokens = this.usage.cacheWrite;
+    this.stats.outputTokens = this.usage.output;
+    this.stats.steps = this.responses.size;
+    if (!previous) this.addTurn();
+    return usage;
+  }
+
+  apply(value: unknown, line: number) {
     this.lastTiming = null;
-    this.lastUsageRecord = null;
+    this.lastUsage = null;
     const row = record(value);
-    if (this.provider === "codex") this.codex(row);
-    else this.claudeRow(row);
+    if (this.provider === "codex") this.codex(row, line);
+    else this.claudeRow(row, line);
   }
-  private codex(row: RecordValue) {
+  private codex(row: RecordValue, line: number) {
     const p = record(row.payload),
-      at = time(row.timestamp);
+      at = rowTime(row);
     if (row.type === "event_msg") {
       if (p.type === "task_started") {
         this.requestGeneration++;
@@ -115,6 +125,7 @@ export class SessionFold {
         this.firstKind = null;
         this.lastModelOutput = NaN;
         this.toolsAfterOutput = false;
+        this.lastUsageAt = NaN;
       }
       if (p.type === "task_complete" || p.type === "task_completed" || p.type === "turn_aborted") {
         this.boundary = NaN;
@@ -141,54 +152,37 @@ export class SessionFold {
       if (p.type !== "token_count" || this.modern) return;
       const info = record(p.info);
       if (!info.total_token_usage && !info.last_token_usage) return;
-      const u = codexUsage(info.total_token_usage);
-      const prev = this.lastCumulative;
       const signature = JSON.stringify([this.turn, this.requestGeneration, info.total_token_usage, info.last_token_usage]);
       if (signature === this.lastLegacySignature) return;
       this.lastLegacySignature = signature;
-      const rawLast = record(info.last_token_usage);
-      const hasLast = ["input_tokens", "output_tokens", "cached_input_tokens", "cache_read_input_tokens", "cache_write_input_tokens"]
-        .some((key) => typeof rawLast[key] === "number" && Number.isFinite(rawLast[key]) && (rawLast[key] as number) >= 0);
-      // Exact per-request usage avoids mixing independently advancing cumulative
-      // lanes. Without it, retain the legacy counter-reset fallback.
-      const reset = prev && (u.input < prev.input || u.output < prev.output);
-      const delta = hasLast ? codexUsage(rawLast) : {
-        input: Math.max(0, u.input - (reset ? 0 : prev?.input ?? 0)),
-        cached: Math.max(0, u.cached - (reset ? 0 : prev?.cached ?? 0)),
-        write: Math.max(0, u.write - (reset ? 0 : prev?.write ?? 0)),
-        output: Math.max(0, u.output - (reset ? 0 : prev?.output ?? 0)),
-      };
-      if (info.total_token_usage) this.lastCumulative = u;
-      if (!hasLast && this.requestStart === null && Object.values(delta).every((value) => value === 0)) return;
-      this.lastUsageRecord = hasLast ? rawLast : record(info.total_token_usage);
-      for (const key of Object.keys(delta) as (keyof Usage)[]) this.legacyUsage[key] += delta[key];
-      this.legacySteps++;
-      this.stats.steps = this.legacySteps;
-      this.addTurn();
-      this.setUsage(this.legacyUsage);
-      this.timed(delta.output, at);
+      const exact = usageBuckets(info.last_token_usage, "codex");
+      const cumulative = usageBuckets(info.total_token_usage, "codex");
+      const hasExact = Object.keys(exact).length > 0;
+      // Cumulative lanes may advance independently of an exact response. Only
+      // use their deltas when the record has no exact response buckets.
+      const buckets = hasExact ? exact : cumulativeDelta(cumulative, this.lastCumulative);
+      if (info.total_token_usage && Object.keys(cumulative).length > 0) this.lastCumulative = cumulative;
+      if (Object.keys(buckets).length === 0) return;
+      if (!hasExact && this.requestStart === null && !Object.values(buckets).some((value) => value > 0)) return;
+      const id = `legacy:${line}`;
+      const usage = this.recordUsage(id, buckets, hasExact ? "reported" : "cumulative");
+      this.timed(id, usage.output, at);
     }
     if (row.type === "turn_context") {
       if (typeof p.turn_id === "string") this.turn = p.turn_id;
       if (Number.isFinite(at)) this.boundary = at;
     }
     if (row.type === "token_usage_record") {
-      const id =
-        typeof p.response_id === "string" ? p.response_id : String(row.ordinal ?? row.timestamp);
-      if (this.responses.has(id)) return;
-      if (!this.modern) {
-        this.modern = true;
-        // Preserve billed history when a session is resumed with a newer Codex.
-        this.modernUsage = { ...this.legacyUsage };
+      const id = text(p.response_id) || String(row.ordinal ?? row.timestamp ?? line);
+      const existing = this.responses.has(id);
+      this.modern = true;
+      if (!existing && typeof p.turn_id === "string") this.turn = p.turn_id;
+      const usage = this.recordUsage(id, usageBuckets(p.usage, "codex"), "reported");
+      if (!existing) this.timed(id, usage.output, at);
+      else {
+        const timing = this.timings.get(id);
+        if (timing && timing.tokens !== usage.output) this.updateTiming(id, timing.ms, usage.output);
       }
-      this.responses.add(id);
-      if (typeof p.turn_id === "string") this.turn = p.turn_id;
-      const u = codexUsage(p.usage);
-      for (const k of Object.keys(u) as (keyof Usage)[]) this.modernUsage[k] += u[k];
-      this.stats.steps = this.legacySteps + this.responses.size;
-      this.addTurn();
-      this.setUsage(this.modernUsage);
-      this.timed(u.output, at);
     }
     if (row.type === "response_item") {
       const output =
@@ -230,10 +224,10 @@ export class SessionFold {
     this.pendingTools.delete(id);
   }
 
-  private claudeRow(row: RecordValue) {
+  private claudeRow(row: RecordValue, line: number) {
     if (row.isSidechain === true || row.isApiErrorMessage === true) return;
     const msg = record(row.message),
-      at = time(row.timestamp);
+      at = rowTime(row);
     if (typeof row.uuid === "string")
       this.chain.set(row.uuid, {
         parent: typeof row.parentUuid === "string" ? row.parentUuid : null,
@@ -251,7 +245,7 @@ export class SessionFold {
       }
       this.boundary = at;
     }
-    if (row.type !== "assistant" || !msg.usage || typeof msg.id !== "string") return;
+    if (row.type !== "assistant") return;
     for (const block of content) {
       if (
         block.type === "tool_use" &&
@@ -260,18 +254,8 @@ export class SessionFold {
       )
         this.pendingTools.set(block.id, at);
     }
-    const raw = record(msg.usage);
-    const u: Usage = {
-      input:
-        count(raw.input_tokens) +
-        count(raw.cache_read_input_tokens) +
-        count(raw.cache_creation_input_tokens),
-      cached: count(raw.cache_read_input_tokens),
-      write: count(raw.cache_creation_input_tokens),
-      output: count(raw.output_tokens),
-    };
-    const prev = this.claude.get(msg.id);
-    let timing = this.claudeStarts.get(msg.id);
+    const id = text(msg.id) || String(line);
+    let timing = this.claudeStarts.get(id);
     if (!timing) {
       let parent = typeof row.parentUuid === "string" ? row.parentUuid : null;
       let start = this.boundary;
@@ -290,33 +274,25 @@ export class SessionFold {
       const first =
         firstBlock && content[0]?.type === "thinking" && duration > 0 ? at - duration : null;
       timing = { start, first };
-      this.claudeStarts.set(msg.id, timing);
+      this.claudeStarts.set(id, timing);
     }
-    this.claude.set(msg.id, u);
-    this.stats.inputTokens += u.input - (prev?.input ?? 0);
-    this.stats.cachedTokens += u.cached - (prev?.cached ?? 0);
-    this.stats.cacheWriteTokens += u.write - (prev?.write ?? 0);
-    this.stats.outputTokens += u.output - (prev?.output ?? 0);
-    this.stats.steps = this.claude.size;
-    this.addTurn();
-    const prior = this.claudeTimings.get(msg.id);
+    if (!msg.usage) return;
+    const usage = this.recordUsage(id, usageBuckets(msg.usage, "claude"), "reported");
     const ms = at - timing.start;
     if (Number.isFinite(ms) && ms >= 100 && ms <= 3_600_000) {
-      this.stats.modelMs += ms - (prior?.ms ?? 0);
-      this.stats.timedOutputTokens += u.output - (prior?.tokens ?? 0);
-      this.claudeTimings.set(msg.id, { tokens: u.output, ms });
+      this.updateTiming(id, ms, usage.output);
       this.lastTiming = { start: timing.start, end: at, modelMs: ms };
     }
     const first = timing.first === null ? NaN : timing.first - timing.start;
     if (
       typeof msg.stop_reason === "string" &&
-      !this.claudeTtft.has(msg.id) &&
+      !this.claudeTtft.has(id) &&
       ms >= 100 &&
       ms <= 3_600_000 &&
       first > 0 &&
       first <= ms
     ) {
-      this.claudeTtft.add(msg.id);
+      this.claudeTtft.add(id);
       this.stats.ttftMs += first;
       this.stats.ttftSteps++;
     }

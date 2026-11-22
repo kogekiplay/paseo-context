@@ -1,4 +1,14 @@
 import type { ContextTimeline, TokenUsage } from "./core/types";
+import type { Request, Usage } from "./contracts";
+
+export function usageSourceOf(request: Pick<Request, "usageFields" | "usageSources">, field: keyof Usage) {
+  if (request.usageSources !== undefined) return request.usageSources[field];
+  return !request.usageFields || request.usageFields.includes(field) ? "reported" : undefined;
+}
+
+export function observedUsage(request: Pick<Request, "usage" | "usageFields" | "usageSources">, field: keyof Usage) {
+  return usageSourceOf(request, field) ? request.usage[field] : null;
+}
 
 /** Absence means unavailable; a captured provider report containing zero stays zero. */
 export function reportedUsageOf(head: Pick<ContextTimeline, "cost">): TokenUsage | null {

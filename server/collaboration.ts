@@ -59,6 +59,20 @@ export class CollaborationLedger {
   readonly tasks = new Map<string, CapturedTask>();
   private pending = new Map<string, Pending>();
 
+  get residentBytes() {
+    const taskBytes = (task: Partial<Pick<CapturedTask, "subject" | "description" | "blockedBy" | "writeScopes">>) =>
+      256 + 2 * ((task.subject?.length ?? 0) + (task.description?.length ?? 0)
+      + (task.blockedBy?.reduce((n, id) => n + id.length + 16, 0) ?? 0)
+      + (task.writeScopes?.reduce((n, path) => n + path.length + 16, 0) ?? 0));
+    let bytes = this.records.length * 1200 + this.children.size * 512;
+    for (const task of this.tasks.values()) bytes += taskBytes(task);
+    for (const call of this.pending.values()) {
+      bytes += 1200;
+      for (const task of call.updates ?? []) bytes += taskBytes(task);
+    }
+    return bytes;
+  }
+
   private tasksOf(args: RecordValue, tool: string, nodeId: number): Pick<Pending, "updates" | "snapshot"> {
     const list = Array.isArray(args.plan) ? args.plan : Array.isArray(args.todos) ? args.todos : null;
     if (list) {
@@ -107,14 +121,14 @@ export class CollaborationLedger {
     }
   }
   apply(message: Message, nodeId: number, at: number) {
-    const tool = (message.tool ?? "").split(".").at(-1)!.replace(/^mcp__.*?__/, "").toLowerCase();
-    const args = message.args ?? parseArgs(message.text);
     if (message.category === "calls") {
+      const tool = (message.tool ?? "").split(".").at(-1)!.replace(/^mcp__.*?__/, "").toLowerCase();
       const kind = /(?:spawn_agent|create_agent|delegate|^task$|^agent$)/.test(tool) ? "delegation"
         : /(?:send_input|send_message|sendmessage|agent_send|message_agent)/.test(tool) ? "message"
         : /(?:task_create|taskcreate|task_update|taskupdate|update_plan|todowrite)/.test(tool) ? "task"
         : /^(?:wait|wait_agent|wait_agents)$/.test(tool) ? "wait" : null;
       if (!kind) return;
+      const args = message.args ?? parseArgs(message.text);
       const title = text(args.message ?? args.content ?? args.prompt ?? args.description ?? args.subject ?? args.explanation) || tool;
       const to = text(args.agent_id ?? args.recipient ?? args.to ?? args.id ?? args.target) || (args.type === "broadcast" ? "*" : "");
       const pending: Pending = { nodeId, title: title.slice(0, 500), tool, kind,

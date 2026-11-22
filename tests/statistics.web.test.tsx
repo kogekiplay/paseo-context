@@ -103,7 +103,17 @@ test("expanded details refresh on content revision changes and ignore an old lat
   expect(JSON.stringify(renderer!.toJSON())).not.toContain("stale body");
   await act(async () => renderer!.update(createElement(Statistics, { sessionId: "agent-a", locale: "zh-CN", snapshot: snapshot("c") })));
   expect(requests).toHaveLength(3);
+  // Collapsing the step stops further automatic background detail refetches on poll updates.
+  const collapseTarget = {
+    closest: () => ({
+      getAttribute: () => "step:one",
+      querySelector: () => ({ getAttribute: () => "true" }),
+    }),
+  };
+  await act(async () => root.findByProps({ className: "pc-statistics" }).props.onClickCapture({ target: collapseTarget }));
+  expect(requests[2].signal.aborted).toBe(true);
+  await act(async () => renderer!.update(createElement(Statistics, { sessionId: "agent-a", locale: "zh-CN", snapshot: snapshot("d") })));
+  expect(requests).toHaveLength(3);
   await act(async () => renderer!.unmount());
   renderer = null;
-  expect(requests[2].signal.aborted).toBe(true);
 });

@@ -1,9 +1,9 @@
 import type { Category } from "../shared/contracts";
-import { printable, record, text, type RecordValue } from "./value";
+import { parseArgs, printable, record, text, type RecordValue } from "./value";
 
 export interface Message {
   category: Category; title: string; text: string; block: number;
-  tool?: string; callId?: string; args?: RecordValue; error?: boolean; images?: number;
+  tool?: string; callId?: string; args?: RecordValue; error?: boolean; images?: number; durationMs?: number;
 }
 export function toolKind(name: string): string {
   const n = name.split(".").at(-1)!.replace(/^mcp__[^_]+__/, "").toLowerCase();
@@ -60,7 +60,10 @@ export function messagesOf(row: RecordValue, provider: string): Message[] {
   if (provider === "claude") {
     if (row.type === "system" && row.subtype === "compact_boundary") return [];
     const msg = record(row.message);
-    if (typeof msg.content === "string") return [{ category: row.isMeta ? "inject" : "user", title: text(row.type), text: msg.content, block: -1 }];
+    if (typeof msg.content === "string") return [{
+      category: row.isMeta ? "inject" : row.type === "assistant" ? "assistant" : "user",
+      title: text(row.type), text: msg.content, block: -1,
+    }];
     if (!Array.isArray(msg.content)) return [];
     return msg.content.map((value, block): Message => {
       const b = record(value), type = text(b.type);
@@ -76,21 +79,25 @@ export function messagesOf(row: RecordValue, provider: string): Message[] {
   const type = text(row.type);
   const content = printable(row.text ?? row.message ?? row.content ?? row.detail);
   if (type === "tool_call") {
-    const detail = record(row.detail), kind = text(detail.type), original = record(row.input);
+    const detail = record(row.detail), kind = text(detail.type);
     const args = kind === "shell" ? { command: detail.command, workdir: detail.cwd }
       : kind === "read" ? { file_path: detail.filePath, offset: detail.offset, limit: detail.limit }
       : kind === "edit" ? { file_path: detail.filePath, old_string: detail.oldString, new_string: detail.newString }
       : kind === "write" ? { file_path: detail.filePath, content: detail.content }
       : kind === "search" ? { pattern: detail.query, path: (detail.filePaths as unknown[] | undefined)?.[0] }
-      : original;
+      : kind === "fetch" ? { url: detail.url, prompt: detail.prompt }
+      : parseArgs(kind === "unknown" ? detail.input ?? row.input : row.input);
     const tool = text(row.name) || ({ shell: "bash", read: "read", edit: "edit", write: "write", search: "grep" } as Record<string, string>)[kind] || kind;
     const callId = text(row.callId ?? row.id);
     const call: Message = { category: "calls", title: tool, text: printable(args), tool, callId, args, block: 0 };
     if (row.status === "running") return [call];
-    const result = printable(detail.output ?? detail.content ?? detail.text ?? record(detail).log);
+    const captured = kind === "fetch" ? detail.result : kind === "edit" ? detail.unifiedDiff : undefined;
+    const result = printable(captured ?? detail.output ?? detail.content ?? detail.text ?? detail.log);
     const exit = typeof detail.exitCode === "number" ? `\nProcess exited with code ${detail.exitCode}` : "";
+    const duration = detail.durationMs ?? (typeof detail.durationSeconds === "number" ? detail.durationSeconds * 1000 : undefined);
+    const durationMs = typeof duration === "number" && Number.isFinite(duration) && duration >= 0 ? duration : undefined;
     return [call, { category: "tool", title: tool, text: result + exit || printable(row.error) || text(row.status),
-      callId, error: row.status === "failed" || row.status === "canceled", block: 1 }];
+      callId, error: row.status === "failed" || row.status === "canceled", durationMs, block: 1 }];
   }
   if (type === "tool_result") return [{ category: "tool", title: "Tool result", text: content, callId: text(row.callId), block: -1 }];
   const category: Category | null = type === "reasoning" ? "reasoning" : /assistant/.test(type) ? "assistant" : /user/.test(type) ? "user" : null;

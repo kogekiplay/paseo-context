@@ -1,21 +1,25 @@
-import { emptyParts, emptyUsage, type Agent, type Command, type ContextEvent, type ContextNode, type FileActivity, type Parts, type Request, type Summary, type Tally, type Usage } from "../shared/contracts";
+import { emptyParts, type Agent, type Command, type ContextEvent, type ContextNode, type FileActivity, type Parts, type Request, type Summary, type Tally } from "../shared/contracts";
 import { estimateTextTokens } from "../shared/core/estimate";
 import { programsOfCommand } from "../shared/core/commands";
-import { opsOfCall, IMAGE_FILE_EXT } from "../shared/core/fileOps";
-import { SessionFold } from "./meter";
+import { opsOfCall, opBearingTool, patchFiles, IMAGE_FILE_EXT } from "../shared/core/fileOps";
+import { SessionFold, type UsageObservation } from "./meter";
 import { CollaborationLedger } from "./collaboration";
 import { messagesOf, toolKind, type Message } from "./normalize";
-import { count, parseArgs, printable, record, text, timestamp, type RecordValue } from "./value";
+import { count, parseArgs, record, text, timestamp, type RecordValue } from "./value";
 import { unionMs } from "./timing";
-import { usageFields } from "./usage-fields";
+import { usageKeys } from "./usage-fields";
 import { StatisticsSpans } from "./statistics-spans";
 import { createHash, randomUUID } from "node:crypto";
+
+interface PendingRequest { boundary: number; seq: number; parts: Parts; start: number; anchor: number }
+const nodeHash = (value: string) => createHash("sha256").update(value).digest("hex");
 
 export class ContextFold {
   readonly nodes: ContextNode[] = [];
   readonly contentHashes: string[] = [];
+  readonly toolResults = new Map<string, ContextNode>();
   readonly requests: Request[] = [];
-  readonly events: ContextEvent[] = [];
+  readonly events: Array<ContextEvent & { seq: number }> = [];
   readonly files: FileActivity[] = [];
   readonly commands: Command[] = [];
   readonly tools = new Map<string, Tally>();
@@ -34,20 +38,30 @@ export class ContextFold {
   private line = 0;
   private turn = 0;
   private active = emptyParts();
-  private pending: { boundary: number; seq: number; parts: Parts; start: number } | null = null;
+  private pending: PendingRequest | null = null;
   private calls = new Map<string, { node: ContextNode; command?: Command; files: FileActivity[]; skill?: string }>();
   private requestIds = new Map<string, number>();
   private claudeNodes = new Map<string, Map<string, number>>();
   private turnIds = new Set<string>();
   private boundaryAt = 0;
+  private boundaryLine = 0;
+  private lastAnchor = 0;
+  private contextRequest = -1;
+  private contextFloor = 0;
   private nodeTurns: number[] = [];
   private background = new Map<string, Command>();
   private lastPrompt = "";
   private modelMs = 0;
-  private toolMs = 0;
   private slot = 2;
   private toolIntervals = new Map<string, { start: number; end: number; kind: "tools" }>();
+  private toolDurations = new Map<string, number>();
   get revision() { return this.line; }
+  get hasToolTiming() { return this.toolDurations.size > 0; }
+  requestIndex(id: string) { return this.requestIds.get(id); }
+  get residentBytes() {
+    return this.line * 160 + this.nodes.length * 768 + this.requests.length * 768
+      + this.events.length * 256 + this.files.length * 384 + this.commands.length * 4608 + this.collaboration.residentBytes;
+  }
 
   constructor(readonly provider: string, readonly epoch: string = randomUUID()) {
     this.meter = new SessionFold(provider === "claude" ? "claude" : "codex");
@@ -73,12 +87,24 @@ export class ContextFold {
     }
     const keep = { system: this.active.system, tools: this.active.tools };
     this.active = { ...emptyParts(), ...keep };
-    this.contextTokens = null;
-    this.pending = null;
+    this.resetContext();
     this.event("compaction", at, "Context compacted", "Earlier messages were replaced by a summary.");
   }
-  private add(message: Message, at: number, row: RecordValue) {
+  private resetContext() {
+    this.contextTokens = null;
+    this.contextFloor = this.requests.length;
+    this.pending = null;
+    this.lastAnchor = this.boundaryLine;
+  }
+  private startRequest(at: number): PendingRequest {
+    const anchor = this.boundaryLine > this.lastAnchor ? this.boundaryLine : 0;
+    return { boundary: this.nodes.length, seq: this.line * 1_000_000 + 1, parts: { ...this.active },
+      start: anchor && this.boundaryAt > 0 ? this.boundaryAt : at, anchor };
+  }
+  private add(message: Message, at: number, row: RecordValue, replayed: boolean) {
     if (!message.text && !message.tool && !message.images) return;
+    if (!replayed && this.provider === "timeline" && message.category === "calls"
+      && message.callId && this.calls.has(message.callId)) return;
     if (this.provider === "claude") {
       const key = text(record(row.message).id) || text(row.uuid);
       if (key) {
@@ -86,31 +112,33 @@ export class ContextFold {
         const signature = `${row.apiBlockIndex ?? message.block}:${message.category}:${message.callId ?? ""}`;
         const previous = seen.get(signature);
         if (previous !== undefined) {
-          const node = this.nodes[previous], tokens = estimateTextTokens(message.text);
+          const node = this.nodes[previous], tokens = message.images ? 1024 * message.images : estimateTextTokens(message.text);
           if (node.gone === undefined) this.active[node.category] += tokens - node.tokens;
           node.tokens = tokens; node.preview = message.text.replace(/\s+/g, " ").slice(0, 180);
+          node.textLength = message.text.length;
           node.line = this.line; node.block = message.block;
           node.error = message.error;
-          this.contentHashes[previous] = createHash("sha256").update(message.text).digest("hex");
+          this.contentHashes[previous] = nodeHash(message.text);
           return;
         }
         seen.set(signature, this.nodes.length);
         this.claudeNodes.set(key, seen);
       }
     }
-    if (message.category === "user") {
+    if (!replayed && message.category === "user") {
       this.lastPrompt = message.text.replace(/\s+/g, " ").slice(0, 180);
     }
-    if (["assistant", "reasoning", "calls"].includes(message.category) && this.pending === null) {
-      this.pending = { boundary: this.nodes.length, seq: this.line * 1_000_000 + 1, parts: { ...this.active }, start: this.boundaryAt || at };
+    if (!replayed && ["assistant", "reasoning", "calls"].includes(message.category) && this.pending === null) {
+      this.pending = this.startRequest(at);
     }
     const tokens = message.images ? 1024 * message.images : estimateTextTokens(message.text);
     const node: ContextNode = {
       id: this.nodes.length, seq: this.line * 1_000_000 + this.slot++, line: this.line, block: message.block, category: message.category, time: at,
       tokens, title: message.title || message.category, preview: message.text.replace(/\s+/g, " ").slice(0, 180),
+      textLength: message.text.length,
       ...(message.images ? { images: message.images } : {}),
       ...(message.callId ? { callId: message.callId } : {}), ...(message.tool ? { tool: message.tool, source: this.toolSource(message.tool) } : {}),
-      ...(message.error === undefined ? {} : { error: message.error }),
+      ...(message.error === undefined ? {} : { error: message.error }), ...(replayed ? { replayed: true } : {}),
     };
     let loadedSkill: string | undefined;
     if (message.category === "tool" && message.callId) {
@@ -120,16 +148,23 @@ export class ContextFold {
         node.tool = call.node.tool;
         node.title = call.node.title;
         node.source = call.node.source;
-        this.toolMs += Math.max(0, at - call.node.time);
-        this.toolIntervals.set(message.callId, { start: call.node.time, end: at, kind: "tools" });
-        for (const file of call.files) file.error = message.error === true;
-        if (call.command) {
+        const paired = !replayed && call.node.time > 0 && at >= call.node.time
+          && (this.provider !== "timeline" || call.node.line !== this.line);
+        const duration = message.durationMs ?? (paired ? at - call.node.time : undefined);
+        if (!replayed && duration !== undefined) {
+          node.toolDurationMs = duration;
+          this.toolDurations.set(message.callId, duration);
+          if (paired) this.toolIntervals.set(message.callId, { start: call.node.time, end: at, kind: "tools" });
+        }
+        if (!replayed) for (const file of call.files) file.error = message.error === true;
+        if (!replayed && call.command) {
           const c = call.command;
           const code = /(?:exit(?:ed)?(?:\s+with)?(?:\s+code)?[=: ]+|Process exited with code )(-?\d+)/i.exec(message.text);
           const background = /Process running with session ID|still running|background job/i.test(message.text);
           c.exit = code ? Number(code[1]) : null;
           c.status = background ? "running" : message.error || (c.exit !== null && c.exit !== 0) ? "failed" : "completed";
-          c.duration = background ? null : Math.max(0, at - c.time);
+          c.duration = background ? null : message.durationMs
+            ?? (c.time > 0 && at >= c.time && (this.provider !== "timeline" || paired) ? at - c.time : null);
           c.outputNode = node.id;
           c.outputNodes ??= [];
           if (!c.outputNodes.includes(node.id)) c.outputNodes.push(node.id);
@@ -139,21 +174,26 @@ export class ContextFold {
         }
       }
     }
-    this.images += message.images ?? 0;
     this.nodes.push(node);
-    this.contentHashes[node.id] = createHash("sha256").update(message.text).digest("hex");
+    this.contentHashes[node.id] = nodeHash(message.text);
     this.nodeTurns.push(this.turn);
     this.active[message.category] += tokens;
-    this.collaboration.apply(message, node.id, at);
-    if (message.category === "calls" && message.tool) this.call(node, message, at);
-    if (message.category === "inject") this.event("inject", at, message.title, node.preview);
+    if (!replayed) {
+      this.images += message.images ?? 0;
+      this.collaboration.apply(message, node.id, at);
+      if (message.category === "tool" && message.callId) this.toolResults.set(message.callId, node);
+      if (message.category === "calls" && message.tool) this.call(node, message, at);
+      if (message.category === "inject") this.event("inject", at, message.title, node.preview);
+    }
     if (message.category === "tool" && loadedSkill) {
       const name = /(?:^|\n)name:\s*([^\n]+)/.exec(message.text)?.[1]?.trim() ?? loadedSkill;
       node.category = "skill";
       this.active.tool -= tokens;
       this.active.skill += tokens;
-      this.tally(this.skills, name, at);
-      this.event("skill", at, name, node.preview);
+      if (!replayed) {
+        this.tally(this.skills, name, at);
+        this.event("skill", at, name, node.preview);
+      }
     }
   }
   private toolSource(name: string) {
@@ -165,16 +205,13 @@ export class ContextFold {
   private call(node: ContextNode, message: Message, at: number) {
     const name = message.tool!, kind = toolKind(name), args = message.args ?? parseArgs(message.text);
     this.tally(this.tools, name, at);
-    const files: FileActivity[] = opsOfCall({ seq: node.id, tool: kind, argsRaw: JSON.stringify(args), time: at }).map((f) => ({
+    const files: FileActivity[] = opsOfCall({ seq: node.id, tool: kind, argsRaw: opBearingTool(kind) ? JSON.stringify(args) : undefined, time: at }).map((f) => ({
       id: node.id, time: at, path: f.path, kind: IMAGE_FILE_EXT.test(f.path) ? "image" : f.kind,
       tool: name, added: f.added, removed: f.removed, error: false,
     }));
     if (kind === "patch") {
       const patch = text(args.input) || message.text;
-      for (const match of patch.matchAll(/\*\*\* (?:Add|Update|Delete) File: ([^\n]+)/g)) {
-        files.push({ id: node.id, time: at, path: match[1], kind: "write", tool: name,
-          added: (patch.match(/^\+[^+]/gm) ?? []).length, removed: (patch.match(/^-[^-]/gm) ?? []).length, error: false });
-      }
+      for (const file of patchFiles(patch)) files.push({ ...file, id: node.id, time: at, kind: "write", tool: name, error: false });
     }
     this.files.push(...files);
     let command: Command | undefined;
@@ -194,12 +231,22 @@ export class ContextFold {
     const skill = skillPath ? skillPath.replace(/[/\\]SKILL\.md$/i, "").split(/[/\\]/).at(-1) : /(?:^|[._])skill$/i.test(name) ? text(args.name) || "skill" : undefined;
     if (message.callId) this.calls.set(message.callId, { node, command, files, skill });
   }
-  private request(id: string, usage: Usage, at: number, model: string, fields: (keyof Usage)[], timing: Partial<Pick<Request, "estimatedModelMs" | "estimatedTtftMs" | "estimatedModelStart" | "estimatedModelEnd">> = {}) {
+  private request(observation: UsageObservation, at: number, model: string, timing: Partial<Pick<Request, "estimatedModelMs" | "estimatedTtftMs" | "estimatedModelStart" | "estimatedModelEnd">>) {
+    const { id, usage, sources } = observation;
+    const fields = usageKeys.filter((field) => sources[field] !== undefined);
     const previousIndex = this.requestIds.get(id);
+    const index = previousIndex ?? this.requests.length;
+    if (sources.input === "reported" && index >= this.contextFloor && index >= this.contextRequest) {
+      this.contextTokens = usage.input;
+      this.contextRequest = index;
+    }
     if (previousIndex !== undefined) {
       const previous = this.requests[previousIndex];
       previous.usage = usage;
       previous.usageFields = fields;
+      previous.usageSources = sources;
+      if (model) previous.model = model;
+      if (!previous.usageAt && at > 0) previous.usageAt = at;
       Object.assign(previous, timing);
       if (this.provider === "claude") {
         previous.response = this.nodes.slice(previous.boundary).filter((n) => ["assistant", "calls"].includes(n.category)).map((n) => n.preview).join(" · ").slice(0, 240);
@@ -208,14 +255,15 @@ export class ContextFold {
       }
       return;
     }
-    const pending = this.pending ?? { boundary: this.nodes.length, seq: this.line * 1_000_000 + 1, parts: { ...this.active }, start: at };
+    const pending = this.pending ?? this.startRequest(at);
     const response = this.nodes.slice(pending.boundary).filter((n) => ["assistant", "calls"].includes(n.category)).map((n) => n.preview).join(" · ").slice(0, 240);
     const duration = at > pending.start ? at - pending.start : null;
     this.requests.push({ id, index: this.requests.length + 1, turn: Math.max(1, this.turn), time: pending.start || at,
       boundary: pending.boundary, seq: pending.seq, parts: pending.parts, usage, model: model || this.model,
-      duration, prompt: this.lastPrompt, response, costUsd: null, usageFields: fields, ...timing });
+      duration, prompt: this.lastPrompt, response, costUsd: null, usageFields: fields, usageSources: sources,
+      ...(at > 0 ? { usageAt: at } : {}), ...timing });
     this.requestIds.set(id, this.requests.length - 1);
-    if (fields.includes("input")) this.contextTokens = usage.input;
+    this.lastAnchor = Math.max(this.lastAnchor, pending.anchor);
     this.pending = null;
   }
   apply(value: unknown) {
@@ -223,8 +271,7 @@ export class ContextFold {
     this.slot = 2;
     const row = record(value), p = record(row.payload), at = timestamp(row.timestamp ?? row.createdAt);
     if (this.provider === "claude" && (row.isSidechain === true || row.isApiErrorMessage === true)) return;
-    const before = { ...this.meter.stats };
-    if (this.provider === "codex" || this.provider === "claude") this.meter.apply(row);
+    if (this.provider === "codex" || this.provider === "claude") this.meter.apply(row, this.line);
     if (row.type === "turn_context") {
       const turnId = text(p.turn_id) || `context:${this.line}`;
       this.turnIds.add(turnId); this.turn = this.turnIds.size;
@@ -244,7 +291,7 @@ export class ContextFold {
         }
         this.active = emptyParts();
         for (const node of this.nodes) if (node.gone === undefined) this.active[node.category] += node.tokens;
-        this.pending = null; this.contextTokens = null;
+        this.resetContext();
         this.event("prune", at, "Conversation rollback", `${n} turns removed from active context`);
       }
     }
@@ -254,82 +301,67 @@ export class ContextFold {
     if (count(info.model_context_window) > 0) this.contextWindow = count(info.model_context_window);
     if (count(p.model_context_window) > 0) this.contextWindow = count(p.model_context_window);
     const messages = messagesOf(row, this.provider);
-    if (messages.some((m) => m.category === "user")) {
+    const replayed = row.type === "compacted" && Array.isArray(p.replacement_history);
+    if (!replayed && messages.some((m) => m.category === "user")) {
       this.humanInputs++;
       if (this.provider !== "codex") this.turn++;
     }
     if (this.provider === "claude" && row.type === "assistant" && text(record(row.message).id)) {
       const previous = this.requestIds.get(text(record(row.message).id));
       const request = previous === undefined ? null : this.requests[previous];
-      this.pending = request ? { boundary: request.boundary, seq: request.seq!, parts: request.parts, start: request.time }
-        : { boundary: this.nodes.length, seq: this.line * 1_000_000 + 1, parts: { ...this.active }, start: this.boundaryAt || at };
+      this.pending = request ? { boundary: request.boundary, seq: request.seq!, parts: request.parts, start: request.time, anchor: 0 }
+        : this.pending ?? this.startRequest(at);
     }
     if (row.type === "turn_context" && Array.isArray(p.tools)) {
-      for (const node of this.nodes) if (node.category === "tools" && node.gone === undefined) {
+      for (const id of this.toolEpochs.at(-1)?.nodeIds ?? []) {
+        const node = this.nodes[id];
         node.gone = this.nodes.length; node.goneSeq = this.line * 1_000_000;
       }
       this.active.tools = 0;
     }
     const firstNode = this.nodes.length;
-    for (const message of messages) this.add(message, at, row);
+    for (const message of messages) this.add(message, at, row, replayed);
     if (row.type === "turn_context" && Array.isArray(p.tools)) this.toolEpochs.push({
       seq: this.line * 1_000_000 + 1, time: at,
       nodeIds: this.nodes.slice(firstNode).filter((node) => node.category === "tools").map((node) => node.id),
     });
-    if (messages.some((message) => message.category === "user" || message.category === "tool")) this.boundaryAt = at;
+    if (!replayed && messages.some((message) => message.category === "user" || message.category === "tool" && this.provider !== "timeline")) {
+      this.boundaryAt = at;
+      this.boundaryLine = this.line;
+    }
     const stats = this.meter.stats;
     this.modelMs = stats.modelMs;
     const measured = this.meter.lastTiming;
     const timing = measured ? { estimatedModelMs: measured.modelMs, estimatedModelStart: measured.start,
       estimatedModelEnd: measured.end, ...(measured.ttftMs === undefined ? {} : { estimatedTtftMs: measured.ttftMs }) } : {};
-    let usageId: string | undefined;
-    if (this.provider === "claude" && row.type === "assistant" && record(row.message).usage) {
-      const msg = record(row.message), raw = record(msg.usage), model = text(msg.model);
-      this.observeModel(model, at);
-      usageId = text(msg.id) || String(this.line);
-      this.request(usageId, {
-        input: count(raw.input_tokens) + count(raw.cache_read_input_tokens) + count(raw.cache_creation_input_tokens),
-        cacheRead: count(raw.cache_read_input_tokens), cacheWrite: count(raw.cache_creation_input_tokens),
-        output: count(raw.output_tokens), reasoning: count(raw.reasoning_tokens),
-      }, at, model, usageFields(raw, "claude"), timing);
-    } else if (row.type === "token_usage_record") {
-      const u = record(p.usage);
-      usageId = text(p.response_id) || String(row.ordinal ?? row.timestamp);
-      this.request(usageId, {
-        input: count(u.input_tokens), cacheRead: count(u.cached_input_tokens ?? u.cache_read_input_tokens), cacheWrite: count(u.cache_write_input_tokens),
-        output: count(u.output_tokens), reasoning: count(u.reasoning_output_tokens),
-      }, at, text(p.model), usageFields(u, "codex"), timing);
-    } else if (row.type === "event_msg" && p.type === "token_count" && stats.steps > before.steps) {
-      usageId = `legacy:${this.line}`;
-      this.request(usageId, {
-        input: Math.max(0, stats.inputTokens - before.inputTokens), cacheRead: Math.max(0, stats.cachedTokens - before.cachedTokens),
-        cacheWrite: Math.max(0, stats.cacheWriteTokens - before.cacheWriteTokens), output: Math.max(0, stats.outputTokens - before.outputTokens),
-        reasoning: count(record(info.last_token_usage).reasoning_output_tokens),
-      }, at, this.model, usageFields(this.meter.lastUsageRecord, "codex"), timing);
+    const observation = this.meter.lastUsage;
+    if (observation) {
+      const model = text(this.provider === "claude" ? record(row.message).model : p.model);
+      if (this.provider === "claude") this.observeModel(model, at);
+      this.request(observation, at, model, timing);
     }
     if (row.type === "event_msg" && p.type === "thread_settings_applied") this.observeModel(text(p.model), at);
     const close = row.type === "event_msg" && ["task_complete", "task_completed", "turn_aborted"].includes(text(p.type))
       ? p.type === "turn_aborted" ? "abort" : "complete"
       : row.type === "system" && row.subtype === "turn_duration" ? "complete" : undefined;
     this.statistics.observe({ line: this.line, at, turn: this.turn, firstNode,
-      nodes: this.nodes.slice(firstNode), requestId: usageId,
+      nodes: replayed ? [] : this.nodes.slice(firstNode), requestId: observation?.id,
       responseKey: this.provider === "claude" && row.type === "assistant" ? text(record(row.message).id) || undefined : undefined,
       turnStart: row.type === "turn_context" || row.type === "event_msg" && p.type === "task_started", close });
   }
   summary(agent: Agent, source: Summary["source"] = "native"): Summary {
-    const s = this.meter.stats, usage = emptyUsage();
-    usage.input = s.inputTokens; usage.output = s.outputTokens; usage.cacheRead = s.cachedTokens; usage.cacheWrite = s.cacheWriteTokens;
-    usage.reasoning = this.requests.reduce((n, r) => n + r.usage.reasoning, 0);
+    const s = this.meter.stats, usage = { ...this.meter.usage }, usageSources = { ...this.meter.usageSources };
     const sorted = (map: Map<string, Tally>) => [...map.values()].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
     const intervals: NonNullable<Summary["intervals"]> = [...this.toolIntervals.values(),
       ...this.requests.filter((r) => r.estimatedModelStart !== undefined && r.estimatedModelEnd !== undefined)
         .map((r) => ({ start: r.estimatedModelStart!, end: r.estimatedModelEnd!, kind: "model" as const }))];
-    return { agent: { ...agent, model: this.model || agent.model }, source, usage,
+    return { agent: { ...agent, model: this.model || agent.model }, source, usage, usageSources,
       turns: s.turns || this.turn || this.humanInputs, steps: s.steps || this.requests.length, humanInputs: this.humanInputs,
       toolCalls: [...this.tools.values()].reduce((n, t) => n + t.count, 0), images: this.images,
       contextTokens: this.contextTokens, contextWindow: this.contextWindow, maxOutput: this.maxOutput,
+      ...(this.contextTokens === null ? {} : { contextSource: "reported" }),
       parts: { ...this.active }, costUsd: null, costComplete: false,
-      modelMs: this.modelMs, toolMs: [...this.toolIntervals.values()].reduce((n, row) => n + Math.max(0, row.end - row.start), 0),
+      modelMs: this.modelMs, toolMs: [...this.toolDurations.values()].reduce((n, duration) => n + duration, 0),
       ttftMs: s.ttftMs, timedOutputTokens: s.timedOutputTokens, intervals, wallMs: unionMs(intervals),
       tools: sorted(this.tools), skills: sorted(this.skills), programs: sorted(this.programs), activity: this.activity(),
       notices: [source === "native" ? "native-estimate" : source === "timeline" ? "timeline-limited" : "unavailable",
@@ -344,18 +376,9 @@ export class ContextFold {
       const day = days.get(time) ?? { time, tools: new Map(), skills: new Map(), programs: new Map() };
       this.tally(day[kind], name, at); days.set(time, day);
     };
-    for (const node of this.nodes) if (node.category === "calls" && node.tool) add("tools", node.tool, node.time);
+    for (const node of this.nodes) if (!node.replayed && node.category === "calls" && node.tool) add("tools", node.tool, node.time);
     for (const event of this.events) if (event.kind === "skill") add("skills", event.title, event.time);
     for (const command of this.commands) for (const program of command.programs) add("programs", program, command.time);
     return [...days.values()].map((day) => ({ time: day.time, tools: [...day.tools.values()], skills: [...day.skills.values()], programs: [...day.programs.values()] }));
-  }
-  private activeWallMs() {
-    const intervals = this.nodes.map((n) => n.time).filter((n) => n > 0).sort((a, b) => a - b);
-    let total = 0;
-    for (let i = 1; i < intervals.length; i++) {
-      const gap = intervals[i] - intervals[i - 1];
-      if (gap < 300_000) total += gap;
-    }
-    return total;
   }
 }

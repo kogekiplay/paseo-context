@@ -16,6 +16,9 @@ export default function contribute(client: PluginClientContext) {
   let pendingTabs: { agentId: string; workspaceId: string; first: PanelMode; rest: PanelMode[];
     source: PluginComposer; owner?: symbol; timer: ReturnType<typeof setTimeout> } | undefined;
   let panelRemovers: Array<() => void> = [], panelKey = "";
+  let statisticsRemover: (() => void) | undefined;
+  const staticRemovers: Array<() => void> = [];
+  const track = (cleanup: unknown) => { if (typeof cleanup === "function") staticRemovers.push(cleanup as () => void); };
   const touched = new Set<string>();
   const openModal = (id: string) => client.openScreen({ screenId: "context", params: { agentId: id, mode: "modal" } });
   const openSettings = () => client.openSettings("preferences");
@@ -85,8 +88,12 @@ export default function contribute(client: PluginClientContext) {
       id: "workspace-context", title: messages.message("context"), icon: "ChartNoAxesCombined", locations: ["workspace"], Component: WorkspaceContext,
     }));
     if (next.fleetTab) panelRemovers.push(client.addWorkspacePanel({ id: "workspace-fleet", title: messages.message("fleet"), icon: "Network", locations: ["workspace"], Component: WorkspaceFleet }));
-    panelRemovers.push(client.addWorkspacePanel({ id: "workspace-statistics", title: messages.message("statistics"), icon: "ChartPie", locations: ["workspace"], Component: WorkspaceStatistics }));
-    for (const agent of agents.values()) register(agent);
+    if (!statisticsRemover) {
+      statisticsRemover = client.addWorkspacePanel({ id: "workspace-statistics", title: messages.message("statistics"), icon: "ChartPie", locations: ["workspace"], Component: WorkspaceStatistics });
+    }
+    controller.batch(() => {
+      for (const agent of agents.values()) register(agent);
+    });
   }
   function Entry(props: PluginSidebarItemProps) {
     const settings = usePreferences();
@@ -94,24 +101,24 @@ export default function contribute(client: PluginClientContext) {
       {settings.status === "ready" && settings.values.insightsEntry && <SidebarRow icon="ChartNoAxesCombined" active={props.currentScreen?.screenId === "insights"} onPress={() => props.openScreen({ screenId: "insights" })} />}
     </>;
   }
-  client.addScreen({ id: "insights", title: messages.message("insights"), Component: Insights });
-  client.addScreen({ id: "context", title: messages.message("context"), Component: Screen });
-  client.addSidebarHeaderItem({ id: "insights", title: messages.message("insights"), Component: Entry });
-  client.addSettingsScreen({ id: "preferences", title: messages.message("settings"), icon: "Settings", Component: Settings });
-  client.addCommandCenterItem({ id: "insights", title: messages.message("insights"), icon: "ChartNoAxesCombined", context: "global",
-    onSelect: ({ openScreen }) => openScreen({ screenId: "insights" }) });
-  client.addCommandCenterItem({ id: "context", title: messages.message("context"), icon: "ChartNoAxesCombined", context: "agent", onSelect: ({ agent, workspace }) => openContext(agent.id, workspace.id) });
-  client.addCommandCenterItem({ id: "fleet", title: messages.message("fleet"), icon: "Network", context: "agent", onSelect: ({ agent, workspace }) => openAgentPanel("fleet", agent.id, workspace.id) });
-  client.addCommandCenterItem({ id: "statistics", title: messages.message("statistics"), icon: "ChartPie", context: "agent", onSelect: ({ agent, workspace }) => openAgentPanel("statistics", agent.id, workspace.id) });
-  client.addCommandCenterItem({ id: "preferences", title: messages.message("settings"), icon: "Settings", context: "global", onSelect: ({ openSettings }) => openSettings("preferences") });
-  client.addSlashCommand({ name: "context", description: messages.message("context"), argumentHint: "[current | fleet | stats | insights | modal]", context: "agent",
+  track(client.addScreen({ id: "insights", title: messages.message("insights"), Component: Insights }));
+  track(client.addScreen({ id: "context", title: messages.message("context"), Component: Screen }));
+  track(client.addSidebarHeaderItem({ id: "insights", title: messages.message("insights"), Component: Entry }));
+  track(client.addSettingsScreen({ id: "preferences", title: messages.message("settings"), icon: "Settings", Component: Settings }));
+  track(client.addCommandCenterItem({ id: "insights", title: messages.message("insights"), icon: "ChartNoAxesCombined", context: "global",
+    onSelect: ({ openScreen }) => openScreen({ screenId: "insights" }) }));
+  track(client.addCommandCenterItem({ id: "context", title: messages.message("context"), icon: "ChartNoAxesCombined", context: "agent", onSelect: ({ agent, workspace }) => openContext(agent.id, workspace.id) }));
+  track(client.addCommandCenterItem({ id: "fleet", title: messages.message("fleet"), icon: "Network", context: "agent", onSelect: ({ agent, workspace }) => openAgentPanel("fleet", agent.id, workspace.id) }));
+  track(client.addCommandCenterItem({ id: "statistics", title: messages.message("statistics"), icon: "ChartPie", context: "agent", onSelect: ({ agent, workspace }) => openAgentPanel("statistics", agent.id, workspace.id) }));
+  track(client.addCommandCenterItem({ id: "preferences", title: messages.message("settings"), icon: "Settings", context: "global", onSelect: ({ openSettings }) => openSettings("preferences") }));
+  track(client.addSlashCommand({ name: "context", description: messages.message("context"), argumentHint: "[current | fleet | stats | insights | modal]", context: "agent",
     onSubmit: ({ args, agent, workspace, openScreen }) => {
       if (args === "fleet") return openAgentPanel("fleet", agent.id, workspace.id);
       if (args === "stats" || args === "statistics") return openAgentPanel("statistics", agent.id, workspace.id);
       if (args === "insights") openScreen({ screenId: "insights" });
       else if (args === "modal") openModal(agent.id);
       else return openContext(agent.id, workspace.id);
-    } });
+    } }));
   const ready = client.rpc(preferencesRpc, {}).then((values) => { if (!lifetime.signal.aborted && !options) updatePanels(values); }).catch((error) => {
     if (!lifetime.signal.aborted) console.error("[paseo-context] Preferences could not be loaded", error);
   });
@@ -195,8 +202,10 @@ export default function contribute(client: PluginClientContext) {
       cursor = page.pageInfo.hasMore ? page.pageInfo.nextCursor : null;
     }
     if (lifetime.signal.aborted || version !== generation) return;
-    for (const id of agents.keys()) if (!rows.has(id) && !touched.has(id)) { controller.remove(id); pills.get(id)?.remove(); pills.delete(id); pillOwners.delete(id); }
-    for (const agent of rows.values()) if (!touched.has(agent.id)) register(agent);
+    controller.batch(() => {
+      for (const id of agents.keys()) if (!rows.has(id) && !touched.has(id)) { controller.remove(id); pills.get(id)?.remove(); pills.delete(id); pillOwners.delete(id); }
+      for (const agent of rows.values()) if (!touched.has(agent.id)) register(agent);
+    });
   }
   const report = (error: unknown) => { if (!lifetime.signal.aborted) console.error("[paseo-context] Agent observation failed", error); };
   void client.paseo.agents.list({ page: { limit: 200 }, subscribe: {}, signal: lifetime.signal }).then(({ subscription }) => {
@@ -215,6 +224,8 @@ export default function contribute(client: PluginClientContext) {
     lifetime.abort();
     cancelPendingTabs();
     for (const remove of panelRemovers) remove(); panelRemovers = [];
+    statisticsRemover?.(); statisticsRemover = undefined;
+    for (const remove of staticRemovers.splice(0)) remove();
     for (const pill of pills.values()) pill.remove(); pills.clear(); pillOwners.clear(); controller.clear(); touched.clear();
     navigation = undefined;
   };

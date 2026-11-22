@@ -4,11 +4,11 @@ import { assemble } from "../shared/core/assemble";
 import { incrementOf } from "../shared/core/increment";
 import { contextDeltaOf } from "../shared/core/delta";
 import { ContextService, agentOf } from "./service";
-import { nodeSeq, rowOf, upstreamOf } from "./upstream";
+import { detailOf, nodeSeq, rowOf, upstreamOf } from "./upstream";
 import { count, record, text } from "./value";
 import { Metadata } from "./metadata";
 import type { PublicCache } from "./public-cache";
-import { UiFleet, graphHeadOf } from "./ui-fleet";
+import { UiFleet } from "./ui-fleet";
 import { uiDocument } from "./assets";
 import { imageUrlOf } from "./images";
 import { previewFile } from "./files";
@@ -37,7 +37,10 @@ export class UiRoutes {
     const data = await this.service.load(await this.service.agent(id, paseo), paseo);
     return { ...data, ...this.project(data) };
   }
-  async handle(route: string, input: unknown, paseo: PaseoApi): Promise<unknown> {
+  rpc(route: string, input: unknown, paseo: PaseoApi) {
+    return this.handle(route, input, paseo, "rpc");
+  }
+  async handle(route: string, input: unknown, paseo: PaseoApi, format: "projection" | "rpc" = "projection"): Promise<unknown> {
     const body = record(input), id = text(body.sessionId ?? body.agentId);
     if (route === "ui.document") return uiDocument();
     if (route === "ui.grammar") return grammarOf(text(body.name));
@@ -57,7 +60,7 @@ export class UiRoutes {
       const data = id ? await this.service.load(await this.service.agent(id, paseo), paseo) : null;
       if (!data) return { sessions: [], selected: null };
       let sessions = body.mode === "fleet"
-        ? this.fleet.rows(await this.fleet.read(id, paseo, data))
+        ? this.fleet.rows(await this.fleet.read(id, paseo, data), id)
         : body.mode === "statistics" ? [rowOf(data.agent)] : (await this.service.directory(paseo)).map((raw) => rowOf(agentOf(raw)));
       const familyRevision = createHash("sha256").update(JSON.stringify(sessions)).digest("hex");
       if (familyRevision && body.familyRevision === familyRevision) sessions = [];
@@ -67,35 +70,43 @@ export class UiRoutes {
       } };
       // Keep a version for delta invalidation while marking a complete
       // projection so the upstream reader does not fetch the same facts again.
-      const { head, headers } = this.project(data);
-      const fullHead = { ...head, paseoComplete: true };
+      const graph = body.mode === "fleet";
+      const { head, headers } = graph ? upstreamOf(data, true) : this.project(data);
       return { sessions, familyRevision, selected: { revision: data.revision,
-        head: body.mode === "fleet" ? graphHeadOf(head) : fullHead,
-        headers: body.mode === "fleet" ? { headers: [] } : headers, notices: data.summary.notices } };
+        head: graph ? head : { ...head, paseoComplete: true }, headers, notices: data.summary.notices } };
     }
     if (route === "family") {
-      return this.fleet.rows(await this.fleet.read(id, paseo, undefined, body.tasks !== false));
+      const tasks = body.tasks !== false;
+      return this.fleet.rows(await this.fleet.read(id, paseo, undefined, tasks), id, tasks);
     }
     if (route === "statistics.details") {
       const data = await this.service.load(await this.service.agent(id, paseo), paseo);
       return statisticsDetails(data, text(body.requestId), this.service.content.bind(this.service), paseo);
     }
     if (route === "history.page") {
-      const data = await this.load(text(record(body.address).sessionId ?? record(body.address).childSessionId), paseo);
+      const id = text(record(body.address).sessionId ?? record(body.address).childSessionId);
+      const data = await this.service.load(await this.service.agent(id, paseo), paseo);
+      if (typeof body.revision === "number" && body.revision !== data.revision) {
+        throw new Error("Context revision changed; refresh the session and retry");
+      }
       const seq = count(body.throughSeq), epoch = data.fold.toolEpochs.find((epoch) => epoch.seq === seq);
       if (epoch) {
-        const tools = await Promise.all(epoch.nodeIds.map(async (nodeId) => {
-          const content = await this.service.content(data.agent.id, nodeId, paseo);
+        const bodies = await this.service.contents(data, epoch.nodeIds);
+        const tools = epoch.nodeIds.map((nodeId) => {
+          const content = bodies.get(nodeId)!;
           try { return JSON.parse(content); } catch { return { name: data.fold.nodes[nodeId].title, description: content }; }
-        }));
+        });
         return { records: [{ event: { type: "request/header", seq, data: { header: { tools } } } }] };
       }
       const node = data.fold.nodes.find((node) => nodeSeq(data.fold, node.id) === seq);
       if (!node) return { records: [] };
       const command = data.fold.commands.find((command) => command.outputNode === node.id);
-      const content = command?.outputNodes && command.outputNodes.length > 1
-        ? (await Promise.all(command.outputNodes.map((id) => this.service.content(data.agent.id, id, paseo)))).join("\n")
-        : await this.service.content(data.agent.id, node.id, paseo);
+      const call = node.category === "tool" || node.category === "skill"
+        ? command ? data.fold.nodes[command.id] : (node.callId ? data.fold.nodes.find((n) => n.callId === node.callId && n.category === "calls") : undefined)
+        : undefined;
+      const outputIds = command?.outputNodes?.length ? command.outputNodes : [node.id];
+      const bodies = await this.service.contents(data, call ? [...outputIds, call.id] : outputIds);
+      const content = outputIds.map((id) => bodies.get(id)).join("\n");
       const records: unknown[] = [];
       const ev = (type: string, data: unknown) => ({ event: { type, seq, data } });
       const image = node.images ? { type: "image", attachment: { attachmentId: `paseo-context-image:${node.id}`, name: "Image" } } : null;
@@ -104,12 +115,11 @@ export class UiRoutes {
         let tool: unknown; try { tool = JSON.parse(content); } catch { tool = { name: node.title, description: content }; }
         records.push(ev("request/header", { header: { tools: [tool] } }));
       } else if (node.category === "tool" || node.category === "skill") {
-        const call = command ? data.fold.nodes[command.id] : data.fold.nodes.find((n) => n.callId === node.callId && n.category === "calls");
         const callId = call?.callId ?? node.callId;
         if (call) records.push({ event: { type: "tool/call", seq: nodeSeq(data.fold, call.id), data: {
-          callId, name: call.tool, arguments: await this.service.content(data.agent.id, call.id, paseo),
+          callId, name: call.tool, arguments: bodies.get(call.id),
         } } });
-        records.push(ev("tool/result", { message: { toolCallId: callId, isError: command?.status === "failed", content: [{ type: "text", text: content }] } }));
+        records.push(ev("tool/result", { message: { toolCallId: callId, isError: node.error === true || command?.status === "failed", content: [{ type: "text", text: content }] } }));
       } else if (node.category === "assistant" || node.category === "reasoning" || node.category === "calls") {
         records.push(ev("assistant/message", { message: { content: [image ?? (node.category === "calls"
           ? { type: "tool-call", name: node.tool, arguments: content }
@@ -129,7 +139,7 @@ export class UiRoutes {
     }
     if (name === "recom") return { ok: true, value: await this.metadata.recoms() };
     if (name === "file.preview") {
-      const data = await this.load(id, paseo);
+      const data = await this.service.load(await this.service.agent(id, paseo), paseo);
       return previewFile(data.agent, data.fold.files, text(body.path));
     }
     if (name === "image") {
@@ -149,16 +159,23 @@ export class UiRoutes {
     if (name === "heads") {
       const out: Record<string, unknown> = {};
       for (const id of Array.isArray(body.ids) ? body.ids.filter((v): v is string => typeof v === "string").slice(0, 64) : []) {
-        try { out[id] = { head: graphHeadOf((await this.load(id, paseo)).head) }; } catch {}
+        try {
+          const data = await this.service.load(await this.service.agent(id, paseo), paseo);
+          out[id] = { head: upstreamOf(data, true).head };
+        } catch {}
       }
       return { ok: true, value: out };
     }
     if (name === "fleet") return this.fleet.handle(body, paseo);
     if (!id) throw new Error("An agent is required for this context request");
+    if (name === "detail" && body.head === true) {
+      const data = await this.service.load(await this.service.agent(id, paseo), paseo);
+      return { ok: true, value: { head: upstreamOf(data, true).head, rev: data.revision } };
+    }
     const data = await this.load(id, paseo), { head, headers } = data;
     const rev = head.detailRev ?? 0;
     if (name === "snapshot") return { ok: true, value: head };
-    if (name === "detail") return { ok: true, value: body.head === true ? { head: graphHeadOf(head), rev } : { ...head, head, rev } };
+    if (name === "detail") return { ok: true, value: format === "rpc" ? detailOf(head, rev) : { head, rev } };
     if (name === "facts") {
       const wanted = Array.isArray(body.parts) ? body.parts : ["head", "series"];
       const parts: Record<string, unknown> = {};
@@ -207,7 +224,7 @@ export class UiRoutes {
     if (part === "summary") return { ok: true, value: { ...state, summary: {
       sessions: data.total, sessionsTotal: data.scanned, sessionsArchived: data.sessionsArchived, archivedScoped: data.archivedScoped,
       tokens: data.tokens, turns: data.turns, costUsd: data.costUsd, costSessions: data.costSessions,
-      usageSessions: data.usageSessions, cacheHit: data.input > 0 ? (data.cacheRead / data.input * 100).toFixed(1) : null,
+      usageSessions: data.usageSessions, cacheHit: data.pairedInput > 0 ? (Math.min(1, data.pairedRead / data.pairedInput) * 100).toFixed(1) : null,
       tokenParts, timing: data.timing, windowTiming: { calls: data.calls, toolCalls: data.toolCalls, toolsMs: data.toolsMs, wallMs: data.wallMs },
       coverage, window: data.window,
     } } };

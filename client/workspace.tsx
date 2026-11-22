@@ -1,4 +1,4 @@
-import { useEffect, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
 import { Text, View } from "react-native";
 import { useAgent, useTabState, useTranslation, type PluginWorkspacePanelProps } from "@getpaseo/plugin/client";
 import { z } from "zod";
@@ -22,16 +22,88 @@ export class WorkspacePanels {
   private initialized = new Map<string, true>();
   private initializing = new Set<string>();
   private listeners = new Set<() => void>();
+  private workspaceListeners = new Map<string, Set<() => void>>();
+  private workspaceRevisions = new Map<string, number>();
+  private dirtyWorkspaces = new Set<string>();
+  private batchDepth = 0;
   private revision = 0;
+
   subscribe = (fn: () => void) => { this.listeners.add(fn); return () => { this.listeners.delete(fn); }; };
   snapshot = () => this.revision;
-  private publish() { this.revision++; for (const fn of this.listeners) fn(); }
-  upsert(agent: PanelAgent) { this.agents.set(agent.id, agent); this.publish(); }
-  remove(id: string) { this.agents.delete(id); this.initialized.delete(id); this.initializing.delete(id); this.publish(); }
+
+  subscribeWorkspace(workspaceId: string, fn: () => void) {
+    let bucket = this.workspaceListeners.get(workspaceId);
+    if (!bucket) { bucket = new Set(); this.workspaceListeners.set(workspaceId, bucket); }
+    bucket.add(fn);
+    return () => {
+      bucket.delete(fn);
+      if (bucket.size === 0) this.workspaceListeners.delete(workspaceId);
+    };
+  }
+
+  workspaceSnapshot(workspaceId: string) {
+    return this.workspaceRevisions.get(workspaceId) ?? 0;
+  }
+
+  private emitWorkspace(workspaceId: string) {
+    this.workspaceRevisions.set(workspaceId, (this.workspaceRevisions.get(workspaceId) ?? 0) + 1);
+    const bucket = this.workspaceListeners.get(workspaceId);
+    if (bucket) for (const fn of bucket) fn();
+  }
+
+  private notify(workspaceId?: string) {
+    if (!workspaceId) return;
+    if (this.batchDepth > 0) {
+      this.dirtyWorkspaces.add(workspaceId);
+      return;
+    }
+    this.revision++;
+    this.emitWorkspace(workspaceId);
+    for (const fn of this.listeners) fn();
+  }
+
+  batch(fn: () => void) {
+    this.batchDepth++;
+    try { fn(); }
+    finally {
+      this.batchDepth--;
+      if (this.batchDepth === 0 && this.dirtyWorkspaces.size > 0) {
+        const dirty = [...this.dirtyWorkspaces];
+        this.dirtyWorkspaces.clear();
+        this.revision++;
+        for (const workspaceId of dirty) this.emitWorkspace(workspaceId);
+        for (const listener of this.listeners) listener();
+      }
+    }
+  }
+
+  upsert(agent: PanelAgent) {
+    const next: PanelAgent = {
+      id: agent.id,
+      workspaceId: agent.workspaceId,
+      title: agent.title ?? null,
+      archivedAt: agent.archivedAt ?? null,
+    };
+    const prev = this.agents.get(next.id);
+    if (prev && prev.workspaceId === next.workspaceId && prev.title === next.title && prev.archivedAt === next.archivedAt) return;
+    this.agents.set(next.id, next);
+    if (prev?.workspaceId && prev.workspaceId !== next.workspaceId) this.notify(prev.workspaceId);
+    this.notify(next.workspaceId);
+  }
+
+  remove(id: string) {
+    const prev = this.agents.get(id);
+    const removed = this.agents.delete(id);
+    this.initialized.delete(id);
+    this.initializing.delete(id);
+    if (removed) this.notify(prev?.workspaceId);
+  }
+
   selection(workspaceId: string) { return this.selected.get(workspaceId); }
   select(workspaceId: string, agentId: string) {
     if (this.selected.get(workspaceId) === agentId) return;
-    remember(this.selected, workspaceId, agentId, MAX_WORKSPACES); this.publish();
+    remember(this.selected, workspaceId, agentId, MAX_WORKSPACES);
+    this.notify(workspaceId);
   }
   hasInitialized(agentId: string) { return this.initialized.has(agentId) || this.initializing.has(agentId); }
   claim(agentId: string) {
@@ -46,7 +118,8 @@ export class WorkspacePanels {
     this.initializing.delete(agentId);
   }
   clear() {
-    this.agents.clear(); this.selected.clear(); this.initialized.clear(); this.initializing.clear(); this.listeners.clear();
+    this.agents.clear(); this.selected.clear(); this.initialized.clear(); this.initializing.clear();
+    this.listeners.clear(); this.workspaceListeners.clear(); this.workspaceRevisions.clear(); this.dirtyWorkspaces.clear();
   }
 }
 
@@ -55,10 +128,15 @@ export function WorkspaceSurface(props: PluginWorkspacePanelProps & {
   openSettings: () => void; openContext: (agentId: string) => void;
 }) {
   const { controller, workspaceId, theme } = props;
-  useSyncExternalStore(controller.subscribe, controller.snapshot);
+  const subscribe = useCallback((fn: () => void) => controller.subscribeWorkspace(workspaceId, fn), [controller, workspaceId]);
+  const getSnapshot = useCallback(() => controller.workspaceSnapshot(workspaceId), [controller, workspaceId]);
+  const revision = useSyncExternalStore(subscribe, getSnapshot);
   const { t } = useTranslation(messages);
   const [saved, save] = useTabState(props.tab, stateSchema, {});
-  const agents = [...controller.agents.values()].filter((a) => a.workspaceId === workspaceId && !a.archivedAt);
+  const agents = useMemo(
+    () => [...controller.agents.values()].filter((a) => a.workspaceId === workspaceId && !a.archivedAt),
+    [controller, workspaceId, revision],
+  );
   const selected = [controller.selection(workspaceId), saved.agentId, agents[0]?.id]
     .find((id) => agents.some((agent) => agent.id === id));
   const agent = useAgent(selected ?? "", ({ id, title, workspaceId: owner }) => ({ id, title, workspaceId: owner }));

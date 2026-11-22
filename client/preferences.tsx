@@ -2,10 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import { useTranslation, type PluginSurfaceProps, type SettingsState } from "@getpaseo/plugin/client";
 import { SettingsAction, SettingsCard, SettingsSection, SettingsSelect, SettingsSwitch } from "@getpaseo/plugin/client/ui";
-import { DICTS, type Translate } from "../shared/locales/i18n";
 import { preferenceSchema, type Preferences } from "../shared/contracts";
 import { messages } from "./messages";
-import { preferencesCopy, type PreferencesCopy } from "./preferences-copy";
+import { preferenceLabels, preferencesCopy, type PreferencesCopy, type Translate } from "./preferences-copy";
 import { previewAgentId } from "../shared/bridge";
 import { FrameSurface } from "./frame";
 
@@ -21,10 +20,10 @@ export function PreferencesScreen({ settings, ...props }: PluginSurfaceProps & {
 function PreferencesContent({ settings, ...props }: PluginSurfaceProps & { settings: State }) {
   const { locale } = useTranslation(messages);
   const [tab, setTab] = useState<Tab>("entries");
-  const language = locale.toLowerCase().split("-")[0] as keyof typeof DICTS;
+  const language = locale.toLowerCase().split("-")[0];
   const copy = preferencesCopy[language] ?? preferencesCopy.en;
-  const dictionary: Record<string, string> = DICTS[language] ?? DICTS.en;
-  const t: Translate = (key, params) => (dictionary[key] ?? (DICTS.en as Record<string, string>)[key] ?? key)
+  const dictionary = preferenceLabels[language] ?? preferenceLabels.en;
+  const t: Translate = (key, params) => (dictionary[key] ?? preferenceLabels.en[key] ?? key)
     .replace(/\{(\w+)\}/g, (match, name) => String(params?.[name] ?? match));
   if (settings.status === "loading") return <Text style={{ color: props.theme.colors.foregroundMuted }}>{copy.loading}</Text>;
   if (settings.status !== "ready") return <SettingsSection title={copy.unavailable}>
@@ -42,6 +41,7 @@ function PreferenceForm({ settings, copy, t, tab, setTab, ...props }: PluginSurf
   const [phone, setPhone] = useState(false);
   const [wide, setWide] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [saveFailure, setSaveFailure] = useState("");
   const lock = useRef(false);
   const { values } = settings;
   const disabled = saving || settings.saving;
@@ -50,26 +50,35 @@ function PreferenceForm({ settings, copy, t, tab, setTab, ...props }: PluginSurf
     if (lock.current || settings.saving) return false;
     lock.current = true;
     setSaving(true);
-    try { return await settings.save({ ...settings.values, ...patch }, settings.revision); }
-    finally { lock.current = false; setSaving(false); }
+    setSaveFailure("");
+    try {
+      return await settings.save({ ...settings.values, ...patch }, settings.revision);
+    } catch (error) {
+      setSaveFailure(error instanceof Error ? error.message : String(error));
+      return false;
+    } finally {
+      lock.current = false;
+      setSaving(false);
+    }
   }
   const options = <Value extends string>(choices: Array<[Value, string]>) => choices.map(([value, key]) => ({ value, label: t(key) }));
   const granularity = options([["step", "gran.step"], ["turn", "gran.turn"]]);
   const select = <Key extends keyof Preferences,>(key: Key, label: string, choices: readonly { value: Extract<Preferences[Key], string>; label: string }[]) =>
     <SettingsSelect label={t(label)} value={values[key] as Extract<Preferences[Key], string>} options={choices}
-      disabled={disabled} onValueChange={(value) => { void save({ [key]: value }); }} />;
+      disabled={disabled} onValueChange={(value) => { void save({ [key]: value }).catch(() => {}); }} />;
   const toggle = (key: "insightsEntry" | "fleetTab" | "defaultDurationCurve", label: string) =>
-    <SettingsSwitch label={t(label)} value={values[key]} disabled={disabled} onValueChange={(value) => { void save({ [key]: value }); }} />;
+    <SettingsSwitch label={t(label)} value={values[key]} disabled={disabled} onValueChange={(value) => { void save({ [key]: value }).catch(() => {}); }} />;
   const columns = !layout.compact && wide;
+  const errorText = settings.saveError || saveFailure;
   return <View style={{ gap: 16, paddingVertical: 14 }} testID="context-preferences"
     onLayout={(event) => setWide(event.nativeEvent.layout.width >= 1080)}>
     <Segments items={tabs.map((value) => ({ value, label: names[value] }))} selected={tab} onSelect={setTab} colors={colors} />
     <Text style={{ fontSize: 13, color: colors.foregroundMuted }}>
       {copy.shared}
     </Text>
-    {settings.saveError ? <View accessibilityRole="alert" style={{ gap: 6 }}>
-      <Text style={{ color: colors.statusDanger }}>{settings.saveError}</Text>
-      <Pressable accessibilityRole="button" onPress={() => { void settings.reload().catch(() => {}); }}>
+    {errorText ? <View accessibilityRole="alert" style={{ gap: 6 }}>
+      <Text style={{ color: colors.statusDanger }}>{errorText}</Text>
+      <Pressable accessibilityRole="button" onPress={() => { setSaveFailure(""); void settings.reload().catch(() => {}); }}>
         <Text style={{ color: colors.foreground }}>{copy.reload}</Text>
       </Pressable>
     </View> : null}

@@ -21,7 +21,11 @@ export interface TimelineLast {
   seq: number
   total: number
   prompt?: number
+  contextSource?: 'reported' | 'paseo'
 }
+
+export type UsageSource = 'reported' | 'cumulative' | 'mixed'
+export type UsageSources = Partial<Record<'input' | 'cacheRead' | 'cacheWrite' | 'output' | 'reasoning', UsageSource>>
 
 export interface ActivityTally {
   n: number
@@ -224,6 +228,7 @@ export interface Snapshot extends SurfaceNodeWindow {
   detailRev?: number
   requests: RequestRecord[]
   events: ContextEventRecord[]
+  usageSources?: UsageSources
   cost?: SessionCostUsage
   timing?: TimingTotals
   systems?: SystemPromptNode[]
@@ -455,6 +460,7 @@ export interface RequestRecord extends SlimRequestRecord {
   skill?: number
   cacheRead?: number
   output?: number
+  usageSources?: UsageSources
   stepCount?: number
   net?: number
 }

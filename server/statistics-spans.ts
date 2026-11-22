@@ -14,7 +14,9 @@ export class StatisticsSpans {
   private current: StatisticsSpan | undefined;
   private responses = new Map<string, StatisticsSpan>();
   private requests = new Map<string, StatisticsSpan>();
+  private byId = new Map<string, StatisticsSpan>();
   private lastUsageAt = 0;
+  find(id: string) { return this.byId.get(id) ?? this.requests.get(id); }
   observe(input: {
     line: number; turn: number; at: number; firstNode: number; nodes: readonly ContextNode[];
     requestId?: string; responseKey?: string; turnStart: boolean; close?: "complete" | "abort" | "interrupt";
@@ -36,6 +38,7 @@ export class StatisticsSpans {
         boundary: firstNode, endBoundary: null, end: null, prompt: user?.preview ?? "",
         closed: false, interrupted: false, aborted: false };
       this.rows.push(this.current);
+      this.byId.set(this.current.id, this.current);
     }
     const span = existing ?? this.current;
     if (!span) return;

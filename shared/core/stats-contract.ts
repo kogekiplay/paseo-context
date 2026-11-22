@@ -1,4 +1,5 @@
 /** Published performance model: per-step metrics, per-turn aggregates, and marker contributions. */
+import type { UsageSources } from './types'
 
 export interface ImageAttachmentRef { readonly attachmentId: string; readonly name?: string }
 interface ConversationViewNode { readonly key: string; readonly kind: string; readonly id: string; readonly target: string }
@@ -94,6 +95,7 @@ export interface StatsStepMetrics {
   /** Stable Paseo request identity for loading captured details on demand. */
   readonly sourceId?: string
   readonly contentRevision?: string
+  readonly usageSources?: UsageSources
   readonly detailsState?: 'unloaded' | 'loading' | 'ready' | 'error'
   readonly timingSource?: 'session-estimate'
   readonly turn: number

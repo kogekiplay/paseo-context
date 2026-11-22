@@ -7,6 +7,7 @@ import { Pricing } from "./pricing";
 import { ContextService } from "./service";
 import { UiRoutes } from "./ui-routes";
 import { record } from "./value";
+import type { ReadBodies } from "./reader";
 
 const titles = ["Atlas UI", "Layout review", "Accounting review"];
 const samplePaths = ["src/dashboard.tsx", "src/chart.tsx", "tests/dashboard.test.ts"];
@@ -76,7 +77,13 @@ class SampleReader {
   async locate() { return null; }
   async read({ id }: Agent) {
     const entry = this.data.get(id);
-    return entry ? { entry } : null;
+    if (!entry) return null;
+    const bodies: ReadBodies = async (ids, project) => {
+      const results = new Map<number, ReturnType<typeof project>>();
+      for (const nodeId of ids) results.set(nodeId, project(nodeId, await this.content({ id }, nodeId)));
+      return results;
+    };
+    return { entry, bodies };
   }
   async content({ id }: Pick<Agent, "id">, nodeId: number) {
     const entry = this.data.get(id), node = entry?.fold.nodes[nodeId];
@@ -106,9 +113,7 @@ function sampleCorpus(now: number) {
     }),
   } } as unknown as PaseoApi;
   const reader = new SampleReader(agents, now);
-  const service = new class extends ContextService {
-    override async content(id: string, nodeId: number) { return reader.content({ id }, nodeId); }
-  }(reader, new SamplePricing());
+  const service = new ContextService(reader, new SamplePricing());
   const routes = new UiRoutes(service);
   return { paseo, routes, clear: () => { routes.clear(); service.clear(); } };
 }
@@ -141,7 +146,7 @@ export class SettingsPreview {
     // The local, non-polling preview can return a full snapshot. Numeric
     // session revisions restart when the fixture rolls over to a new day.
     const input = route === "bootstrap" ? { ...record(payload), revision: undefined, familyRevision: undefined } : payload;
-    return this.sample.routes.handle(route, input, this.sample.paseo);
+    return this.sample.routes.rpc(route, input, this.sample.paseo);
   }
   clear() { this.sample?.clear(); this.sample = undefined; }
 }

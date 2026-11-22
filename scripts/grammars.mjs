@@ -2,6 +2,12 @@ import { readFile, writeFile } from "node:fs/promises";
 import { gzipSync } from "node:zlib";
 import { resolve } from "node:path";
 
+function mustReplace(source, pattern, replacement, label) {
+  const next = source.replace(pattern, replacement);
+  if (next === source) throw new Error(`Upstream grammar seam mismatch (${label}); update scripts/grammars.mjs.`);
+  return next;
+}
+
 /** Keep the offline document small without discarding any supported grammar. */
 export async function grammarPlugin() {
   const path = "web/vendor/ui/index.js";
@@ -14,18 +20,23 @@ export async function grammarPlugin() {
     compressed[name] = gzipSync(JSON.stringify(grammar), { level: 9 }).toString("base64");
   }
   await writeFile("shared/generated/grammars.ts", `export const grammars: Record<string, string> = ${JSON.stringify(compressed)};\n`);
-  source = source.replace(/^import lang(?:Ts|Bash|Json) from "@shikijs\/langs\/[^"]+";\n/gm, "");
-  source = source.replace(/const LANGS = \[[\s\S]*?\];/, "const LANGS = [];");
-  source = source.replace(/const LAZY_GRAMMARS = new Map\(\[/, `const LAZY_GRAMMARS = new Map([
+  source = mustReplace(source, /^import lang(?:Ts|Bash|Json) from "@shikijs\/langs\/[^"]+";\n/gm, "", "boot grammar imports");
+  source = mustReplace(source, /const LANGS = \[[\s\S]*?\];/, "const LANGS = [];", "boot LANGS array");
+  source = mustReplace(source, /const LAZY_GRAMMARS = new Map\(\[/, `const LAZY_GRAMMARS = new Map([
     ["typescript", () => loadGrammar("typescript")],
     ["shellscript", () => loadGrammar("shellscript")],
-    ["json", () => loadGrammar("json")],`);
-  source = source.replace(/import\("@shikijs\/langs\/([^"]+)"\)/g, 'loadGrammar("$1")');
+    ["json", () => loadGrammar("json")],`, "LAZY_GRAMMARS map");
+  source = mustReplace(source, /import\("@shikijs\/langs\/([^"]+)"\)/g, 'loadGrammar("$1")', "dynamic grammar imports");
   // Empty boot grammars need no synchronous warmup. Highlighting initializes
   // only when a visible code surface asks for its language.
-  source = source.replace(/for \(const sample of BOOT_GRAMMAR_WARMUPS\)/, "for (const sample of [])");
-  source = source.replace(/setTimeout\(\(\) => \{\s*highlighter\(\);\s*\}, 0\)\.unref\?\.\(\);/, "");
-  source = source.replace("for (const listener of listeners) listener();\n\t\t});", "for (const listener of listeners) listener();\n\t\t}).catch(() => { requested.delete(resolved); });");
+  source = mustReplace(source, /for \(const sample of BOOT_GRAMMAR_WARMUPS\)/, "for (const sample of [])", "BOOT_GRAMMAR_WARMUPS loop");
+  source = mustReplace(source, /setTimeout\(\(\) => \{\s*highlighter\(\);\s*\}, 0\)\.unref\?\.\(\);/, "", "idle highlighter warmup");
+  source = mustReplace(
+    source,
+    /(for \(const listener of listeners\) listener\(\);\n[ \t]*\}\));/,
+    "$1.catch(() => { requested.delete(resolved); });",
+    "grammar load failure recovery",
+  );
   source = `import { loadGrammar } from "../../grammars";\n${source}`;
   return {
     name: "offline-lazy-grammars",

@@ -53,8 +53,16 @@ function harness(fixtures: Session[], unread: string[] = []) {
       if (!fixture) throw new Error("Missing session");
       return fixture.data();
     }),
-    fleet: vi.fn(async () => ({ rootId: fixtures[0].agent.id,
-      members: fixtures.map((s) => s.fold.summary(s.agent)), failed: 0 })),
+    fleet: vi.fn(async (_id: string, _paseo: PaseoApi, options?: { seed?: ReturnType<Session["data"]> }) => {
+      const usable = fixtures.filter((fixture) => !unread.includes(fixture.agent.id));
+      return {
+        rootId: fixtures[0].agent.id, agents: fixtures.map((fixture) => fixture.agent), aliases: new Map<string, string>(),
+        members: usable.map((fixture) => fixture.fold.summary(fixture.agent)),
+        loaded: new Map(usable.map((fixture) => [fixture.agent.id,
+          options?.seed?.agent.id === fixture.agent.id ? options.seed : fixture.data()])),
+        failed: fixtures.length - usable.length,
+      };
+    }),
     content: vi.fn(async (id: string, nodeId: number) => {
       const content = byId.get(id)?.contents.get(nodeId);
       if (content === undefined) throw new Error("Missing source content");
@@ -204,17 +212,18 @@ describe("Captured task projections", () => {
     ]);
   });
 
-  test("attaches the captured agentTeam through both bootstrap and family host seams", async () => {
+  test("encodes the captured agentTeam once on the root through both host seams", async () => {
     const root = session("root", "root-native"), child = session("child", "child-native", "root");
     const plan = root.call("update_plan", { plan: [{ step: "Captured work", status: "pending" }] });
     root.result(plan.callId, "Plan updated");
     const { service, paseo } = harness([root, child]), routes = new UiRoutes(service);
     const bootstrap = await routes.handle("bootstrap", { agentId: "root", mode: "fleet" }, paseo) as {
-      sessions: Array<{ id: string; projectionValues: { agentTeam: { tasks: Array<{ subject: string }> } } }>;
+      sessions: Array<{ id: string; projectionValues: { agentTeam?: { tasks: Array<{ subject: string }> } } }>;
     };
-    expect(bootstrap.sessions.find((row) => row.id === "root")?.projectionValues.agentTeam.tasks[0].subject).toBe("Captured work");
-    const family = await routes.handle("family", { agentId: "root" }, paseo) as typeof bootstrap.sessions;
-    expect(family.find((row) => row.id === "child")?.projectionValues.agentTeam.tasks[0].subject).toBe("Captured work");
+    expect(bootstrap.sessions.find((row) => row.id === "root")?.projectionValues.agentTeam?.tasks[0].subject).toBe("Captured work");
+    const family = await routes.handle("family", { agentId: "child" }, paseo) as typeof bootstrap.sessions;
+    expect(family.find((row) => row.id === "root")?.projectionValues.agentTeam?.tasks[0].subject).toBe("Captured work");
+    expect(family.find((row) => row.id === "child")?.projectionValues.agentTeam).toBeUndefined();
     routes.clear();
   });
 });

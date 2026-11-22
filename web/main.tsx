@@ -54,8 +54,40 @@ document.addEventListener("click", (event) => {
   if (/^https?:\/\//.test(url)) { event.preventDefault(); action("openExternal", { url }); }
 });
 
-type State = { byId: Record<string, any>; selected: any; familyRevision?: string; current: string; locale: string; mode: string; preview?: boolean; preferences: Record<string, unknown>; image: { src: string; name: string; text?: string; note?: string } | null };
-let state: State = { byId: {}, selected: null, current: "", locale: "en", mode: "context", preferences: {}, image: null };
+type State = {
+  initialized: boolean;
+  byId: Record<string, any>;
+  selected: any;
+  familyRevision?: string;
+  current: string;
+  locale: string;
+  mode: string;
+  preview?: boolean;
+  dark?: boolean;
+  platform?: string;
+  preferences: Record<string, unknown>;
+  image: { src: string; name: string; text?: string; note?: string } | null;
+};
+
+const CONTEXT_PREVIEW_KEYS = [
+  "defaultGranularity", "defaultTrendMode", "defaultDurationCurve",
+  "overviewAutoSteps", "defaultDeltaBase", "defaultToolSort", "defaultFileSort",
+] as const;
+
+function shallowEqualRecord(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
+  const keysA = Object.keys(a), keysB = Object.keys(b);
+  if (keysA.length !== keysB.length) return false;
+  for (const key of keysA) if (a[key] !== b[key]) return false;
+  return true;
+}
+
+function previewKeyFor(mode: string, preferences: Record<string, unknown>, preview?: boolean): string | undefined {
+  if (!preview) return undefined;
+  if (mode === "insights") return String(preferences.defaultOverviewRange ?? "");
+  return JSON.stringify(CONTEXT_PREVIEW_KEYS.map((key) => preferences[key]));
+}
+
+let state: State = { initialized: false, byId: {}, selected: null, current: "", locale: "en", mode: "context", preferences: {}, image: null };
 const listeners = new Set<() => void>(), cleanups: Array<() => void> = [];
 const subscribe = (listener: () => void) => { listeners.add(listener); return () => { listeners.delete(listener); }; };
 const publish = (next: Partial<State>) => { state = { ...state, ...next }; for (const listener of listeners) listener(); };
@@ -95,7 +127,7 @@ const sessions = {
 };
 let familyStamp = "";
 const scope = {
-  getSnapshot: () => ({ status: "ready", value: state.preferences, writable: !state.preview }),
+  getSnapshot: () => ({ status: state.initialized ? "ready" : "loading", value: state.preferences, writable: !state.preview }),
   subscribe,
   set: async (field: string, value: unknown) => {
     if (state.preview) return;
@@ -158,11 +190,13 @@ const useProjection = (key: string) => {
 const useSessions = <T,>(selector: (snapshot: any) => T) => selector(state);
 function App() {
   const s = useSyncExternalStore(subscribe, () => state);
-  const previewKey = s.preview ? JSON.stringify(s.preferences) : undefined;
+  const loadingLabel = s.locale.startsWith("zh") ? "正在加载…" : "Loading…";
+  if (!s.initialized) return <div className="pc-status" role="status">{loadingLabel}</div>;
+  const previewKey = previewKeyFor(s.mode, s.preferences, s.preview);
   if (s.mode === "insights") return <Overview key={previewKey} useSessions={useSessions} />;
   if (s.mode === "settings") return <div className="pc-settings"><Config useContextSettings={(selector) => useSyncExternalStore(settings.store.subscribe, () => selector(settings.store.getSnapshot()))} set={(field, value) => settings.set(field, value)} /></div>;
   if (!s.current) return <div className="pc-status">{t("trend.empty")}</div>;
-  if (!s.selected) return <div className="pc-status" role="status">{s.locale.startsWith("zh") ? "正在加载…" : "Loading…"}</div>;
+  if (!s.selected) return <div className="pc-status" role="status">{loadingLabel}</div>;
   const props = { sessionId: s.current, useProjection };
   if (s.mode === "statistics") return <Statistics key={s.current} {...props} locale={s.locale} snapshot={s.selected?.statistics ?? null} />;
   if (s.mode === "modal") return <ContextModal {...props} useContextModal={(selector) => useSyncExternalStore(modalStoreOf(s.current).subscribe, () => selector(modalStoreOf(s.current).getSnapshot()))} />;
@@ -192,9 +226,11 @@ const loader = new PageLoader({
     const selected = result.selected?.unchanged ? state.selected : result.selected;
     // No state publication means no chart/table reconstruction for an idle session.
     if (selected !== state.selected || result.familyRevision !== state.familyRevision) {
-      const byId = { ...state.byId, ...Object.fromEntries(result.sessions.map((row: any) => [row.id, {
+      const familyChanged = result.familyRevision !== undefined && result.familyRevision !== state.familyRevision;
+      const incoming = Object.fromEntries(result.sessions.map((row: any) => [row.id, {
         ...row, projectionValues: { ...state.byId[row.id]?.projectionValues, ...row.projectionValues },
-      }])) };
+      }]));
+      const byId = familyChanged ? incoming : { ...state.byId, ...incoming };
       if (selected?.head && state.current) {
         const head = selected.head;
         byId[state.current] = { ...byId[state.current], projectionValues: {
@@ -230,12 +266,44 @@ window.addEventListener("message", (event) => {
   if (event.source !== parent || event.data?.type !== "paseo-context:init" || event.data?.nonce !== (globalThis as any).__PASEO_CONTEXT_NONCE__) return;
   const current = event.data.agentId || "";
   const mode = event.data.mode || "context";
+  const nextLocale = event.data.locale || "en";
   const preview = event.data.preview === true;
-  if (current !== state.current || mode !== state.mode) {
+  const dark = event.data.dark === true;
+  const platform = typeof event.data.platform === "string" && event.data.platform ? event.data.platform : "";
+  const preferences: Record<string, unknown> = event.data.preferences && typeof event.data.preferences === "object" ? event.data.preferences : {};
+
+  if (
+    state.initialized
+    && current === state.current
+    && mode === state.mode
+    && nextLocale === state.locale
+    && preview === !!state.preview
+    && dark === !!state.dark
+    && platform === (state.platform ?? "")
+    && shallowEqualRecord(preferences, state.preferences)
+  ) {
+    return;
+  }
+
+  const targetChanged = !state.initialized || current !== state.current || mode !== state.mode;
+  if (targetChanged) {
     familyRead?.abort(); familyRead = null; familyStamp = "";
   }
   document.body.toggleAttribute("data-pc-preview", preview);
-  publish({ current, ...(current !== state.current || mode !== state.mode ? { selected: null, image: null, byId: {}, familyRevision: undefined } : {}), locale: event.data.locale || "en", mode, preview, preferences: event.data.preferences || {} });
+  if (platform) document.documentElement.dataset.platform = platform;
+  else delete document.documentElement.dataset.platform;
+  if (dark) document.body.setAttribute("data-ds-dark-theme", ""); else document.body.removeAttribute("data-ds-dark-theme");
+  publish({
+    initialized: true,
+    current,
+    ...(targetChanged ? { selected: null, image: null, byId: {}, familyRevision: undefined } : {}),
+    locale: nextLocale,
+    mode,
+    preview,
+    dark,
+    platform,
+    preferences,
+  });
   const modalTarget = state.mode === "modal" ? state.current : null;
   if (modalTarget !== modalSession) {
     modalOff?.(); modalOff = null;
@@ -249,7 +317,6 @@ window.addEventListener("message", (event) => {
     document.body.style.background = "transparent";
   }
   if (state.mode !== "modal") document.body.style.background = "";
-  if (event.data.dark) document.body.setAttribute("data-ds-dark-theme", ""); else document.body.removeAttribute("data-ds-dark-theme");
   loader.configure({ agentId: current, mode, preview });
   if ((mode === "settings" || mode === "insights") && !rendered) {
     rendered = true;
@@ -270,4 +337,5 @@ window.addEventListener("pagehide", () => {
   disposeRetention(); listeners.clear();
 });
 createRoot(document.getElementById("root")!).render(<><App /><ImagePreview /><div id="pc-error" role="status" /></>);
+(globalThis as any).__PASEO_CONTEXT_BOOTED__ = true;
 send({ type: "paseo-context:ready", nonce: (globalThis as any).__PASEO_CONTEXT_NONCE__ });

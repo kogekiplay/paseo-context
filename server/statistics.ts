@@ -3,6 +3,7 @@ import { aggregateTurn } from "../shared/core/stats-aggregate";
 import { toolSpanUnion } from "../shared/core/stats-tools";
 import { nodeSeq, type Loaded } from "./upstream";
 import { statisticsRows } from "./statistics-rows";
+import { observedUsage, usageSourceOf } from "../shared/usage";
 
 /** Project captured Paseo/native facts onto the original table's static model. */
 export function statisticsOf(data: Loaded): StatsSnapshot {
@@ -24,7 +25,9 @@ export function statisticsOf(data: Loaded): StatsSnapshot {
       const result = node.callId ? results.get(node.callId) : undefined;
       const command = commands.get(node.id);
       const files = filesByNode.get(node.id) ?? [];
-      const measured = result && node.time > 0 && result.time >= node.time;
+      const duration = result?.toolDurationMs ?? null;
+      const paired = result && node.time > 0 && result.time >= node.time
+        && (summary.source !== "timeline" || node.line !== result.line);
       return {
         callId: node.callId ?? `node:${node.id}`, seq: nodeSeq(fold, node.id), name: node.tool ?? null,
         hint: command?.command ?? files[0]?.path ?? null, chars: null, lines: null,
@@ -33,14 +36,15 @@ export function statisticsOf(data: Loaded): StatsSnapshot {
         removed: files.length ? files.reduce((n, file) => n + file.removed, 0) : null,
         before: null, after: null, args: null, inner: false,
         text: null, truncated: false,
-        ms: measured ? result.time - node.time : null,
-        startedAt: node.time > 0 ? node.time : null, endedAt: measured ? result.time : null,
+        ms: duration,
+        startedAt: node.time > 0 && (summary.source !== "timeline" || paired) ? node.time : null,
+        endedAt: paired ? result.time : null,
       };
     });
     const measuredTools = calls.filter((call) => call.ms !== null);
-    const usage = hasUsage ? request?.usage : null;
-    const field = (key: keyof NonNullable<typeof usage>) => usage && (!request?.usageFields || request.usageFields.includes(key)) ? usage[key] : null;
-    const context = field("input"), read = field("cacheRead"), output = field("output");
+    const field = (key: keyof NonNullable<typeof request>["usage"]) => hasUsage && request ? observedUsage(request, key) : null;
+    const context = request && usageSourceOf(request, "input") === "reported" ? field("input") : null;
+    const read = field("cacheRead"), output = field("output");
     const counts = new Map<string, number>();
     for (const call of calls) if (call.name) counts.set(call.name, (counts.get(call.name) ?? 0) + 1);
     const previous = steps.get(span.turn) ?? [];
@@ -52,6 +56,7 @@ export function statisticsOf(data: Loaded): StatsSnapshot {
     const decode = model !== null && ttft !== null && model >= ttft ? model - ttft : null;
     const step: StatsStepMetrics = {
       sourceId: span.id, contentRevision: revision, detailsState: "unloaded", timingSource: model === null ? undefined : "session-estimate",
+      ...(hasUsage && request?.usageSources ? { usageSources: request.usageSources } : {}),
       turn: span.turn, step: previous.length + 1, startTime, endTime,
       context, output, cacheRead: read, cacheWrite: field("cacheWrite"),
       cacheHit: context !== null && context > 0 && read !== null ? Math.min(1, read / context) : null,
@@ -59,7 +64,7 @@ export function statisticsOf(data: Loaded): StatsSnapshot {
       // includes tools/idle and must not be substituted for model latency.
       ttft, decode, tps: decode !== null && decode > 0 && output !== null ? output / (decode / 1000) : null, model,
       tool: measuredTools.length ? measuredTools.reduce((n, call) => n + call.ms!, 0) : calls.length ? null : 0,
-      toolWall: toolSpanUnion(calls), toolPending: calls.filter((call) => call.endedAt === null).length,
+      toolWall: toolSpanUnion(calls), toolPending: calls.filter((call) => !results.has(call.callId)).length,
       tools: [...counts].map(([name, count]) => ({ name, count })), calls: calls.slice(0, 12), toolOutput: null,
       retries: 0, toolErrors: calls.filter((call) => call.error).length,
       answer: nodes.filter((node) => node.category === "assistant").map((node) => node.preview).join("\n").slice(0, 240) || null,

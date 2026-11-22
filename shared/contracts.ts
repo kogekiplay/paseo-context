@@ -14,12 +14,15 @@ export const usageSchema = z.object({
 });
 export type Usage = z.infer<typeof usageSchema>;
 export const emptyUsage = (): Usage => ({ input: 0, cacheRead: 0, cacheWrite: 0, output: 0, reasoning: 0 });
+const usageFieldSchema = z.enum(["input", "cacheRead", "cacheWrite", "output", "reasoning"]);
+const usageSourcesSchema = z.partialRecord(usageFieldSchema, z.enum(["reported", "cumulative", "mixed"]));
+const contextSourceSchema = z.enum(["reported", "paseo"]);
 export const nodeSchema = z.object({
   id: z.number().int(), line: z.number().int(), block: z.number().int(),
   seq: z.number().optional(), goneSeq: z.number().optional(), images: z.number().optional(),
   category: categorySchema, time: z.number(), tokens: z.number(),
-  title: z.string(), preview: z.string(), callId: z.string().optional(),
-  error: z.boolean().optional(),
+  title: z.string(), preview: z.string(), textLength: z.number().int().nonnegative().optional(), callId: z.string().optional(),
+  error: z.boolean().optional(), replayed: z.boolean().optional(), toolDurationMs: z.number().nonnegative().optional(),
   tool: z.string().optional(), source: z.string().optional(), gone: z.number().optional(),
 });
 export type ContextNode = z.infer<typeof nodeSchema>;
@@ -27,7 +30,9 @@ export const requestSchema = z.object({
   id: z.string(), index: z.number(), turn: z.number(), time: z.number(), boundary: z.number(), seq: z.number().optional(),
   parts: partsSchema, usage: usageSchema, model: z.string(), duration: z.number().nullable(),
   prompt: z.string(), response: z.string(), costUsd: z.number().nullable(),
-  usageFields: z.array(z.enum(["input", "cacheRead", "cacheWrite", "output", "reasoning"])).optional(),
+  usageFields: z.array(usageFieldSchema).optional(),
+  usageSources: usageSourcesSchema.optional(),
+  usageAt: z.number().optional(),
   estimatedModelMs: z.number().nonnegative().optional(), estimatedTtftMs: z.number().nonnegative().optional(),
   estimatedModelStart: z.number().optional(), estimatedModelEnd: z.number().optional(),
 });
@@ -61,9 +66,9 @@ export const tallySchema = z.object({ name: z.string(), count: z.number(), last:
 export type Tally = z.infer<typeof tallySchema>;
 export const summarySchema = z.object({
   agent: agentSchema, source: z.enum(["native", "timeline", "unavailable"]),
-  usage: usageSchema, turns: z.number(), steps: z.number(), humanInputs: z.number(),
+  usage: usageSchema, usageSources: usageSourcesSchema.optional(), turns: z.number(), steps: z.number(), humanInputs: z.number(),
   toolCalls: z.number(), images: z.number(), contextTokens: z.number().nullable(),
-  contextWindow: z.number().nullable(), maxOutput: z.number().nullable(), parts: partsSchema,
+  contextWindow: z.number().nullable(), contextSource: contextSourceSchema.optional(), maxOutput: z.number().nullable(), parts: partsSchema,
   costUsd: z.number().nullable(), costComplete: z.boolean(), modelMs: z.number(), toolMs: z.number(),
   ttftMs: z.number().optional(), timedOutputTokens: z.number().optional(),
   intervals: z.array(z.object({ start: z.number(), end: z.number(), kind: z.enum(["model", "tools"]) })).optional(),
@@ -86,11 +91,12 @@ export const browserRpc = defineRpc({
     query: z.string().default(""), sort: z.enum(["order", "size", "name"]).default("order"),
     offset: z.number().int().nonnegative().default(0), limit: z.number().int().min(1).max(100).default(40),
   }),
-  output: z.object({ items: z.array(nodeSchema), total: z.number() }),
+  output: z.object({ items: z.array(nodeSchema), total: z.number(), revision: z.number().int().nonnegative().optional() }),
 });
 export const contentRpc = defineRpc({
   name: "context.content", input: agentInput.extend({
     nodeId: z.number().int().nonnegative(), offset: z.number().int().nonnegative().default(0),
+    revision: z.number().int().nonnegative().optional(),
   }),
   output: z.object({ text: z.string(), totalChars: z.number(), nextOffset: z.number().nullable() }),
 });

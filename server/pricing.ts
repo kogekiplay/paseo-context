@@ -1,5 +1,6 @@
 import { calculateSessionCost, pricesBookOf, priceSourceOf, type ModelBook } from "../shared/core/pricing";
 import type { Request, Usage } from "../shared/contracts";
+import { usageSourceOf } from "../shared/usage";
 import type { PublicCache } from "./public-cache";
 
 export class Pricing {
@@ -43,6 +44,7 @@ export class Pricing {
     finally { clearTimeout(timer); this.controller = null; }
   }
   cost(provider: string, model: string, usage: Usage) {
+    if (usage.cacheRead + usage.cacheWrite > usage.input) return null;
     if (usage.input + usage.output === 0) return 0;
     return calculateSessionCost({ [provider]: { [model]: { off: {
       uncached: Math.max(0, usage.input - usage.cacheRead - usage.cacheWrite),
@@ -50,7 +52,10 @@ export class Pricing {
     } } } }, this.book);
   }
   priceRequests(provider: string, requests: Request[]) {
-    return requests.map((r) => ({ ...r, costUsd: this.cost(provider, r.model, r.usage) }));
+    return requests.map((r) => ({
+      ...r,
+      costUsd: usageSourceOf(r, "input") && usageSourceOf(r, "output") ? this.cost(provider, r.model, r.usage) : null,
+    }));
   }
   clear() { this.closed = true; this.controller?.abort(); this.book = null; }
 }

@@ -17,13 +17,14 @@ export interface FleetTask {
 export interface AgentTeam { tasks: FleetTask[]; failure?: string }
 export interface FleetRead {
   rootId: string; agents: Agent[]; loaded: Map<string, Loaded>; failed: number; total: number;
+  aliases?: ReadonlyMap<string, string>;
   subtasks?: Map<string, PaseoSubtask[]>; subtaskFailures?: number;
 }
 const PREVIEW_MESSAGES = 80;
 const PREVIEW_TEXT = 400;
+const RECENT_BYTES = 48 * 1024 * 1024;
 const clip = (value: string, max: number) => value.length <= max ? value : value.slice(0, max) + "…";
 const taskKey = (owner: string, id: string) => `${owner}:task:${id}`;
-const identity = (agent: Agent) => `${agent.provider}:${agent.sessionId ?? agent.id}`;
 
 /** Limits concurrent disk/timeline reads without retaining an extra cache of session folds. */
 async function mapBounded<T, U>(values: readonly T[], read: (value: T) => Promise<U>): Promise<U[]> {
@@ -39,7 +40,7 @@ async function mapBounded<T, U>(values: readonly T[], read: (value: T) => Promis
 }
 
 function resolverOf(family: FleetRead) {
-  const aliases = new Map<string, string>(), names = new Map<string, string | null>();
+  const aliases = new Map(family.aliases), names = new Map<string, string | null>();
   for (const agent of family.agents) {
     aliases.set(agent.id, agent.id);
     if (agent.sessionId) {
@@ -115,36 +116,61 @@ export function fleetRow(agent: Agent, team: AgentTeam, head?: ContextTimeline) 
   const row = rowOf(agent, head);
   return { ...row, projectionValues: { ...row.projectionValues, agentTeam: team } };
 }
-/** The graph consumes headline metrics and counts, not context item bodies. */
-export function graphHeadOf(head: ContextTimeline): ContextTimeline {
-  const { detailRev: _revision, ...rest } = head;
-  return { ...rest, nodes: [], archive: [], requests: [], events: [], systems: [], fileOps: [], commands: [], spans: [] };
-}
-
 export class UiFleet {
   private subtasks = new PaseoSubtasks();
-  private recent = new Map<string, { at: number; revision?: number; pending: Promise<FleetRead> }>();
+  private recent = new Map<string, { at: number; revision?: number; bytes: number; pending: Promise<FleetRead> }>();
   private timers = new Set<ReturnType<typeof setTimeout>>();
   private closed = false;
   private heads = new WeakMap<Loaded, ContextTimeline>();
+  private taskReads = new WeakMap<FleetRead, Promise<FleetRead>>();
   constructor(private service: Pick<ContextService, "agent" | "load" | "fleet" | "content">) {}
   clear() {
-    this.closed = true; this.subtasks.clear(); this.recent.clear(); this.heads = new WeakMap();
+    this.closed = true; this.subtasks.clear(); this.recent.clear(); this.heads = new WeakMap(); this.taskReads = new WeakMap();
     for (const timer of this.timers) clearTimeout(timer);
     this.timers.clear();
   }
 
   async read(id: string, paseo: PaseoApi, seed?: Loaded, includeSubtasks = true): Promise<FleetRead> {
-    const key = `${id}:${includeSubtasks}`;
+    const family = await this.readFamily(id, paseo, seed);
+    if (!includeSubtasks) return family;
+    let pending = this.taskReads.get(family);
+    if (!pending) {
+      pending = this.readSubtasks(family, paseo);
+      this.taskReads.set(family, pending);
+    }
+    return pending;
+  }
+
+  private async readFamily(id: string, paseo: PaseoApi, seed?: Loaded): Promise<FleetRead> {
+    if (this.closed) throw new Error("Plugin was stopped");
+    const key = id;
     const known = this.recent.get(key);
-    if (known && Date.now() - known.at < 1000 && (!seed || known.revision === seed.revision)) return known.pending;
-    const entry = { at: Infinity, revision: seed?.revision, pending: this.readFamily(id, paseo, seed, includeSubtasks) };
+    if (known && Date.now() - known.at < 1000 && (!seed || known.revision === seed.revision)) {
+      const family = await known.pending;
+      if (this.closed) throw new Error("Plugin was stopped");
+      if ([...family.loaded.values()].every((data) => data.foldRevision === undefined || data.foldRevision === data.fold.revision)) return family;
+      if (this.recent.get(key) === known) this.recent.delete(key);
+    }
+    const pending = this.service.fleet(id, paseo, { details: true, seed }).then((family): FleetRead => ({ ...family, total: family.agents.length }));
+    const entry = { at: Infinity, revision: seed?.revision, bytes: 0, pending };
     if (!this.closed) {
       for (const [key, value] of this.recent) if (Date.now() - value.at >= 1000) this.recent.delete(key);
       this.recent.delete(key); this.recent.set(key, entry);
       while (this.recent.size > 4) this.recent.delete(this.recent.keys().next().value!);
     }
-    try { return await entry.pending; }
+    try {
+      const family = await entry.pending;
+      if (this.closed) throw new Error("Plugin was stopped");
+      entry.bytes = [...family.loaded.values()].reduce((sum, data) => sum + (data.residentBytes ?? data.fold.residentBytes), 0);
+      if (entry.bytes > RECENT_BYTES && this.recent.get(key) === entry) this.recent.delete(key);
+      let bytes = [...this.recent.values()].reduce((sum, item) => sum + item.bytes, 0);
+      for (const [id, item] of this.recent) {
+        if (bytes <= RECENT_BYTES) break;
+        this.recent.delete(id);
+        bytes -= item.bytes;
+      }
+      return family;
+    }
     catch (error) { if (this.recent.get(key) === entry) this.recent.delete(key); throw error; }
     finally {
       // Retain only a brief burst of concurrent graph/summary/batch requests.
@@ -158,39 +184,30 @@ export class UiFleet {
       }
     }
   }
-  private async readFamily(id: string, paseo: PaseoApi, seed?: Loaded, includeSubtasks = true): Promise<FleetRead> {
-    const family = await this.service.fleet(id, paseo), candidates = family.members.map((s) => s.agent);
-    if (seed && !candidates.some((a) => a.id === seed.agent.id)) candidates.push(seed.agent);
-    const bySession = new Map<string, Agent>();
-    for (const agent of candidates) {
-      const previous = bySession.get(identity(agent));
-      if (!previous || previous.id.startsWith("native:") && !agent.id.startsWith("native:")) bySession.set(identity(agent), agent);
-    }
-    const agents = [...bySession.values()];
-    const root = candidates.find((a) => a.id === family.rootId);
-    const rootId = root ? bySession.get(identity(root))!.id : family.rootId;
-    const loaded = new Map<string, Loaded>(), failed = new Set<string>();
-    await mapBounded(agents, async (agent) => {
-      try {
-        const data = seed && identity(seed.agent) === identity(agent) ? seed.agent.id === agent.id ? seed : { ...seed, agent }
-          : await this.service.load(await this.service.agent(agent.id, paseo), paseo);
-        loaded.set(agent.id, data);
-      } catch { failed.add(agent.id); }
-    });
+  private async readSubtasks(family: FleetRead, paseo: PaseoApi): Promise<FleetRead> {
+    if (this.closed) throw new Error("Plugin was stopped");
     const subtasks = new Map<string, PaseoSubtask[]>();
     let subtaskFailures = 0;
-    await mapBounded(includeSubtasks ? agents.filter((agent) => !agent.id.startsWith("native:")) : [], async (agent) => {
+    await mapBounded(family.agents.filter((agent) => !agent.id.startsWith("native:")), async (agent) => {
       try { subtasks.set(agent.id, await this.subtasks.read(agent.id, agent.updatedAt, paseo)); }
       catch { subtaskFailures++; }
     });
-    return { rootId, agents, loaded, subtasks, subtaskFailures, failed: family.failed + failed.size, total: agents.length + family.failed };
+    if (this.closed) throw new Error("Plugin was stopped");
+    return { ...family, subtasks, subtaskFailures };
   }
-  rows(family: FleetRead) {
-    const team = teamOfFleet(family);
+  rows(family: FleetRead, selectedId?: string, includeTasks = true) {
+    const selected = selectedId ? family.aliases?.get(selectedId) : undefined;
+    const visibleId = (id: string) => selected === id && selectedId ? selectedId : id;
+    const team = includeTasks ? teamOfFleet(family) : undefined;
+    if (team && selected && selected !== selectedId) {
+      for (const task of team.tasks) if (task.ownerId) task.ownerId = visibleId(task.ownerId);
+    }
     return family.agents.map((agent) => {
       const data = family.loaded.get(agent.id);
-      if (data && !this.heads.has(data)) this.heads.set(data, graphHeadOf(upstreamOf(data).head));
-      return fleetRow(agent, team, data ? this.heads.get(data) : undefined);
+      if (data && !this.heads.has(data)) this.heads.set(data, upstreamOf(data, true).head);
+      const head = data ? this.heads.get(data) : undefined;
+      const row = { ...agent, id: visibleId(agent.id), parentId: agent.parentId ? visibleId(agent.parentId) : null };
+      return team && agent.id === family.rootId ? fleetRow(row, team, head) : rowOf(row, head);
     });
   }
   private delegations(family: FleetRead, data: Loaded): FleetDelegation[] {
@@ -201,8 +218,7 @@ export class UiFleet {
       return { seq: nodeSeq(data.fold, r.nodeId), time: r.time, to, mode: child?.mode ?? "unknown", label: r.title };
     });
   }
-  private async messageText(source: MessageSource, paseo: PaseoApi): Promise<string> {
-    const value = await this.service.content(source.data.agent.id, source.record.nodeId, paseo);
+  private messageText(source: MessageSource, value: string): string {
     if (source.record.contentKind === "delegation-result") return delegationTextOf(value);
     if (source.record.contentKind === "report") {
       const report = agentReportsOf(value).find((r) => r.from === source.record.from);
@@ -212,8 +228,9 @@ export class UiFleet {
     const args = parseArgs(value);
     return text(args.message ?? args.content ?? args.prompt ?? args.description ?? args.subject ?? args.explanation) || value;
   }
-  private async nodeText(data: Loaded, nodes: Loaded["fold"]["nodes"], paseo: PaseoApi) {
-    return (await mapBounded(nodes, (node) => this.service.content(data.agent.id, node.id, paseo))).join("\n");
+  private async bodies(data: Loaded, ids: number[], paseo: PaseoApi) {
+    if (data.bodies) return data.bodies(ids, (_id, body) => body);
+    return new Map(await mapBounded([...new Set(ids)], async (id) => [id, await this.service.content(data.agent.id, id, paseo)] as const));
   }
   async detail(family: FleetRead, id: string, mode: Mode, paseo: PaseoApi): Promise<FleetDetail | null> {
     const resolve = resolverOf(family);
@@ -222,8 +239,22 @@ export class UiFleet {
     if (!data) return null;
     const { incoming } = sourcesOf(family), all = incoming.get(canonicalId) ?? [];
     const shown = mode === "preview" ? all.slice(-PREVIEW_MESSAGES) : all;
-    const messages = await mapBounded(shown, async (source): Promise<FleetMessage> => {
-      const value = mode === "preview" ? source.record.title : await this.messageText(source, paseo);
+    const first = data.fold.nodes.find((n) => n.category === "user" && !n.replayed);
+    const last = data.fold.nodes.findLast((n) => n.category === "assistant" && n.gone === undefined);
+    const promptNodes = first ? data.fold.nodes.filter((n) => n.category === "user" && n.line === first.line) : [];
+    const replyNodes = last ? data.fold.nodes.filter((n) => n.category === "assistant" && n.line === last.line) : [];
+    const reads = new Map<Loaded, number[]>();
+    if (mode !== "preview") {
+      reads.set(data, [...promptNodes, ...replyNodes].map((node) => node.id));
+      for (const source of shown) {
+        const ids = reads.get(source.data) ?? [];
+        ids.push(source.record.nodeId);
+        reads.set(source.data, ids);
+      }
+    }
+    const bodies = new Map(await mapBounded([...reads], async ([source, ids]) => [source, await this.bodies(source, ids, paseo)] as const));
+    const messages = shown.map((source): FleetMessage => {
+      const value = mode === "preview" ? source.record.title : this.messageText(source, bodies.get(source.data)!.get(source.record.nodeId)!);
       const clipped = mode === "preview" && (value.length > PREVIEW_TEXT || (source.record.textLength ?? value.length) > value.length);
       const fromName = family.agents.find((a) => a.id === source.from)?.title;
       const body = mode === "preview" ? clip(value, PREVIEW_TEXT) : value;
@@ -233,14 +264,10 @@ export class UiFleet {
           summary: source.record.status === "failed" ? "Agent reported an error." : "Agent completed." } : {}),
         ...(clipped ? { clipped: true } : {}) };
     });
-    const first = data.fold.nodes.find((n) => n.category === "user");
-    const last = [...data.fold.nodes].reverse().find((n) => n.category === "assistant" && n.gone === undefined);
-    const promptNodes = first ? data.fold.nodes.filter((n) => n.category === "user" && n.line === first.line) : [];
-    const replyNodes = last ? data.fold.nodes.filter((n) => n.category === "assistant" && n.line === last.line) : [];
     const prompt = first ? mode === "preview" ? clip(promptNodes.map((n) => n.preview).join("\n"), 1600)
-      : await this.nodeText(data, promptNodes, paseo) : undefined;
+      : promptNodes.map((n) => bodies.get(data)!.get(n.id)).join("\n") : undefined;
     const reply = last ? mode === "preview" ? clip(replyNodes.map((n) => n.preview).join("\n"), 300)
-      : await this.nodeText(data, replyNodes, paseo) : undefined;
+      : replyNodes.map((n) => bodies.get(data)!.get(n.id)).join("\n") : undefined;
     const parent = data.agent.parentId ? family.loaded.get(resolve(data.agent.parentId, data.agent.provider)) : undefined;
     const child = parent && [...parent.fold.collaboration.children.values()].find((c) => c.sessionId === data.agent.sessionId);
     return { descriptor: { mode: child?.mode ?? "continuable", label: data.agent.title,
@@ -250,18 +277,19 @@ export class UiFleet {
       messages, messagesTotal: all.length, delegations: this.delegations(family, data),
       truncated: shown.length < all.length || family.failed > 0 };
   }
-  async summary(family: FleetRead, paseo: PaseoApi): Promise<FleetSummary> {
+  async summary(family: FleetRead, paseo: PaseoApi, requestedId = family.rootId): Promise<FleetSummary> {
     const { incoming } = sourcesOf(family), counts: Record<string, FleetDetailCounts> = {};
+    const rootId = family.aliases?.get(requestedId) === family.rootId ? requestedId : family.rootId;
     // Incoming messages can originate in any member. An unread source prevents
     // attesting complete totals even for a recipient whose own log was read.
     if (family.failed === 0) for (const [id, data] of family.loaded) {
-      counts[id] = { readAt: data.agent.updatedAt, messagesTotal: incoming.get(id)?.length ?? 0,
+      counts[id === family.rootId ? rootId : id] = { readAt: data.agent.updatedAt, messagesTotal: incoming.get(id)?.length ?? 0,
         delegationsCount: this.delegations(family, data).length };
     }
     const root = family.agents.find((a) => a.id === family.rootId);
     const detail = await this.detail(family, family.rootId, "preview", paseo);
     if (!detail) throw new Error("Fleet root could not be read");
-    return { rootId: family.rootId, ...(root ? { rootCreatedAt: root.createdAt } : {}), detail, counts,
+    return { rootId, ...(root ? { rootCreatedAt: root.createdAt } : {}), detail, counts,
       familySize: family.total,
       members: family.agents.filter((a) => a.id !== family.rootId).map((agent) => ({
         id: agent.id, name: agent.title, label: agent.title, createdAt: agent.createdAt,
@@ -273,8 +301,8 @@ export class UiFleet {
     if (ids.length > 16) throw new Error("Fleet batches support at most 16 agents");
     const id = text(body.sessionId ?? batch.rootId) || ids[0];
     if (!id) throw new Error("An agent is required for a fleet request");
-    const family = await this.read(id, paseo);
-    if (body.summary === true) return { ok: true, value: await this.summary(family, paseo) };
+    const family = await this.read(id, paseo, undefined, false);
+    if (body.summary === true) return { ok: true, value: await this.summary(family, paseo, id) };
     const mode: Mode = body.full === true ? "full" : body.history === true || batch.mode === "history" ? "history" : "preview";
     if (!Array.isArray(batch.ids)) return { ok: true, value: await this.detail(family, id, mode, paseo) };
     const rows: Record<string, FleetDetail> = {}, missing: string[] = [];

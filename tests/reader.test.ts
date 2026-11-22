@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "vitest";
-import { mkdtemp, mkdir, writeFile, appendFile, rm, utimes } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, appendFile, rename, rm, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionReader } from "../server/reader";
@@ -103,6 +103,54 @@ describe("Incremental native reader", () => {
     await utimes(file, changed, changed);
     expect(await reader.content(agent, 0)).toBe("change");
     reader.clear();
+  });
+  test("resets the incremental fold when the same inode is rewritten and grows", async () => {
+    const { reader, file, agent } = await fixture();
+    try {
+      await writeFile(file, message("before") + "\n");
+      const first = (await reader.read(agent))!;
+      await writeFile(file, message("change") + "\n" + message("appended") + "\n");
+      const next = (await reader.read(agent))!;
+      expect(next.entry.fold.epoch).not.toBe(first.entry.fold.epoch);
+      expect(next.entry.fold.nodes.map((node) => node.preview)).toEqual(["change", "appended"]);
+      await expect(first.bodies([0], (_id, body) => body)).rejects.toThrow(/changed/i);
+      await expect(reader.content(agent, 0)).resolves.toBe("change");
+    } finally { reader.clear(); }
+  });
+  test("rejects old content addresses after a rollout is atomically replaced", async () => {
+    const { reader, file, agent } = await fixture();
+    try {
+      await writeFile(file, message("alpha") + "\n");
+      const first = (await reader.read(agent))!;
+      expect(await first.bodies([0], (_id, body) => body)).toEqual(new Map([[0, "alpha"]]));
+      await writeFile(`${file}.next`, message("omega") + "\n");
+      await rename(`${file}.next`, file);
+      await expect(first.bodies([0], (_id, body) => body)).rejects.toThrow(/changed/i);
+      await expect(reader.content(agent, 0)).resolves.toBe("omega");
+    } finally { reader.clear(); }
+  });
+  test("checks a body record beyond the prefix and suffix append guards", async () => {
+    const { reader, file, agent } = await fixture();
+    try {
+      const prefix = message("a".repeat(5000)), suffix = message("z".repeat(5000));
+      await writeFile(file, `${prefix}\n${message("alpha")}\n${suffix}\n`);
+      const first = (await reader.read(agent))!;
+      await writeFile(file, `${prefix}\n${message("omega")}\n${suffix}\n${message("later")}\n`);
+      await expect(first.bodies([1], (_id, body) => body)).rejects.toThrow(/changed/i);
+      expect((await reader.read(agent))?.entry.fold.nodes[1].preview).toBe("omega");
+    } finally { reader.clear(); }
+  });
+  test("reads a valid final JSON record without a newline only once when sealed", async () => {
+    const { reader, file, agent } = await fixture();
+    try {
+      await writeFile(file, message("first") + "\n" + message("sealed tail"));
+      expect((await reader.read(agent))?.entry.fold.nodes).toHaveLength(1);
+      const sealed = { ...agent, archived: true };
+      expect((await reader.read(sealed))?.entry.fold.nodes).toHaveLength(2);
+      await expect(reader.content(sealed, 1)).resolves.toBe("sealed tail");
+      await appendFile(file, "\n" + message("later") + "\n");
+      expect((await reader.read(sealed))?.entry.fold.nodes.map((node) => node.preview)).toEqual(["first", "sealed tail", "later"]);
+    } finally { reader.clear(); }
   });
   test("rejects path traversal and reports corrupted records", async () => {
     const { reader, file, agent } = await fixture();

@@ -364,4 +364,60 @@ describe("Workspace tabs", () => {
     expect(pending.client.openPanel).not.toHaveBeenCalled();
     expect(pending.client.openScreen).not.toHaveBeenCalled();
   });
+  test("cross-workspace or unchanged agent_update does not re-render unrelated WorkspaceSurface", async () => {
+    const h = setup(); h.resolve(); await h.snapshot();
+    const { panel } = await mountWorkspace(h, "context");
+    mocks.frame.mockClear();
+    // Same workspace, identical PanelAgent fields (e.g. live running/status churn).
+    await act(async () => {
+      h.upsert({ id: "agent-a", workspaceId: "workspace-a", title: "Agent A", status: "running" });
+    });
+    expect(mocks.frame).not.toHaveBeenCalled();
+    // Different workspace upsert must not re-render workspace-a.
+    await act(async () => {
+      h.upsert({ id: "agent-other", workspaceId: "workspace-b", title: "Other" });
+    });
+    expect(mocks.frame).not.toHaveBeenCalled();
+    // Actual title change in workspace-a does re-render workspace-a.
+    await act(async () => {
+      h.upsert({ id: "agent-a", workspaceId: "workspace-a", title: "Agent A Renamed" });
+    });
+    expect(mocks.frame).toHaveBeenCalledTimes(1);
+    await act(async () => panel.unmount());
+  });
+  test("workspace-statistics is registered once and not torn down when toggling defaultPlacement or fleetTab", async () => {
+    const h = setup({ defaultPlacement: "all", fleetTab: true }); h.resolve(); await h.snapshot();
+    const statsBefore = h.workspacePanels.get("workspace-statistics");
+    const statsAddCalls = () => h.client.addWorkspacePanel.mock.calls.filter(([p]: any) => p.id === "workspace-statistics").length;
+    expect(statsAddCalls()).toBe(1);
+    mocks.settings = { status: "ready", revision: "rev-2", values: preferenceSchema.parse({ defaultPlacement: "sidebar", fleetTab: false }) };
+    const { panel } = await mountWorkspace(h, "statistics");
+    expect(statsAddCalls()).toBe(1);
+    expect(h.workspacePanels.get("workspace-statistics")).toBe(statsBefore);
+    expect(h.workspacePanels.has("workspace-fleet")).toBe(false);
+    expect(h.workspacePanels.has("workspace-context")).toBe(false);
+    await act(async () => panel.unmount());
+  });
+  test("dispose invokes static registration cleanups when supplied by host", async () => {
+    const staticCleanups = Array.from({ length: 10 }, () => vi.fn());
+    let index = 0;
+    const nextCleanup = () => staticCleanups[index++];
+    const client = {
+      rpc: vi.fn(() => Promise.resolve(preferenceSchema.parse({}))),
+      openPanel: vi.fn(), openScreen: vi.fn(), openSettings: vi.fn(),
+      composers: () => [],
+      addAgentPanel: vi.fn(() => vi.fn()),
+      addWorkspacePanel: vi.fn(() => vi.fn()),
+      addScreen: vi.fn(nextCleanup),
+      addSidebarHeaderItem: vi.fn(nextCleanup),
+      addSettingsScreen: vi.fn(nextCleanup),
+      addCommandCenterItem: vi.fn(nextCleanup),
+      addSlashCommand: vi.fn(nextCleanup),
+      addComposerPill: vi.fn(() => ({ remove: vi.fn() })),
+      paseo: { agents: { list: vi.fn(async () => ({ subscription: { subscribe: vi.fn() } })) } },
+    };
+    const dispose = contribute(client as unknown as PluginClientContext);
+    dispose();
+    expect(staticCleanups.every((fn) => fn.mock.calls.length === 1)).toBe(true);
+  });
 });
