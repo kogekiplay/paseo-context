@@ -1,4 +1,6 @@
 import type { PaseoApi } from "@getpaseo/client";
+import { createHash } from "node:crypto";
+import type { Request, Summary } from "../shared/contracts";
 import { ContextFold } from "./fold";
 import { messagesOf } from "./normalize";
 import { ensureActive, timelineAfter, timelineHistory } from "./paging";
@@ -17,6 +19,7 @@ interface Frame {
   residentBytes: number;
 }
 const RESIDENT_LIMIT = 48 * 1024 * 1024;
+const HASH_CHUNK_CHARS = 64 * 1024;
 const rowOf = (entry: TimelineEntry) => ({ ...record(entry.item), timestamp: entry.timestamp });
 
 // Timeline items are JSON DTOs. Weigh their strings and containers without serializing a second copy.
@@ -34,6 +37,54 @@ function itemBytes(value: unknown): number {
 }
 const sizeOf = (entries: readonly TimelineEntry[]) => entries.reduce((size, entry) =>
   size + itemBytes(entry.item) + 128, 0);
+
+/** Stream length-delimited collections so a large history never needs one JSON string. */
+export function timelineFingerprint(key: string, fold: ContextFold, summary: Summary, requests: readonly Request[]) {
+  const hash = createHash("sha256");
+  const chunk: string[] = [];
+  let chars = 0;
+  const flush = () => {
+    if (!chars) return;
+    hash.update(chunk.join(""));
+    chunk.length = 0;
+    chars = 0;
+  };
+  const write = (value: unknown) => {
+    const row = `${JSON.stringify(value) ?? "null"}\n`;
+    if (chars + row.length > HASH_CHUNK_CHARS) flush();
+    if (row.length >= HASH_CHUNK_CHARS) hash.update(row);
+    else {
+      chunk.push(row);
+      chars += row.length;
+    }
+  };
+  const rows = <T>(items: readonly T[] | undefined, writeRow: (item: T) => void = write) => {
+    write(items?.length ?? null);
+    if (items) for (const item of items) writeRow(item);
+  };
+  const { intervals, activity, tools, skills, programs, ...metrics } = summary;
+  write([key, fold.revision, fold.epoch, metrics]);
+  rows(intervals);
+  rows(tools);
+  rows(skills);
+  rows(programs);
+  rows(activity, (day) => {
+    write(day.time);
+    rows(day.tools);
+    rows(day.skills);
+    rows(day.programs);
+  });
+  rows(fold.contentHashes);
+  rows(fold.statistics.rows, ({ nodeIds, ...span }) => { write(span); rows(nodeIds); });
+  rows(fold.nodes);
+  rows(fold.events);
+  rows(fold.files);
+  rows(fold.toolEpochs, ({ nodeIds, ...epoch }) => { write(epoch); rows(nodeIds); });
+  rows(fold.commands, ({ outputNodes, programs, ...command }) => { write(command); rows(programs); rows(outputNodes); });
+  rows(requests);
+  flush();
+  return hash.digest("hex");
+}
 
 function applyEntries(fold: ContextFold, entries: readonly TimelineEntry[]) {
   for (const entry of entries) fold.apply(rowOf(entry));

@@ -43,7 +43,7 @@ export class UiRoutes {
   }
   async handle(route: string, input: unknown, paseo: PaseoApi, format: "projection" | "rpc" = "projection"): Promise<unknown> {
     const body = record(input), id = text(body.sessionId ?? body.agentId);
-    if (route === "ui.document") return uiDocument();
+    if (route === "ui.document") return uiDocument({ variant: body.variant === "statistics" ? "statistics" : "full", locale: text(body.locale) });
     if (route === "ui.grammar") return grammarOf(text(body.name));
     if (route === "ui.error") {
       console.error("[paseo-context] UI error:", text(body.message).slice(0, 16000));

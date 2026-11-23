@@ -13,9 +13,13 @@ const USER = 14, PLANNER = 15, CHECKPOINT = 23, TOOL = 132;
 
 export interface AntigravityDatabaseFile { path: string; fingerprint: string; bytes: number }
 interface StoredStep { facts: AntigravityStep; key: string }
+interface StepIndex extends Iterable<[number, StoredStep]> {
+  readonly size: number;
+  get(index: number): StoredStep | undefined;
+}
 export interface AntigravitySnapshot {
   fingerprint: string;
-  steps: ReadonlyMap<number, StoredStep>;
+  steps: StepIndex;
   bytes: number;
 }
 
@@ -37,53 +41,91 @@ function usageOf(value: unknown) {
   return { usage, responseId: protobufText(fields.get(11)) };
 }
 
-function readSteps(db: Sqlite.DatabaseSync): Map<number, AntigravityStep> {
+function readSteps(db: Sqlite.DatabaseSync) {
   const tables = new Set(db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table'").all().map((row) => row.name));
-  const steps = new Map<number, AntigravityStep>(), types = new Map<number, number>();
+  const steps = new Map<number, StoredStep>();
+  const ignored = tables.has("gen_metadata") ? new Set<number>() : undefined;
+  let last = -1, ordered = true;
+  const store = (index: number, facts: AntigravityStep) => {
+    const previous = steps.get(index);
+    if (previous) {
+      previous.facts = facts;
+      return;
+    }
+    ordered &&= index > last;
+    last = index;
+    steps.set(index, { facts, key: "" });
+  };
   if (tables.has("steps")) for (const row of db.prepare(`
     SELECT idx, step_type, CASE WHEN step_type IN (${USER}, ${PLANNER}, ${CHECKPOINT}, ${TOOL}) THEN metadata END AS metadata
     FROM steps ORDER BY idx
   `).iterate()) {
     const index = antigravityStepIndex(row.idx), type = row.step_type;
     if (index === undefined || typeof type !== "number") continue;
-    types.set(index, type);
-    if (![USER, PLANNER, CHECKPOINT, TOOL].includes(type)) continue;
+    if (type !== USER && type !== PLANNER && type !== CHECKPOINT && type !== TOOL) {
+      steps.delete(index);
+      ignored?.add(index);
+      continue;
+    }
+    ignored?.delete(index);
     const fields = protobuf(row.metadata);
     const time = (tag: number) => milliseconds(fields.get(tag)) || undefined;
     const at = time(1), usageAt = time(8);
-    if (type === USER) steps.set(index, { type: "USER_INPUT", at });
+    if (type === USER) store(index, { type: "USER_INPUT", at });
     if (type === TOOL) {
       const start = time(32);
       const end = usageAt !== undefined && (start === undefined || usageAt >= start) ? usageAt : undefined;
-      steps.set(index, { type: "GENERIC", at,
+      store(index, { type: "GENERIC", at,
         tool: protobufText(protobuf(fields.get(4)).get(2)), times: { start, end } });
     }
-    if (type === CHECKPOINT) steps.set(index, { type: "CHECKPOINT", at, usageAt, ...usageOf(fields.get(9)) });
+    if (type === CHECKPOINT) store(index, { type: "CHECKPOINT", at, usageAt, ...usageOf(fields.get(9)) });
     if (type === PLANNER) {
       const first = time(6), rawEnd = time(7);
       const end = rawEnd !== undefined && (at === undefined || rawEnd >= at) ? rawEnd : undefined;
       const timing: ProviderTiming = { start: at, end,
         ttftMs: at !== undefined && first !== undefined && first >= at ? first - at : undefined,
         modelMs: at !== undefined && end !== undefined && end >= at ? end - at : undefined };
-      steps.set(index, { type: "PLANNER_RESPONSE", at, usageAt, ...usageOf(fields.get(9)), timing });
+      store(index, { type: "PLANNER_RESPONSE", at, usageAt, ...usageOf(fields.get(9)), timing });
     }
   }
-  if (tables.has("gen_metadata")) for (const row of db.prepare("SELECT data FROM gen_metadata ORDER BY idx").iterate()) {
+  if (ignored) for (const row of db.prepare("SELECT data FROM gen_metadata ORDER BY idx").iterate()) {
     const generator = protobuf(row.data), index = antigravityStepIndex(firstIndex(generator.get(2)));
-    if (index === undefined || types.has(index) && types.get(index) !== PLANNER) continue;
+    if (index === undefined || ignored.has(index)) continue;
+    const planner = steps.get(index)?.facts;
+    if (planner && planner.type !== "PLANNER_RESPONSE") continue;
     const fields = protobuf(generator.get(1));
     if (!fields.size) continue;
-    const previous = steps.get(index);
-    const planner = previous?.type === "PLANNER_RESPONSE" ? previous : undefined;
     const ttftMs = milliseconds(fields.get(11)), stream = milliseconds(fields.get(12));
     const { usage, responseId } = usageOf(fields.get(4));
-    if (!planner && !Object.keys(usage).length && ttftMs === undefined && stream === undefined) continue;
-    steps.set(index, { type: "PLANNER_RESPONSE", at: planner?.at, usageAt: planner?.usageAt,
+    if (!planner && !Object.keys(usage).length && ttftMs === undefined) continue;
+    store(index, { type: "PLANNER_RESPONSE", at: planner?.at, usageAt: planner?.usageAt,
       usage: mergeAntigravityUsage(planner?.usage, usage), responseId: responseId ?? planner?.responseId,
       timing: { ...planner?.timing, ttftMs: ttftMs ?? planner?.timing?.ttftMs,
         modelMs: ttftMs !== undefined && stream !== undefined ? ttftMs + stream : planner?.timing?.modelMs } });
   }
-  return steps;
+  return { steps, ordered };
+}
+
+function indexSteps({ steps, ordered }: ReturnType<typeof readSteps>): { steps: StepIndex; bytes: number } {
+  let bytes = 0;
+  for (const step of steps.values()) {
+    step.key = JSON.stringify(step.facts);
+    bytes += 320 + step.key.length * 2;
+  }
+  if (ordered) return { steps, bytes };
+  // A generator-only step can precede an existing row. Sort just the numeric
+  // indices and keep a single copy of the lookup table.
+  const indices = new Float64Array(steps.size);
+  let offset = 0;
+  for (const index of steps.keys()) indices[offset++] = index;
+  indices.sort();
+  return { bytes: bytes + indices.byteLength, steps: {
+    size: steps.size,
+    get: (index) => steps.get(index),
+    *[Symbol.iterator]() {
+      for (const index of indices) yield [index, steps.get(index)!];
+    },
+  } };
 }
 
 // Inspect sidecars without following a symlink into another conversation or
@@ -144,7 +186,7 @@ export class AntigravityDatabase {
       ensureActive(this.signal);
       account(current.bytes);
       const db = new module.DatabaseSync(path, { readOnly: true, timeout: 250 });
-      let facts: Map<number, AntigravityStep>;
+      let facts: ReturnType<typeof readSteps>;
       let begun = false;
       try {
         db.exec("BEGIN");
@@ -158,15 +200,8 @@ export class AntigravityDatabase {
       ensureActive(this.signal);
       if (!after) break;
       if (after.fingerprint !== key) { key = after.fingerprint; continue; }
-      const steps = new Map<number, StoredStep>();
-      let bytes = 0;
-      for (const [index, fact] of [...facts].sort(([a], [b]) => a - b)) {
-        const stepKey = JSON.stringify(fact);
-        steps.set(index, { facts: fact, key: stepKey });
-        bytes += 320 + stepKey.length * 2;
-      }
-      const snapshot = { fingerprint: key, steps, bytes };
-      this.cache.set(path, snapshot, bytes);
+      const snapshot = { fingerprint: key, ...indexSteps(facts) };
+      this.cache.set(path, snapshot, snapshot.bytes);
       return snapshot;
     }
     throw new Error("Antigravity database changed while reading");

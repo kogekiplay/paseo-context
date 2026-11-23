@@ -1,30 +1,28 @@
 import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 import { stat } from "node:fs/promises";
-import { emptyParts, type Agent, type Request, type Scope, type Summary, type Tally } from "../shared/contracts";
-import { ContextFold } from "./fold";
+import type { Agent, Request, Scope, Summary } from "../shared/contracts";
+import type { ContextFold } from "./fold";
 import { SessionReader, type ReadBodies } from "./reader";
 import { Pricing } from "./pricing";
 import { detachSlice, timestamp } from "./value";
 import { createHash } from "node:crypto";
-import { scopedIntervals, sumTiming, unionMs } from "./timing";
-import { dayKeyOf, shiftDayKey, startOfDayKey } from "../shared/core/days";
-import { usageSourceOf } from "../shared/usage";
 import { ensureActive, nextCursor } from "./paging";
-import { TimelineReader } from "./timeline";
+import { TimelineReader, timelineFingerprint } from "./timeline";
 import type { NativeLocation } from "./native-paths";
 import type { NativeChild } from "./collaboration";
 import { antigravityConversationId } from "./antigravity-log";
 import { MIB, sessionReadBudget, type ReadBudget } from "./read-budget";
 import { RetainedCache, SESSION_IDLE_MS } from "./retained-cache";
+import { aggregateScope, overviewPage, sessionShard, type SessionShard } from "./corpus";
+
+export { aggregate } from "./corpus";
 
 const CORPUS_TTL_MS = 10_000;
 const CORPUS_IDLE_MS = 180_000;
 const FIRST_PAINT_BUDGET_MS = 400;
 const SCAN_CONCURRENCY = 4;
-const DERIVED_BYTES = 48 * 1024 * 1024;
-const OVERVIEW_PAGE_SIZE = 24;
-type LedgerRequest = Pick<Request, "time" | "usageAt" | "turn" | "usage" | "usageFields" | "usageSources" | "parts" | "costUsd">;
-interface Ledger { at: number; key: string; summary: Summary; requests: LedgerRequest[]; retry?: boolean }
+const DERIVED_BYTES = 48 * MIB;
+const SUMMARY_BYTES = 16 * MIB;
 interface Reader {
   read(agent: Agent, location?: NativeLocation | null): Promise<{
     entry: { fold: ContextFold }; bodies?: ReadBodies; residentBytes?: number; metadataOnly?: boolean; companionFailed?: boolean;
@@ -64,7 +62,7 @@ interface Corpus {
   at: number;
   pricingRevision: number;
   all: Summary[];
-  ledgers: Map<string, Ledger>;
+  shards: Map<string, SessionShard>;
   scanned: number;
   failed: number;
   unreadable: number;
@@ -103,7 +101,7 @@ export class ContextService {
     this.budget = reader instanceof SessionReader ? reader.budget : sessionReadBudget;
     this.timeline = new TimelineReader(this.lifetime.signal, this.budget);
   }
-  private summaries = new RetainedCache<Ledger>(256, 50_000);
+  private summaries = new RetainedCache<SessionShard>(256, SUMMARY_BYTES);
   private corpus: Corpus | null = null;
   private corpusTimer?: ReturnType<typeof setTimeout>;
   private scanning: Corpus | null = null;
@@ -184,9 +182,8 @@ export class ContextService {
       summary.costUsd = last.totalCostUsd;
       summary.notices.push("last-turn-cost");
     }
-    const fingerprint = createHash("sha256").update(JSON.stringify(native
-      ? [key, fold.epoch, fold.revision]
-      : [key, summary, fold.revision, fold.epoch, fold.contentHashes, fold.statistics.rows, fold.nodes, fold.events, fold.commands, requests])).digest("hex");
+    const fingerprint = native ? createHash("sha256").update(JSON.stringify([key, fold.epoch, fold.revision])).digest("hex")
+      : timelineFingerprint(key, fold, summary, requests);
     const previous = this.revisions.get(agent.id);
     const revision = previous?.fingerprint === fingerprint ? previous.revision : ++this.serial;
     if (!this.closed) {
@@ -226,9 +223,9 @@ export class ContextService {
     return contents;
   }
   async summary(raw: PaseoAgent, paseo: PaseoApi) {
-    return (await this.ledger(raw, paseo)).summary;
+    return (await this.shard(raw, paseo)).summary;
   }
-  private async ledger(raw: PaseoAgent, paseo: PaseoApi, previous?: Ledger, locate?: (agent: Agent) => Promise<NativeLocation | null>) {
+  private async shard(raw: PaseoAgent, paseo: PaseoApi, previous?: SessionShard, locate?: (agent: Agent) => Promise<NativeLocation | null>) {
     const agent = agentOf(raw);
     const location = locate ? await locate(agent) : await this.reader.locateSource?.(agent);
     const path = location === undefined ? await this.reader.locate(agent) : location?.path;
@@ -237,15 +234,13 @@ export class ContextService {
     const key = JSON.stringify([agent, raw.lastUsage, path, source?.dev, source?.ino, source?.size,
       source?.mtimeMs, source?.ctimeMs, location?.antigravity?.database?.fingerprint, this.pricing.revision]);
     const ttl = path ? 600_000 : 15_000;
-    const valid = (entry: Ledger | undefined): entry is Ledger => entry?.key === key && !entry.retry && Date.now() - entry.at < ttl;
+    const valid = (entry: SessionShard | undefined): entry is SessionShard => entry?.key === key && !entry.retry && Date.now() - entry.at < ttl;
     if (valid(previous)) return previous;
     const cached = this.summaries.get(raw.id);
     if (valid(cached)) return cached;
     const data = await this.load(raw, paseo, location);
-    const value: Ledger = { at: Date.now(), key, summary: data.summary, retry: data.companionFailed,
-      requests: data.requests.map(({ time, usageAt, turn, usage, usageFields, usageSources, parts, costUsd }) =>
-        ({ time, usageAt, turn, usage, usageFields, usageSources, parts, costUsd })) };
-    if (!this.closed) this.summaries.set(raw.id, value, value.requests.length);
+    const value = sessionShard(data.summary, data.requests, key, Date.now(), data.companionFailed);
+    if (!this.closed) this.summaries.set(raw.id, value, value.bytes);
     return value;
   }
   async overview(scope: Scope, offset: number, paseo: PaseoApi) {
@@ -303,7 +298,7 @@ export class ContextService {
       data: data ? overviewPage(data, offset) : null };
   }
   private aggregateCorpus(corpus: Corpus, scope: Scope) {
-    return aggregateScope(corpus.all, (id) => corpus.ledgers.get(id)?.requests, scope, corpus.scanned, corpus.failed);
+    return aggregateScope(corpus.all, corpus.shards, scope, corpus.scanned, corpus.failed);
   }
   async backfill(paseo: PaseoApi) {
     const corpus = await this.readCorpus(paseo, true);
@@ -318,7 +313,7 @@ export class ContextService {
     if (!force && this.corpus && this.corpus.pricingRevision === this.pricing.revision
       && Date.now() - this.corpus.at < CORPUS_TTL_MS) return this.corpus;
     const corpus = this.scanning = { at: 0, pricingRevision: this.pricing.revision, all: [],
-      ledgers: new Map(), scanned: 0, failed: 0, unreadable: 0, failedSessions: [], unreadableSessions: [],
+      shards: new Map(), scanned: 0, failed: 0, unreadable: 0, failedSessions: [], unreadableSessions: [],
       running: true, revision: ++this.corpusRevision };
     this.corpusBusy = this.scanCorpus(paseo, corpus);
     try { return await this.corpusBusy; }
@@ -351,7 +346,7 @@ export class ContextService {
       const locate = await this.reader.locateForScan?.(agents.map(agentOf)).catch(() => undefined);
       return { agents, locate };
     });
-    const previous = this.corpus?.ledgers;
+    const previous = this.corpus?.shards;
     ensureActive(signal);
     const order = new Map(agents.map((agent, index) => [agent.id, index]));
     agents.sort((a, b) => timestamp(b.updatedAt) - timestamp(a.updatedAt));
@@ -362,10 +357,10 @@ export class ContextService {
       while (!signal.aborted && cursor < agents.length) {
         const raw = agents[cursor++];
         try {
-          const data = await this.ledger(raw, paseo, previous?.get(raw.id), locate);
+          const data = await this.shard(raw, paseo, previous?.get(raw.id), locate);
           if (signal.aborted) return;
           corpus.all.push(data.summary);
-          corpus.ledgers.set(raw.id, data);
+          corpus.shards.set(raw.id, data);
         } catch (error) {
           if (signal.aborted) return;
           const code = (error as NodeJS.ErrnoException | undefined)?.code;
@@ -498,125 +493,4 @@ export class ContextService {
     this.overviewCache.clear(); this.refreshIssues = []; this.corpus = null; this.scanning = null;
     this.corpusBusy = null;
   }
-}
-
-const accountingTime = (request: LedgerRequest) => request.usageAt ?? request.time;
-export function aggregate(all: Summary[], requests: ReadonlyMap<string, LedgerRequest[]>, scope: Scope, offset: number, scanned: number, failed: number, now = Date.now()) {
-  return overviewPage(aggregateScope(all, (id) => requests.get(id), scope, scanned, failed, now), offset);
-}
-
-function overviewPage(data: ReturnType<typeof aggregateScope>, offset: number) {
-  return { ...data, sessions: data.sessions.slice(offset, offset + OVERVIEW_PAGE_SIZE) };
-}
-
-function aggregateScope(all: Summary[], requests: (id: string) => LedgerRequest[] | undefined, scope: Scope, scanned: number, failed: number, now = Date.now()) {
-  const today = dayKeyOf(now) ?? "";
-  const day = startOfDayKey(scope.day) === null ? "" : scope.day;
-  const from = day || (scope.range === "custom" ? scope.start : scope.range === "all" ? ""
-    : shiftDayKey(today, -(scope.range === "today" ? 0 : scope.range === "7d" ? 6 : 29)) ?? "");
-  const to = day || (scope.range === "custom" ? scope.end : "");
-  const start = startOfDayKey(from) ?? 0;
-  const end = startOfDayKey(shiftDayKey(to, 1) ?? "") ?? Infinity;
-  const projectKey = (s: Summary) => s.agent.cwd || "__ungrouped__";
-  const groups = [...new Set(all.map(projectKey))].sort();
-  const query = scope.query.toLowerCase();
-  const eligible = all.filter((s) => {
-    const a = s.agent;
-    const search = !query || `${a.title} ${a.cwd} ${a.provider} ${a.model}`.toLowerCase().includes(query);
-    return search && (scope.coverage === "all" || (scope.coverage === "archived") === a.archived);
-  });
-  const inScope = eligible.filter((s) => {
-    const rows = requests(s.agent.id) ?? [];
-    return rows.some((r) => accountingTime(r) >= start && accountingTime(r) < end)
-      || (!rows.length && s.agent.updatedAt >= start && s.agent.updatedAt < end)
-      || s.activity.some((d) => d.time >= start && d.time < end);
-  });
-  const matchesPick = (s: Summary) => !scope.pick || s.activity.some((d) => d.time >= start && d.time < end
-    && d[scope.pick as "tools" | "skills" | "programs"].some((t) => t.name === scope.name));
-  const matchesFilters = (s: Summary) => (!scope.group || projectKey(s) === scope.group) && matchesPick(s);
-  const selected = inScope.filter(matchesFilters);
-  const filtered = eligible.filter(matchesFilters);
-  let tokens = 0, input = 0, cacheRead = 0, pairedInput = 0, pairedRead = 0, cost = 0, priced = 0, total = 0, turns = 0;
-  const days = new Map<string, { day: string; tokens: number; costUsd: number | null; sessions: Set<string> }>();
-  const parts = emptyParts();
-  const partKeys = Object.keys(parts) as Array<keyof typeof parts>;
-  const rangeUsage = new Map<string, { tokens: number; complete: boolean }>();
-  const tallySessionCounts = { tools: {} as Record<string, number>, skills: {} as Record<string, number>, programs: {} as Record<string, number> };
-  const tally = (key: "tools" | "skills" | "programs") => {
-    const map = new Map<string, Tally>();
-    for (const s of selected) {
-      const names = new Set<string>();
-      for (const day of s.activity.filter((d) => d.time >= start && d.time < end)) for (const t of day[key]) {
-        names.add(t.name);
-        const hit = map.get(t.name) ?? { name: t.name, count: 0, last: 0 };
-        hit.count += t.count; hit.last = Math.max(hit.last, t.last); map.set(t.name, hit);
-      }
-      for (const name of names) tallySessionCounts[key][name] = (tallySessionCounts[key][name] ?? 0) + 1;
-    }
-    return [...map.values()].sort((a, b) => b.count - a.count);
-  };
-  for (const s of filtered) {
-    const turnIds = new Set<number>();
-    for (const r of requests(s.agent.id) ?? []) {
-      const at = accountingTime(r), day = at > 0 ? dayKeyOf(at) : null;
-      if (day === null) continue;
-      const hasInput = usageSourceOf(r, "input"), hasOutput = usageSourceOf(r, "output"), hasRead = usageSourceOf(r, "cacheRead");
-      const measured = hasInput || hasOutput || hasRead || usageSourceOf(r, "cacheWrite") || usageSourceOf(r, "reasoning");
-      const d = days.get(day) ?? { day, tokens: 0, costUsd: 0, sessions: new Set<string>() };
-      d.tokens += r.usage.input + r.usage.output; d.sessions.add(s.agent.id);
-      d.costUsd = d.costUsd === null || r.costUsd === null ? null : d.costUsd + r.costUsd;
-      days.set(day, d);
-      if (at < start || at >= end) continue;
-      if (measured) {
-        const usage = rangeUsage.get(s.agent.id) ?? { tokens: 0, complete: true };
-        usage.tokens += r.usage.input + r.usage.output;
-        usage.complete &&= r.costUsd !== null;
-        rangeUsage.set(s.agent.id, usage);
-      }
-      total++; turnIds.add(r.turn); input += r.usage.input; cacheRead += r.usage.cacheRead;
-      if (hasInput && hasRead) { pairedInput += r.usage.input; pairedRead += r.usage.cacheRead; }
-      tokens += r.usage.input + r.usage.output;
-      if (r.costUsd !== null) { cost += r.costUsd; priced++; }
-      const sum = Object.values(r.parts).reduce((a, b) => a + b, 0);
-      for (const key of partKeys) parts[key] += sum ? r.parts[key] / sum * r.usage.input : 0;
-      parts.assistant += Math.max(0, r.usage.output - r.usage.reasoning); parts.reasoning += r.usage.reasoning;
-    }
-    turns += turnIds.size;
-  }
-  const rangeTokens = (s: Summary) => rangeUsage.get(s.agent.id)?.tokens ?? 0;
-  selected.sort((a, b) => scope.sort === "tokens" ? rangeTokens(b) - rangeTokens(a)
-    : scope.sort === "context" ? (b.contextTokens ?? 0) - (a.contextTokens ?? 0) : b.agent.updatedAt - a.agent.updatedAt);
-  const tools = tally("tools"), skills = tally("skills"), programs = tally("programs");
-  const byProject = new Map<string, { key: string; sessions: number; tokens: number }>();
-  for (const session of selected) {
-    const key = projectKey(session);
-    const project = byProject.get(key) ?? { key, sessions: 0, tokens: 0 };
-    project.sessions++; project.tokens += rangeTokens(session);
-    byProject.set(key, project);
-  }
-  const counts = new Map<string, number>();
-  for (const session of inScope) {
-    const key = projectKey(session);
-    counts.set(key, (counts.get(key) ?? 0) + 1);
-  }
-  const groupCounts = groups.map((key) => ({ key, count: counts.get(key) ?? 0 }));
-  const projects = [...byProject.values()].filter((row) => row.tokens > 0)
-    .sort((a, b) => b.tokens - a.tokens || a.key.localeCompare(b.key));
-  let wallMs = 0, toolsMs = 0;
-  for (const s of selected) {
-    const intervals = scopedIntervals(s.intervals ?? [], start, end);
-    wallMs += unionMs(intervals);
-    toolsMs += intervals.filter((row) => row.kind === "tools").reduce((n, row) => n + row.end - row.start, 0);
-  }
-  return { sessions: selected, total: selected.length, scopeTotal: inScope.length, scanned, failed,
-    tokens, input, cacheRead, pairedInput, pairedRead, turns, calls: total, toolCalls: tools.reduce((n, t) => n + t.count, 0),
-    wallMs, toolsMs, timing: sumTiming(selected), costUsd: priced ? cost : null,
-    costComplete: total > 0 && priced === total, parts, groups,
-    groupCounts, projects, window: { start, end: Number.isFinite(end) ? end - 1 : null, from: from || null, to: to || today || null },
-    tallySessionCounts, sessionsArchived: all.filter((s) => s.agent.archived).length,
-    archivedScoped: selected.filter((s) => s.agent.archived).length,
-    costSessions: [...rangeUsage.values()].filter((usage) => usage.complete).length,
-    usageSessions: rangeUsage.size,
-    days: [...days.values()].map((d) => ({ ...d, sessions: d.sessions.size })).sort((a, b) => a.day.localeCompare(b.day)),
-    tools, skills, programs };
 }

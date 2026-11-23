@@ -8,7 +8,7 @@ import { bridgeRpc, settingsPreviewRpc } from "../shared/bridge";
 import { preferences } from "../shared/contracts";
 import {
   buildInitPayload, createSettingsSaver, handleBridgeAction, handleBridgeRpc,
-  platformNameOf, uiDocumentQueryOptions,
+  platformNameOf, uiDocumentQueryOptions, uiDocumentVariantOf,
 } from "./bridge-shared";
 import type { FrameProps } from "./frame";
 import { messages } from "./messages";
@@ -96,11 +96,11 @@ function NativeFrameBody(props: FrameProps & { retry: () => void }) {
   const seenHistoryIds = useRef(new Set<string>());
   const seenHistorySeqs = useRef(new Set<string>());
   const webViewGen = useRef(0);
+  const readyNonce = useRef("");
   const latest = useRef({ props, settings, locale, rpc, previewRpc });
   latest.current = { props, settings, locale, rpc, previewRpc };
   const saveSetting = useMemo(() => createSettingsSaver(() => latest.current.settings as any), []);
-  const nonce = useMemo(() => `native${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`, []);
-  const baseUrl = useMemo(() => nativeDocumentUrl(nonce), [nonce]);
+  const poolId = useMemo(() => `native${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`, []);
   const platform = platformNameOf(Platform.OS);
   const pooled = !props.overlay;
   const [error, setError] = useState("");
@@ -160,7 +160,7 @@ function NativeFrameBody(props: FrameProps & { retry: () => void }) {
   const poolEntryRef = useRef<NativeWebViewPoolEntry | null>(null);
   if (!poolEntryRef.current) {
     poolEntryRef.current = {
-      id: nonce,
+      id: poolId,
       isVisible: () => layoutVisibleRef.current,
       pause: () => { pauseNow(); },
       resume: () => { resumeNow(); },
@@ -178,7 +178,12 @@ function NativeFrameBody(props: FrameProps & { retry: () => void }) {
   // Paseo supplies a query client per installation/host. All tabs reuse
   // the static markup without sharing session data across connections.
   const shouldMountWebView = !paused && (!pooled || layoutVisible || hasRenderedWebView.current);
-  const markupQuery = useQuery({ ...uiDocumentQueryOptions(rpc), enabled: shouldMountWebView });
+  const markupQuery = useQuery({
+    ...uiDocumentQueryOptions(rpc, { variant: uiDocumentVariantOf(props.mode), locale }),
+    enabled: shouldMountWebView,
+  });
+  const nonce = useMemo(() => `native${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`, [markupQuery.data]);
+  const baseUrl = useMemo(() => nativeDocumentUrl(nonce), [nonce]);
   const chinese = locale.startsWith("zh");
   const docError = markupQuery.error ? (markupQuery.error instanceof Error ? markupQuery.error.message : String(markupQuery.error)) : "";
   const settingsError = !props.preview && (settings.status === "error" || settings.status === "invalid")
@@ -193,6 +198,20 @@ function NativeFrameBody(props: FrameProps & { retry: () => void }) {
       ? markup.replace("globalThis.__PASEO_CONTEXT_NONCE__=", 'globalThis.__PASEO_CONTEXT_TRANSPORT__="history";globalThis.__PASEO_CONTEXT_NONCE__=')
       : markup;
   }, [shouldMountWebView, failed, markupQuery.data, nonce]);
+
+  const prevHtml = useRef("");
+  useEffect(() => {
+    const before = prevHtml.current;
+    prevHtml.current = html;
+    // Reloading or unmounting a live WebView on locale/variant change restarts the bridge sequence.
+    if (before && before !== html) {
+      readyNonce.current = "";
+      webViewGen.current++;
+      resetBridgeState();
+      setReady(false);
+      setSlow(false);
+    }
+  }, [html, resetBridgeState]);
 
   const loaded = !paused && ready && Boolean(html) && (!!props.preview || settings.status === "ready");
 
@@ -244,8 +263,11 @@ function NativeFrameBody(props: FrameProps & { retry: () => void }) {
     if (markupQuery.data && !markupQuery.error && error) setError("");
   }, [markupQuery.data, markupQuery.error]);
 
-  useEffect(initialize, [
+  useEffect(() => {
+    if (!paused && readyNonce.current === nonce) initialize();
+  }, [
     paused,
+    nonce,
     settings.status,
     settings.status === "ready" ? settings.revision : "",
     props.preview?.values,
@@ -272,7 +294,7 @@ function NativeFrameBody(props: FrameProps & { retry: () => void }) {
     if (!nextVisible) {
       if (!hasRenderedWebView.current) {
         clearHideTimer();
-        nativeWebViewPool.deactivate(nonce);
+        nativeWebViewPool.deactivate(poolId);
         pauseNow();
         return;
       }
@@ -280,7 +302,7 @@ function NativeFrameBody(props: FrameProps & { retry: () => void }) {
         hideTimer.current = setTimeout(() => {
           hideTimer.current = null;
           if (!mounted.current || layoutVisibleRef.current) return;
-          nativeWebViewPool.deactivate(nonce);
+          nativeWebViewPool.deactivate(poolId);
           pauseNow();
         }, HIDDEN_PAUSE_DELAY_MS);
       }
@@ -290,7 +312,7 @@ function NativeFrameBody(props: FrameProps & { retry: () => void }) {
     if (!wasVisible) {
       resumeFromUserOrFocus();
     }
-  }, [pooled, nonce, clearHideTimer, pauseNow, resumeFromUserOrFocus]);
+  }, [pooled, poolId, clearHideTimer, pauseNow, resumeFromUserOrFocus]);
 
   const receive = (event: { nativeEvent: { data: string } }) => {
     if (!mounted.current || pausedRef.current) return;
@@ -298,6 +320,7 @@ function NativeFrameBody(props: FrameProps & { retry: () => void }) {
     try { data = JSON.parse(event.nativeEvent.data); } catch { return; }
     if (data?.nonce !== nonce) return;
     if (data.type === "paseo-context:ready") {
+      readyNonce.current = nonce;
       hasRenderedWebView.current = true;
       setSlow(false); setReady(true); report("JavaScript ready"); initialize(); return;
     }
@@ -477,7 +500,7 @@ function NativeFrameBody(props: FrameProps & { retry: () => void }) {
   return <View onLayout={handleLayout} style={{ flex: 1, minHeight: 0, backgroundColor: props.theme.colors.surface0 }}>
     {statusBanner}
     {createElement(RNCWebView, {
-      ref, source, newSource: source, style: { flex: 1, backgroundColor: props.theme.colors.surface0 },
+      key: nonce, ref, source, newSource: source, style: { flex: 1, backgroundColor: props.theme.colors.surface0 },
       javaScriptEnabled: true, messagingEnabled: true, messagingModuleName: "",
       onMessage: receive,
       onLoadingFinish: (event: { nativeEvent: { url?: string; title?: string } }) => {

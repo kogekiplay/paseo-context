@@ -5,10 +5,11 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 const mocks = vi.hoisted(() => ({
   platform: { OS: "web" },
+  locale: "zh-CN",
   openURL: vi.fn(),
   copyText: vi.fn(async () => {}),
   rpc: vi.fn(async (input: { route: string; payload?: any }) => input.route === "ui.document"
-    ? '<script>globalThis.__PASEO_CONTEXT_NONCE__="%%PASEO_CONTEXT_NONCE%%";</script>'
+    ? `<script>globalThis.__PASEO_CONTEXT_NONCE__="%%PASEO_CONTEXT_NONCE%%";/*${input.payload?.variant ?? "full"}:${input.payload?.locale ?? "all"}*/</script>`
     : { ok: true }),
   previewRpc: vi.fn(async () => ({ preview: true })),
   settings: {
@@ -31,7 +32,7 @@ vi.mock("react-native", () => ({
 vi.mock("@getpaseo/plugin/client", () => ({
   useRpc: (def: { name?: string }) => def?.name === "context.settings-preview" ? mocks.previewRpc : mocks.rpc,
   useSettings: () => mocks.settings,
-  useTranslation: () => ({ locale: "zh-CN", t: (k: string) => k }),
+  useTranslation: () => ({ locale: mocks.locale, t: (k: string) => k }),
   defineTranslations: (value: unknown) => value,
 }));
 vi.mock("@getpaseo/plugin/client/ui", () => ({
@@ -39,7 +40,7 @@ vi.mock("@getpaseo/plugin/client/ui", () => ({
 }));
 
 import { WebFrame } from "../client/web";
-import { isDarkColor, platformNameOf } from "../client/bridge-shared";
+import { isDarkColor, platformNameOf, uiDocumentLocaleOf, uiDocumentQueryOptions, uiDocumentVariantOf } from "../client/bridge-shared";
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -75,6 +76,7 @@ beforeEach(() => {
   };
   (globalThis.URL as any).revokeObjectURL = (url: string) => { revokedUrls.push(url); };
   mocks.platform.OS = "web";
+  mocks.locale = "zh-CN";
   mocks.settings.status = "ready";
   mocks.settings.revision = "rev-1";
   mocks.settings.values = { defaultPlacement: "all", fleetTab: true };
@@ -137,11 +139,21 @@ describe("WebFrame and shared bridge helpers", () => {
     expect(platformNameOf("web", "Win32")).toBe("win32");
     expect(platformNameOf("web", "Linux x86_64")).toBe("linux");
     expect(platformNameOf("android")).toBe("android");
+    expect(uiDocumentVariantOf("statistics")).toBe("statistics");
+    expect(uiDocumentVariantOf("context")).toBe("full");
+    expect(uiDocumentVariantOf("fleet")).toBe("full");
+    expect(uiDocumentVariantOf("insights")).toBe("full");
+    expect(uiDocumentLocaleOf("zh-CN")).toBe("zh");
+    expect(uiDocumentLocaleOf("pt-BR")).toBe("pt");
+    expect(uiDocumentLocaleOf("ko-KR")).toBe("en");
+    expect(uiDocumentLocaleOf(undefined)).toBe("en");
+    expect(uiDocumentQueryOptions(mocks.rpc, { variant: "statistics", locale: "zh-CN" }).queryKey.slice(-2)).toEqual(["statistics", "all"]);
+    expect(uiDocumentQueryOptions(mocks.rpc, { variant: "full", locale: "ja-JP" }).queryKey.slice(-2)).toEqual(["full", "ja"]);
   });
 
   test("loads ui.document via bridgeRpc, validates nonce/source, revokes Blob URL on unmount, and ignores non-fatal errors", async () => {
     const { root, frameWindow } = await mount();
-    expect(mocks.rpc).toHaveBeenCalledWith({ route: "ui.document", payload: {} });
+    expect(mocks.rpc).toHaveBeenCalledWith({ route: "ui.document", payload: { variant: "full", locale: "zh" } });
     expect(createdBlobs).toHaveLength(1);
     const nonce = /__PASEO_CONTEXT_NONCE__="([^"]+)"/.exec(createdBlobs[0].html)![1];
 
@@ -308,5 +320,45 @@ describe("WebFrame and shared bridge helpers", () => {
       if (originalIO === undefined) delete (globalThis as any).IntersectionObserver;
       else (globalThis as any).IntersectionObserver = originalIO;
     }
+  });
+
+  test("requests lightweight statistics variant and refetches full variant when locale changes", async () => {
+    await mount({ mode: "statistics" });
+    expect(mocks.rpc).toHaveBeenCalledWith({ route: "ui.document", payload: { variant: "statistics" } });
+    expect(createdBlobs[0].html).toContain("/*statistics:all*/");
+
+    await act(async () => renderer!.unmount());
+    renderer = null;
+    mocks.rpc.mockClear();
+    createdBlobs = [];
+    revokedUrls = [];
+
+    const { frameWindow } = await mount({ mode: "context" });
+    expect(mocks.rpc).toHaveBeenCalledWith({ route: "ui.document", payload: { variant: "full", locale: "zh" } });
+    expect(createdBlobs).toHaveLength(1);
+    const firstUrl = createdBlobs[0].url;
+
+    // Switch host locale -> fetches new locale bundle and revokes old Blob URL.
+    mocks.locale = "ja-JP";
+    await act(async () => {
+      renderer!.update(
+        createElement(QueryClientProvider, { client: queryClient },
+          createElement(WebFrame, { ...baseProps, mode: "context" } as any)),
+      );
+    });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+    expect(mocks.rpc).toHaveBeenCalledWith({ route: "ui.document", payload: { variant: "full", locale: "ja" } });
+    expect(revokedUrls).toContain(firstUrl);
+    expect(createdBlobs.at(-1)!.html).toContain("/*full:ja*/");
+
+    // Ready on the newly loaded locale iframe sends init with ja-JP; stale nonce from zh is ignored.
+    const oldNonce = /__PASEO_CONTEXT_NONCE__="([^"]+)"/.exec(createdBlobs[0].html)![1];
+    const nonce = /__PASEO_CONTEXT_NONCE__="([^"]+)"/.exec(createdBlobs.at(-1)!.html)![1];
+    expect(nonce).not.toBe(oldNonce);
+    postMessageMock.mockClear();
+    await act(async () => dispatchMessage(frameWindow, { type: "paseo-context:ready", nonce: oldNonce }));
+    expect(postMessageMock).not.toHaveBeenCalled();
+    await act(async () => dispatchMessage(frameWindow, { type: "paseo-context:ready", nonce }));
+    expect(postMessageMock).toHaveBeenCalledWith(expect.objectContaining({ type: "paseo-context:init", locale: "ja-JP", nonce }), "*");
   });
 });

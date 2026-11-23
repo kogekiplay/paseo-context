@@ -101,6 +101,38 @@ function generation(db: Sqlite.DatabaseSync, index: number, step: number, usage:
     proto({ 1: proto({ 4: usage, 11: time(ttft), 12: time(decode) }), 2: varint(step) }));
 }
 
+sqliteTest("indexes a large database in step order while applying generator updates in row order", async () => {
+  const { reader, database, agent } = await fixture();
+  const db = databaseAt(database);
+  db.exec(`WITH RECURSIVE source(idx) AS (VALUES (2) UNION ALL SELECT idx + 2 FROM source WHERE idx < 16384)
+    INSERT INTO steps SELECT idx, 14, X'' FROM source`);
+  step(db, 6, 15, proto({ 1: time(start), 8: time(start + 210), 9: proto({ 2: 50, 3: 20, 5: 40, 11: "original" }) }));
+  step(db, 10, 909, Buffer.alloc(0));
+  step(db, 12, 132, proto({ 32: time(start + 250), 8: time(start + 300) }));
+  const largeIndex = 2 ** 32 + 11;
+  generation(db, 30, 6, proto({ 3: 34, 9: 11 }), 35, 135);
+  generation(db, 10, 6, proto({ 2: 130, 3: 30, 5: 61 }), 40, 90);
+  generation(db, 2, largeIndex, proto({ 2: 100, 3: 5 }), 10, 11);
+  generation(db, 3, 3, proto({ 2: 90, 3: 4 }), 20, 25);
+  generation(db, 4, 10, proto({ 2: 1000, 3: 1 }), 10, 10);
+  generation(db, 5, 12, proto({ 2: 1000, 3: 1 }), 10, 10);
+
+  const source = (await reader.locateSource(agent))!.antigravity!.database!;
+  const snapshot = await reader["paths"].antigravity.read(source, () => {});
+  const ordered = [...snapshot.steps].map(([index]) => index);
+  expect(snapshot.steps.size).toBe(8193);
+  expect(ordered.slice(0, 7)).toEqual([2, 3, 4, 6, 8, 12, 14]);
+  expect(ordered.at(-1)).toBe(largeIndex);
+  expect(ordered.every((index, position) => position === 0 || index > ordered[position - 1])).toBe(true);
+  expect(snapshot.steps.get(10)).toBeUndefined();
+  expect(snapshot.steps.get(12)?.facts).toMatchObject({ type: "GENERIC", times: { start: start + 250, end: start + 300 } });
+  expect(snapshot.steps.get(6)?.facts).toMatchObject({ type: "PLANNER_RESPONSE", responseId: "original", usageAt: start + 210,
+    usage: { input: 130, cacheRead: 61, output: 34, reasoning: 11 }, timing: { start, ttftMs: 35, modelMs: 170 } });
+  expect(snapshot.steps.get(3)?.facts).toMatchObject({ type: "PLANNER_RESPONSE", usage: { input: 90 }, timing: { ttftMs: 20 } });
+  const updated = snapshot.steps.get(6)!;
+  expect(updated.key).toBe(JSON.stringify(updated.facts));
+});
+
 sqliteTest("evicts companion database snapshots after idle time and releases their timers on clear", async () => {
   const { reader, database, agent } = await fixture();
   const db = databaseAt(database, false);

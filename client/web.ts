@@ -7,7 +7,7 @@ import { bridgeRpc, settingsPreviewRpc } from "../shared/bridge";
 import { preferences } from "../shared/contracts";
 import {
   buildInitPayload, createSettingsSaver, handleBridgeAction, handleBridgeRpc,
-  platformNameOf, uiDocumentQueryOptions,
+  platformNameOf, uiDocumentQueryOptions, uiDocumentVariantOf,
 } from "./bridge-shared";
 import type { FrameProps } from "./frame";
 import { messages } from "./messages";
@@ -55,10 +55,11 @@ function WebFrameBody(props: FrameProps & { retry: () => void }) {
   const { locale } = useTranslation(messages);
   const container = useRef<unknown>(null);
   const frame = useRef<Frame | null>(null);
+  const docGen = useRef(0);
+  const readyNonce = useRef("");
   const latest = useRef({ props, settings, locale, rpc, previewRpc });
   latest.current = { props, settings, locale, rpc, previewRpc };
   const saveSetting = useMemo(() => createSettingsSaver(() => latest.current.settings as any), []);
-  const nonce = useMemo(() => `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`, []);
   const platform = useMemo(() => platformNameOf("web", typeof navigator !== "undefined" ? `${navigator?.platform ?? ""} ${navigator?.userAgent ?? ""}` : ""), []);
   const canObserve = !props.overlay && !props.preview && typeof IntersectionObserver === "function";
   const [visible, setVisible] = useState(() => !canObserve);
@@ -67,7 +68,11 @@ function WebFrameBody(props: FrameProps & { retry: () => void }) {
   const [ready, setReady] = useState(false);
   const [error, setError] = useState("");
   const [slow, setSlow] = useState(false);
-  const markupQuery = useQuery({ ...uiDocumentQueryOptions(rpc), enabled: active });
+  const markupQuery = useQuery({
+    ...uiDocumentQueryOptions(rpc, { variant: uiDocumentVariantOf(props.mode), locale }),
+    enabled: active,
+  });
+  const nonce = useMemo(() => `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`, [markupQuery.data]);
   const chinese = locale.startsWith("zh");
   const docError = markupQuery.error ? (markupQuery.error instanceof Error ? markupQuery.error.message : String(markupQuery.error)) : "";
   const loaded = active && ready && Boolean(source) && (!!props.preview || settings.status === "ready");
@@ -107,12 +112,16 @@ function WebFrameBody(props: FrameProps & { retry: () => void }) {
   }, [canObserve, visible, active]);
 
   useEffect(() => {
+    docGen.current++;
+    readyNonce.current = "";
+    setSlow(false);
     if (!active || failed || !markupQuery.data) {
       setSource("");
       setReady(false);
       return;
     }
     // Give the bundled page its own document URL, as Paseo does for document previews.
+    setReady(false);
     const url = URL.createObjectURL(new Blob([markupQuery.data.replaceAll("%%PASEO_CONTEXT_NONCE%%", nonce)], { type: "text/html;charset=utf-8" }));
     setSource(url);
     return () => { URL.revokeObjectURL(url); };
@@ -138,14 +147,15 @@ function WebFrameBody(props: FrameProps & { retry: () => void }) {
         if (!props.preview) void rpc({ route: "ui.error", payload: { message: String(data.message ?? "") } }).catch(() => {});
         return;
       }
-      if (data.type === "paseo-context:ready") { setSlow(false); setReady(true); initialize(); return; }
+      if (data.type === "paseo-context:ready") { readyNonce.current = nonce; setSlow(false); setReady(true); initialize(); return; }
       if (data.type === "paseo-context:action") {
         handleBridgeAction(data, props, (url) => { void Linking.openURL(url); });
         return;
       }
       if (data.type !== "paseo-context:rpc") return;
+      const gen = docGen.current;
       const reply = (value: unknown, err?: string) => {
-        if (alive && frame.current?.contentWindow === sender) sender.postMessage({ type: "paseo-context:result", nonce, id: data.id, value, error: err }, "*");
+        if (alive && docGen.current === gen && frame.current?.contentWindow === sender) sender.postMessage({ type: "paseo-context:result", nonce, id: data.id, value, error: err }, "*");
       };
       void (async () => {
         try {
@@ -161,9 +171,10 @@ function WebFrameBody(props: FrameProps & { retry: () => void }) {
   }, [active, nonce, saveSetting]);
 
   useEffect(() => {
-    if (active) initialize();
+    if (active && readyNonce.current === nonce) initialize();
   }, [
     active,
+    nonce,
     settings.status,
     settings.status === "ready" ? settings.revision : "",
     props.preview?.values,

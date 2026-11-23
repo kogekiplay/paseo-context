@@ -4,12 +4,12 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 const mocks = vi.hoisted(() => ({
-  platform: { OS: "ios" }, dispatch: vi.fn(), navigation: vi.fn(), copyText: vi.fn(async () => {}),
+  platform: { OS: "ios" }, locale: "zh-CN", dispatch: vi.fn(), navigation: vi.fn(), copyText: vi.fn(async () => {}),
   module: { shouldStartLoadWithLockIdentifier: vi.fn() },
   appStateListeners: new Set<(state: string) => void>(),
   appStateCurrent: "active",
   rpc: vi.fn(async (input: { route: string; payload?: any }): Promise<unknown> => input.route === "ui.document"
-    ? '<script>globalThis.__PASEO_CONTEXT_NONCE__="%%PASEO_CONTEXT_NONCE%%";</script>'
+    ? `<script>globalThis.__PASEO_CONTEXT_NONCE__="%%PASEO_CONTEXT_NONCE%%";/*${input.payload?.variant ?? "full"}:${input.payload?.locale ?? "all"}*/</script>`
     : { sessions: [], selected: null }),
   previewRpc: vi.fn(async () => ({ ok: true })),
   settings: {
@@ -36,7 +36,7 @@ vi.mock("react-native", () => ({
 vi.mock("@getpaseo/plugin/client", () => ({
   useRpc: (def: { name?: string }) => def?.name === "context.settings-preview" ? mocks.previewRpc : mocks.rpc,
   useSettings: () => mocks.settings,
-  useTranslation: () => ({ locale: "zh-CN", t: () => "上下文" }),
+  useTranslation: () => ({ locale: mocks.locale, t: () => "上下文" }),
   defineTranslations: (value: unknown) => value,
 }));
 vi.mock("@getpaseo/plugin/client/ui", () => ({
@@ -56,12 +56,12 @@ afterEach(async () => {
   mocks.appStateListeners.clear();
   mocks.appStateCurrent = "active";
   queryClient?.clear();
-  renderer = null; vi.clearAllMocks(); mocks.platform.OS = "ios";
+  renderer = null; vi.clearAllMocks(); mocks.platform.OS = "ios"; mocks.locale = "zh-CN";
   mocks.settings.status = "ready";
   mocks.settings.error = undefined;
   mocks.settings.revision = "one";
-  mocks.rpc.mockImplementation(async (input: { route: string }) => input.route === "ui.document"
-    ? '<script>globalThis.__PASEO_CONTEXT_NONCE__="%%PASEO_CONTEXT_NONCE%%";</script>'
+  mocks.rpc.mockImplementation(async (input: { route: string; payload?: any }) => input.route === "ui.document"
+    ? `<script>globalThis.__PASEO_CONTEXT_NONCE__="%%PASEO_CONTEXT_NONCE%%";/*${input.payload?.variant ?? "full"}:${input.payload?.locale ?? "all"}*/</script>`
     : { sessions: [], selected: null });
 });
 const baseProps = {
@@ -111,18 +111,32 @@ describe("Native upstream UI container", () => {
     expect(mocks.dispatch).toHaveBeenCalledWith(7, "stopLoading", []);
   });
 
-  test("shares static markup across tabs while keeping separate bridge nonces", async () => {
+  test("shares full markup across full tabs and loads standalone statistics variant separately", async () => {
     queryClient = new QueryClient();
     await act(async () => {
       renderer = create(createElement(QueryClientProvider, { client: queryClient },
         createElement(NativeFrame, baseProps as any),
-        createElement(NativeFrame, { ...baseProps, mode: "statistics" } as any)));
+        createElement(NativeFrame, { ...baseProps, mode: "context" } as any)));
     });
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
     const views = renderer!.root.findAllByType("RNCWebView" as any);
     expect(views).toHaveLength(2);
-    expect(mocks.rpc.mock.calls.filter(([request]) => request.route === "ui.document")).toHaveLength(1);
+    expect(mocks.rpc.mock.calls.filter(([request]) => request.route === "ui.document")).toEqual([
+      [{ route: "ui.document", payload: { variant: "full", locale: "zh" } }],
+    ]);
     expect(views[0].props.source.html).not.toBe(views[1].props.source.html);
+
+    // Statistics tab requests its own lightweight document variant.
+    await act(async () => renderer!.unmount());
+    renderer = null;
+    nativeWebViewPool.reset();
+    await act(async () => {
+      renderer = create(createElement(QueryClientProvider, { client: queryClient },
+        createElement(NativeFrame, { ...baseProps, mode: "statistics" } as any)));
+    });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+    expect(mocks.rpc).toHaveBeenCalledWith({ route: "ui.document", payload: { variant: "statistics" } });
+    expect(renderer!.root.findByType("RNCWebView" as any).props.source.html).toContain("/*statistics:all*/");
   });
 
   test("Android bridges local history events, recovers ACK on malformed payloads, and reassembles chunks", async () => {
@@ -481,5 +495,67 @@ describe("Native upstream UI container", () => {
       nativeEvent: { url: `${view.props.source.baseUrl}#paseo-context-chunk=211:g5:1:2:${encoded.slice(mid)}` },
     }));
     expect(mocks.rpc).toHaveBeenCalledWith({ route: "bootstrap", payload: { k: "v" } });
+  });
+
+  test("Android locale switch refetches ui.document and resets history bridge seq dedupe across reload", async () => {
+    mocks.platform.OS = "android";
+    const root = await mount({ mode: "context" });
+    const firstView = root.findByType("RNCWebView" as any);
+    expect(firstView.props.source.html).toContain("/*full:zh*/");
+    const nonce = /__PASEO_CONTEXT_NONCE__="([^"]+)"/.exec(firstView.props.source.html)![1];
+    const readyEncoded = encodeURIComponent(JSON.stringify({ type: "paseo-context:ready", nonce }));
+
+    // Initial ready uses seq=1 on Android history bridge.
+    await act(async () => firstView.props.onLoadingStart({
+      nativeEvent: { url: `${firstView.props.source.baseUrl}#paseo-context=1:${readyEncoded}` },
+    }));
+    expect(mocks.dispatch).toHaveBeenCalledWith(7, "injectJavaScript", [expect.stringContaining('__PASEO_CONTEXT_ACK__?.("1")')]);
+
+    // Switch locale from zh-CN -> en-US (uncached query transitions html: zh -> "" -> en).
+    mocks.locale = "en-US";
+    await act(async () => {
+      renderer!.update(createElement(QueryClientProvider, { client: queryClient },
+        createElement(NativeFrame, { ...baseProps, mode: "context" } as any)));
+    });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+    const reloadedView = renderer!.root.findByType("RNCWebView" as any);
+    expect(reloadedView.props.source.html).toContain("/*full:en*/");
+    const reloadedNonce = /__PASEO_CONTEXT_NONCE__="([^"]+)"/.exec(reloadedView.props.source.html)![1];
+    expect(reloadedNonce).not.toBe(nonce);
+
+    // Outgoing document frame with stale nonce must be ignored without initializing.
+    mocks.dispatch.mockClear();
+    await act(async () => reloadedView.props.onLoadingStart({
+      nativeEvent: { url: `${reloadedView.props.source.baseUrl}#paseo-context=1:${readyEncoded}` },
+    }));
+    expect(mocks.dispatch.mock.calls.some(([, , args]) => String(args[0]).includes('"locale":"en-US"'))).toBe(false);
+
+    // Reloaded Android WebView restarts history seq from 1 with its fresh nonce -> MUST be accepted and ACKed!
+    const reloadedReady = encodeURIComponent(JSON.stringify({ type: "paseo-context:ready", nonce: reloadedNonce }));
+    mocks.dispatch.mockClear();
+    await act(async () => reloadedView.props.onLoadingStart({
+      nativeEvent: { url: `${reloadedView.props.source.baseUrl}#paseo-context=2:${reloadedReady}` },
+    }));
+    const scripts = mocks.dispatch.mock.calls.map(([, , args]) => String(args[0]));
+    expect(scripts.some((s) => s.includes('__PASEO_CONTEXT_ACK__?.("2")'))).toBe(true);
+    expect(scripts.some((s) => s.includes('"locale":"en-US"'))).toBe(true);
+
+    // Switching back to cached zh-CN rotates nonce again and accepts seq=1 cleanly.
+    mocks.locale = "zh-CN";
+    await act(async () => {
+      renderer!.update(createElement(QueryClientProvider, { client: queryClient },
+        createElement(NativeFrame, { ...baseProps, mode: "context" } as any)));
+    });
+    const cachedBackView = renderer!.root.findByType("RNCWebView" as any);
+    const backNonce = /__PASEO_CONTEXT_NONCE__="([^"]+)"/.exec(cachedBackView.props.source.html)![1];
+    expect(backNonce).not.toBe(reloadedNonce);
+    const backReady = encodeURIComponent(JSON.stringify({ type: "paseo-context:ready", nonce: backNonce }));
+    mocks.dispatch.mockClear();
+    await act(async () => cachedBackView.props.onLoadingStart({
+      nativeEvent: { url: `${cachedBackView.props.source.baseUrl}#paseo-context=1:${backReady}` },
+    }));
+    const backScripts = mocks.dispatch.mock.calls.map(([, , args]) => String(args[0]));
+    expect(backScripts.some((s) => s.includes('__PASEO_CONTEXT_ACK__?.("1")'))).toBe(true);
+    expect(backScripts.some((s) => s.includes('"locale":"zh-CN"'))).toBe(true);
   });
 });

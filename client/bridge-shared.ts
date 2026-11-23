@@ -2,6 +2,18 @@ import type { FrameProps } from "./frame";
 import { uiRevision } from "../shared/generated/ui-revision";
 
 export type BridgeRpcFn = (input: { route: string; payload: unknown }) => Promise<unknown>;
+export type UiDocumentVariant = "full" | "statistics";
+
+const SUPPORTED_UI_LOCALES = new Set(["de", "en", "es", "fr", "ja", "pt", "ru", "zh"]);
+
+export function uiDocumentVariantOf(mode: FrameProps["mode"]): UiDocumentVariant {
+  return mode === "statistics" ? "statistics" : "full";
+}
+
+export function uiDocumentLocaleOf(locale?: string): string {
+  const code = (locale ?? "").toLowerCase().split(/[-_]/)[0];
+  return SUPPORTED_UI_LOCALES.has(code) ? code : "en";
+}
 
 export interface SettingsStateLike<T extends Record<string, unknown>> {
   status: string;
@@ -48,13 +60,19 @@ export function platformNameOf(os: string, hint = ""): string {
   return os || "web";
 }
 
-export function uiDocumentQueryOptions(rpc: BridgeRpcFn) {
+export function uiDocumentQueryOptions(
+  rpc: BridgeRpcFn,
+  options?: { variant?: UiDocumentVariant; locale?: string },
+) {
+  const variant: UiDocumentVariant = options?.variant === "statistics" ? "statistics" : "full";
+  const lang = variant === "statistics" ? "all" : uiDocumentLocaleOf(options?.locale);
+  const payload = variant === "statistics" ? { variant } : { variant, locale: lang };
   return {
-    queryKey: ["paseo-context", "ui.document", uiRevision] as const,
+    queryKey: ["paseo-context", "ui.document", uiRevision, variant, lang] as const,
     staleTime: Infinity,
     gcTime: 120000,
     queryFn: async () => {
-      const value = await rpc({ route: "ui.document", payload: {} });
+      const value = await rpc({ route: "ui.document", payload });
       if (typeof value !== "string") throw new Error("Invalid UI document");
       return value;
     },

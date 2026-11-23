@@ -1,13 +1,14 @@
 import { expect, test, vi } from "vitest";
 import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 import { ContextFold } from "../server/fold";
-import { ContextService, listAgents } from "../server/service";
+import { agentOf, ContextService, listAgents } from "../server/service";
 import { statisticsOf } from "../server/statistics";
 import { UiRoutes } from "../server/ui-routes";
 import { UiFleet } from "../server/ui-fleet";
 import { scopeSchema } from "../shared/contracts";
 import { ReadBudget } from "../server/read-budget";
 import { SessionReader } from "../server/reader";
+import { timelineFingerprint } from "../server/timeline";
 
 const at = (millis: number) => new Date(millis).toISOString();
 const raw = (id: string, extra = {}) => ({ id, title: id, provider: "antigravity", cwd: "/fixture", status: "idle",
@@ -123,6 +124,54 @@ test("rebuilds a changed projected row and resets after epoch replacement", asyn
     expect(third.fold.nodes.map((node) => node.preview)).toEqual(["replaced"]);
     expect(refetch.mock.calls.map(([, options]) => options.direction)).toEqual(["tail", "after", "after", "tail"]);
   } finally { service.clear(); }
+});
+
+test("changes the Timeline revision when an updated body has the same preview and length", async () => {
+  const agent = raw("body-rewrite"), service = serviceOf();
+  const prefix = "a".repeat(240);
+  const firstEntry = entry(1, { type: "assistant_message", text: prefix + "old" });
+  const updatedEntry = { ...firstEntry, seqEnd: 2, item: { ...firstEntry.item as Record<string, unknown>, text: prefix + "new" } };
+  const refetch = vi.fn()
+    .mockResolvedValueOnce(page([firstEntry], { endCursor: cursor(1) }))
+    .mockResolvedValueOnce(page([updatedEntry], { endCursor: cursor(2) }))
+    .mockResolvedValueOnce(page([], { endCursor: cursor(2) }));
+  const paseo = apiOf([agent], refetch);
+  try {
+    const first = await service.load(agent, paseo), second = await service.load(agent, paseo);
+    expect(second.fold.nodes).toEqual(first.fold.nodes);
+    expect(second.fold.revision).toBe(first.fold.revision);
+    expect(second.revision).toBeGreaterThan(first.revision);
+    expect(await service.contents(second, [0])).toEqual(new Map([[0, prefix + "new"]]));
+    expect(await service.load(agent, paseo)).toBe(second);
+  } finally { service.clear(); }
+});
+
+test("streams each Timeline revision field including nested summary and command facts", () => {
+  const fold = new ContextFold("codex", "epoch");
+  fold.apply({ type: "turn_context", timestamp: 1000, payload: { effort: "high" } });
+  fold.apply({ type: "response_item", timestamp: 2000, payload: { type: "function_call", name: "exec_command",
+    call_id: "exec", arguments: { cmd: "echo ready" } } });
+  fold.apply({ type: "response_item", timestamp: 2200, payload: { type: "function_call_output", call_id: "exec", output: "ready" } });
+  fold.apply({ type: "token_usage_record", timestamp: 3000, payload: { response_id: "r1", usage: { input_tokens: 3, output_tokens: 1 } } });
+  const summary = fold.summary(agentOf(raw("revision-fields")));
+  const fingerprint = () => timelineFingerprint("key", fold, summary, fold.requests);
+  const original = fingerprint();
+  function changed<T, K extends keyof T>(object: T, field: K, value: T[K]) {
+    const previous = object[field];
+    object[field] = value;
+    expect(fingerprint()).not.toBe(original);
+    object[field] = previous;
+  }
+  changed(summary.intervals![0], "end", 2201);
+  changed(summary.activity[0].tools[0], "count", 2);
+  changed(fold.contentHashes, 0, "different body");
+  changed(fold.nodes[0], "preview", "different preview");
+  changed(fold.statistics.rows[0].nodeIds, 0, 99);
+  changed(fold.requests[0].usage, "input", 100);
+  changed(fold.events[0], "title", "different event");
+  changed(fold.commands[0], "command", "echo done");
+  changed(fold.commands[0], "outputNodes", [17]);
+  expect(fingerprint()).toBe(original);
 });
 
 test("never treats missing timeline or directory cursors as a completed read", async () => {
