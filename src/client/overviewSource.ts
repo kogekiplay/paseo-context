@@ -349,9 +349,9 @@ function useOverviewPart<T>(options: PartOptions<T>): PartState<T> {
         return
       }
       live.inFlight = true
-      setPending(true)
+      const heldPart = heldFor(heldRef.current, key)
+      setPending(heldPart === null)
       try {
-        const heldPart = heldFor(heldRef.current, key)
         const body: OverviewRequest = { ...request, revision: heldPart === null ? null : heldPart.revision }
         const read = await postRoute(OVERVIEW_ROUTE, body, overviewValueOf, { label: 'overview ' + request.part, signal: lifetime.signal })
         if (stopped()) return
@@ -362,7 +362,7 @@ function useOverviewPart<T>(options: PartOptions<T>): PartState<T> {
         }
         setError(false)
         setStale(read.refreshFailed === true)
-        if (read.refreshing) schedule(250)
+        if (read.refreshing) schedule(400)
         if ('unchanged' in read) {
           notePricingPending(pricingReady.current)
           return

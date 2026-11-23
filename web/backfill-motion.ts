@@ -5,9 +5,16 @@ export interface ParsedProgress {
   suffix: string;
 }
 
+export interface ParsedMetric {
+  prefix: string;
+  value: number;
+  decimals: number;
+  suffix: string;
+}
+
 const PROGRESS_RE = /^([\s\S]*?[（(])(\d+)\/(\d+)([)）][\s\S]*)$/;
-const INTEGER_RE = /^\d+$/;
-const INTERP_DURATION_MS = 200;
+const METRIC_RE = /^([^\d-]*)(-?\d+(?:\.\d+)?)([^\d]*)$/;
+const INTERP_DURATION_MS = 320;
 
 export function parseFoldProgress(text: string): ParsedProgress | null {
   const match = PROGRESS_RE.exec(text);
@@ -20,11 +27,35 @@ export function parseFoldProgress(text: string): ParsedProgress | null {
   return { prefix: match[1], covered, total, suffix: match[4] };
 }
 
+export function parseFormattedMetric(text: string): ParsedMetric | null {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  const match = METRIC_RE.exec(trimmed);
+  if (!match) return null;
+  const rawNum = match[2];
+  const value = Number(rawNum);
+  if (!Number.isFinite(value)) return null;
+  const dot = rawNum.indexOf(".");
+  const decimals = dot >= 0 ? rawNum.length - dot - 1 : 0;
+  return { prefix: match[1], value, decimals, suffix: match[3] };
+}
+
 export function interpolateBounded(from: number, to: number, progress: number): number {
   const clamped = Math.max(0, Math.min(1, progress));
   const eased = 1 - (1 - clamped) ** 3;
   const value = Math.round(from + (to - from) * eased);
   return Math.max(from, Math.min(to, value));
+}
+
+export function interpolateMetricBounded(from: number, to: number, progress: number, decimals: number): number {
+  const clamped = Math.max(0, Math.min(1, progress));
+  const eased = 1 - (1 - clamped) ** 3;
+  const lo = Math.min(from, to);
+  const hi = Math.max(from, to);
+  const bounded = Math.max(lo, Math.min(hi, from + (to - from) * eased));
+  if (decimals <= 0) return Math.max(lo, Math.min(hi, Math.round(bounded)));
+  const scale = 10 ** decimals;
+  return Math.max(lo, Math.min(hi, Math.round(bounded * scale) / scale));
 }
 
 function prefersReducedMotion(): boolean {
@@ -49,6 +80,9 @@ interface KpiTrack {
   raf: number;
   displayed: number;
   target: number;
+  decimals: number;
+  prefix: string;
+  suffix: string;
   rawTarget: string;
 }
 
@@ -63,10 +97,10 @@ function clearDisplay(el: Element): void {
 }
 
 /**
- * Host-side smooth progress and KPI number transitions during Insights backfill.
- * Never mutates React-managed DOM text nodes: animates via data attributes + CSS
- * ::after overlay so DOM textContent always remains the authoritative server value,
- * and strictly bounds interpolation between consecutive real snapshots (`prev -> next <= total`).
+ * Host-side smooth number rolling for Insights backfill progress and KPI values.
+ * Never mutates React-managed DOM text nodes and never alters opacity: animates
+ * strictly via data attributes + CSS ::after overlay, bounded within consecutive
+ * server-reported snapshots.
  */
 export function watchBackfillMotion(root: Node | null): () => void {
   if (!root || typeof MutationObserver !== "function" || typeof requestAnimationFrame !== "function") {
@@ -108,16 +142,6 @@ export function watchBackfillMotion(root: Node | null): () => void {
     for (const el of [...activeElements]) {
       if (!el.isConnected) stopElement(el, true);
     }
-  };
-
-  const bumpClass = (el: Element) => {
-    if (!el.classList) return;
-    el.classList.remove("pc-kpi-bump");
-    const id = requestAnimationFrame(() => {
-      activeRafs.delete(id);
-      if (el.isConnected) el.classList.add("pc-kpi-bump");
-    });
-    activeRafs.add(id);
   };
 
   const handleFolding = (el: Element) => {
@@ -190,49 +214,66 @@ export function watchBackfillMotion(root: Node | null): () => void {
       return;
     }
     if (prevText === undefined || prevText === raw) return;
-    const existing = kpiTracks.get(el);
-    if (INTEGER_RE.test(prevText) && INTEGER_RE.test(raw)) {
-      const from = existing ? existing.displayed : Number(prevText);
-      const to = Number(raw);
-      if (Number.isSafeInteger(from) && Number.isSafeInteger(to) && to > from) {
-        if (existing?.raf) cancelFrame(existing.raf);
-        const started = typeof performance !== "undefined" ? performance.now() : Date.now();
-        const track: KpiTrack = { raf: 0, displayed: from, target: to, rawTarget: raw };
-        kpiTracks.set(el, track);
-        activeElements.add(el);
-        const step = (now: number) => {
-          activeRafs.delete(track.raf);
-          track.raf = 0;
-          if (!el.isConnected) {
-            stopElement(el, true);
-            return;
-          }
-          const elapsed = Math.max(0, (typeof performance !== "undefined" ? now : Date.now()) - started);
-          const t = elapsed / INTERP_DURATION_MS;
-          if (t >= 1) {
-            track.displayed = to;
-            clearDisplay(el);
-            activeElements.delete(el);
-            return;
-          }
-          const nextValue = interpolateBounded(from, to, t);
-          if (nextValue !== track.displayed) {
-            track.displayed = nextValue;
-            setDisplay(el, String(nextValue));
-          }
-          track.raf = requestAnimationFrame(step);
-          activeRafs.add(track.raf);
-        };
-        setDisplay(el, String(from));
-        track.raf = requestAnimationFrame(step);
-        activeRafs.add(track.raf);
-        return;
-      }
+    const prevParsed = parseFormattedMetric(prevText);
+    const nextParsed = parseFormattedMetric(raw);
+    if (!prevParsed || !nextParsed || prevParsed.prefix !== nextParsed.prefix || prevParsed.suffix !== nextParsed.suffix) {
       stopElement(el, true);
       return;
     }
-    stopElement(el, true);
-    bumpClass(el);
+    const existing = kpiTracks.get(el);
+    const sameUnit = existing !== undefined && existing.prefix === nextParsed.prefix && existing.suffix === nextParsed.suffix;
+    const prevDecimals = sameUnit ? existing.decimals : prevParsed.decimals;
+    if (prevDecimals !== nextParsed.decimals) {
+      stopElement(el, true);
+      return;
+    }
+    const from = sameUnit ? existing.displayed : prevParsed.value;
+    const to = nextParsed.value;
+    if (!Number.isFinite(from) || !Number.isFinite(to) || from === to) {
+      stopElement(el, true);
+      return;
+    }
+    if (existing?.raf) cancelFrame(existing.raf);
+    const decimals = nextParsed.decimals;
+    const started = typeof performance !== "undefined" ? performance.now() : Date.now();
+    const track: KpiTrack = {
+      raf: 0,
+      displayed: from,
+      target: to,
+      decimals,
+      prefix: nextParsed.prefix,
+      suffix: nextParsed.suffix,
+      rawTarget: raw,
+    };
+    kpiTracks.set(el, track);
+    activeElements.add(el);
+    const formatValue = (n: number) => `${nextParsed.prefix}${n.toFixed(decimals)}${nextParsed.suffix}`;
+    const step = (now: number) => {
+      activeRafs.delete(track.raf);
+      track.raf = 0;
+      if (!el.isConnected) {
+        stopElement(el, true);
+        return;
+      }
+      const elapsed = Math.max(0, (typeof performance !== "undefined" ? now : Date.now()) - started);
+      const t = elapsed / INTERP_DURATION_MS;
+      if (t >= 1) {
+        track.displayed = to;
+        clearDisplay(el);
+        activeElements.delete(el);
+        return;
+      }
+      const nextValue = interpolateMetricBounded(from, to, t, decimals);
+      if (nextValue !== track.displayed) {
+        track.displayed = nextValue;
+        setDisplay(el, formatValue(nextValue));
+      }
+      track.raf = requestAnimationFrame(step);
+      activeRafs.add(track.raf);
+    };
+    setDisplay(el, formatValue(from));
+    track.raf = requestAnimationFrame(step);
+    activeRafs.add(track.raf);
   };
 
   const scan = () => {
