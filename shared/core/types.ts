@@ -145,7 +145,7 @@ export interface FleetBatchValue {
 
 export type DefaultGranularity = 'step' | 'turn'
 
-export type DefaultTrendMode = 'total' | 'delta'
+export type DefaultTimelineMode = 'total' | 'delta'
 
 export type DefaultDeltaBase = 'step' | 'turn'
 
@@ -168,7 +168,7 @@ export type FleetTab = 'show' | 'hide'
 export interface PluginSettings {
   defaultPlacement: DefaultPlacement
   defaultGranularity: DefaultGranularity
-  defaultTrendMode: DefaultTrendMode
+  defaultTimelineMode: DefaultTimelineMode
   defaultDeltaBase: DefaultDeltaBase
   defaultToolSort: DefaultToolSort
   defaultFileSort: DefaultFileSort
@@ -226,6 +226,7 @@ export interface Snapshot extends SurfaceNodeWindow {
   counts?: TimelineCounts
   last?: TimelineLast
   detailRev?: number
+  paseoComplete?: boolean
   requests: RequestRecord[]
   events: ContextEventRecord[]
   usageSources?: UsageSources
@@ -468,8 +469,11 @@ export interface RequestRecord extends SlimRequestRecord {
 export interface ContextEventRecord {
   id?: number
   seq: number
+  ord?: number
   time: number
-  kind: 'compaction' | 'prune' | 'inject' | 'model' | 'mode'
+  kind: 'compaction' | 'prune' | 'inject' | 'model' | 'mode' | 'agent'
+    | 'goal-create' | 'goal-complete' | 'todo-add' | 'todo-done' | 'ask'
+    | 'team-task-create' | 'team-task-complete'
   form?: string
   tokens?: number
   grossTokens?: number
@@ -478,6 +482,7 @@ export interface ContextEventRecord {
   name?: string
   agent?: string
   detail?: string
+  items?: string[]
   from?: string
   to?: string
   fromTurn?: number
@@ -526,6 +531,11 @@ export interface PlatformBalance {
   balances: PlatformBalanceEntry[]
 }
 
+export interface BackfillSessionIssue {
+  id: string
+  reason: string
+}
+
 export interface BackfillCoverage {
   complete: boolean
   remaining: number
@@ -534,9 +544,13 @@ export interface BackfillCoverage {
   total: number
   covered: number
   unsupported: number
+  unreadable: number
+  unreadableSessions?: BackfillSessionIssue[]
+  failedSessions?: BackfillSessionIssue[]
+  refreshIssues?: BackfillSessionIssue[]
 }
 
-export type OverviewPart = 'summary' | 'days' | 'page' | 'tally'
+export type OverviewPart = 'summary' | 'days' | 'page' | 'tally' | 'projects'
 
 export type OverviewCoverage = 'all' | 'active' | 'archived'
 
@@ -549,6 +563,7 @@ export type OverviewRange = 'today' | '7d' | '30d' | { start: number; end: numbe
 export interface OverviewScope {
   range?: OverviewRange
   day?: string | null
+  calendar?: { from: string; to: string }
   coverage?: OverviewCoverage
   group?: string | null
   query?: string
@@ -581,6 +596,13 @@ export interface OverviewTimingWindow {
   wallMs: number
 }
 
+export interface OverviewResolvedWindow {
+  start: number
+  end: number | null
+  from: string | null
+  to: string | null
+}
+
 export interface OverviewSummary {
   sessions: number
   sessionsTotal: number
@@ -595,6 +617,7 @@ export interface OverviewSummary {
   tokenParts: OverviewPartTotal[] | null
   timing: TimingTotals | null
   windowTiming: OverviewTimingWindow
+  window?: OverviewResolvedWindow
   coverage: BackfillCoverage
 }
 
@@ -652,6 +675,12 @@ export interface OverviewTally {
   stats: OverviewTallyStat[]
 }
 
+export interface OverviewProjectStat {
+  key: string
+  tokens: number
+  sessions: number
+}
+
 export interface OverviewUnchanged {
   revision: string
   unchanged: true
@@ -667,6 +696,7 @@ export interface OverviewDaysValue {
   revision: string
   pricingReady: boolean
   days: OverviewDay[]
+  today?: string
 }
 
 export interface OverviewPageValue {
@@ -681,4 +711,35 @@ export interface OverviewTallyValue {
   tally: OverviewTally
 }
 
-export type OverviewValue = OverviewUnchanged | OverviewSummaryValue | OverviewDaysValue | OverviewPageValue | OverviewTallyValue
+export interface OverviewProjectsValue {
+  revision: string
+  pricingReady: boolean
+  projects: OverviewProjectStat[]
+}
+
+export type OverviewValue = (OverviewUnchanged | OverviewSummaryValue | OverviewDaysValue | OverviewPageValue
+  | OverviewTallyValue | OverviewProjectsValue) & {
+  refreshing?: boolean
+  refreshFailed?: boolean
+  partial?: boolean
+}
+
+export const HISTORY_PARTS = ['requests', 'events', 'milestones', 'nodes', 'archive', 'files', 'spans'] as const
+
+export type HistoryPart = (typeof HISTORY_PARTS)[number]
+
+export type HistoryRow = RequestRecord | ContextEventRecord | SurfaceNode | FileOpRecord | TimingSpan
+
+export interface HistoryPage {
+  rev: number
+  live: boolean
+  part: HistoryPart
+  rows: HistoryRow[]
+  first: number
+  last: number
+  total: number
+  atStart: boolean
+  atEnd: boolean
+  beforeSeq?: number
+  beforeIndex?: number
+}

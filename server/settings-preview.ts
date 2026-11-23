@@ -40,6 +40,11 @@ function sampleFold(now: number, member: number) {
     const turnId = `sample-turn-${turn}`;
     add("turn_context", { turn_id: turnId, model: member === 0 && turn < 6 ? "gpt-5-mini" : "gpt-5", tools }, start);
     message("user", ["Build the usage dashboard.", "Review the compact layout.", "Verify chart totals and request details."][turn % 3], start + 50);
+    if (member === 0 && turn === 0) {
+      add("response_item", { type: "function_call", name: "request_user_input", call_id: "sample-scope",
+        arguments: { questions: [{ question: "Which layout should the dashboard use?" }] } }, start + 70);
+      add("response_item", { type: "function_call_output", call_id: "sample-scope", output: "Use the compact layout." }, start + 120);
+    }
     for (let step = 0; step < steps; step++) {
       const at = start + 150 + step * 1100, id = `sample-${turn}-${step}`, path = samplePaths[(turn + step) % samplePaths.length];
       const name = step % 4 === 0 ? "read_file" : step % 4 === 1 ? "apply_patch" : "exec_command";
@@ -119,7 +124,7 @@ function sampleCorpus(now: number) {
 }
 
 const sampleRoutes = new Set([
-  "bootstrap", "family", "statistics.details", "history.page", "ui.grammar", "detail", "delta", "facts", "heads", "commands", "snapshot", "fleet", "overview", "skills",
+  "bootstrap", "family", "statistics.details", "history.page", "history", "ui.grammar", "detail", "delta", "facts", "heads", "commands", "snapshot", "fleet", "overview", "skills",
 ]);
 
 export class SettingsPreview {

@@ -4,6 +4,8 @@ export const DELTA_ROUTE = 'api/paseo-context/delta'
 
 export const FACTS_ROUTE = 'api/paseo-context/facts'
 
+export const HISTORY_ROUTE = 'api/paseo-context/history'
+
 export const HEADS_ROUTE = 'api/paseo-context/heads'
 
 export const COMMANDS_ROUTE = 'api/paseo-context/commands'

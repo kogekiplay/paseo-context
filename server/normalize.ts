@@ -5,7 +5,8 @@ import { parseArgs, printable, record, text, type RecordValue } from "./value";
 export interface Message {
   category: Category; title: string; text: string; block: number;
   tool?: string; callId?: string; args?: RecordValue; error?: boolean; images?: number; durationMs?: number;
-  toolTimes?: ToolTimes; pending?: boolean;
+  toolTimes?: ToolTimes; pending?: boolean; resultConfirmed?: boolean;
+  delegation?: { childId: string; description: string; running: boolean };
 }
 export function toolKind(name: string): string {
   const n = name.split(".").at(-1)!.replace(/^mcp__[^_]+__/, "").toLowerCase();
@@ -43,7 +44,7 @@ export function messagesOf(row: RecordValue, provider: string): Message[] {
     }
     if (payload.type === "function_call_output" || payload.type === "custom_tool_call_output") {
       return [{ category: "tool", title: "Tool result", text: printable(payload.output),
-        callId: text(payload.call_id), block: -1 }];
+        callId: text(payload.call_id), ...(payload.is_error === true || payload.isError === true ? { error: true } : {}), block: -1 }];
     }
     if (payload.type === "reasoning") {
       const content = printable(payload.summary ?? payload.content);
@@ -91,18 +92,23 @@ export function messagesOf(row: RecordValue, provider: string): Message[] {
       : parseArgs(kind === "unknown" ? detail.input ?? row.input : row.input);
     const tool = text(row.name) || ({ shell: "bash", read: "read", edit: "edit", write: "write", search: "grep" } as Record<string, string>)[kind] || kind;
     const callId = text(row.callId ?? row.id);
-    const call: Message = { category: "calls", title: tool, text: printable(args), tool, callId, args, block: 0 };
+    const failed = row.status === "failed" || row.status === "canceled" || row.is_error === true || row.isError === true || !!row.error;
+    const call: Message = { category: "calls", title: tool, text: printable(args), tool, callId, args, block: 0,
+      ...(kind === "sub_agent" ? { delegation: { childId: text(detail.childSessionId), description: text(detail.description),
+        running: row.status === "running" } } : {}) };
     if (row.status === "running") return [call];
-    const captured = kind === "fetch" ? detail.result : kind === "edit" ? detail.unifiedDiff : undefined;
+    const captured = kind === "fetch" || kind === "sub_agent" || kind === "unknown"
+      ? detail.result : kind === "edit" ? detail.unifiedDiff : undefined;
     const result = printable(captured ?? detail.output ?? detail.content ?? detail.text ?? detail.log);
     const exit = typeof detail.exitCode === "number" ? `\nProcess exited with code ${detail.exitCode}` : "";
     const duration = detail.durationMs ?? (typeof detail.durationSeconds === "number" ? detail.durationSeconds * 1000 : undefined);
     const durationMs = typeof duration === "number" && Number.isFinite(duration) && duration >= 0 ? duration : undefined;
     return [call, { category: "tool", title: tool, text: result + exit || printable(row.error) || text(row.status),
-      callId, error: row.status === "failed" || row.status === "canceled", durationMs, block: 1 }];
+      callId, error: failed, ...(row.status === "completed" ? { resultConfirmed: true } : {}), durationMs, block: 1 }];
   }
   const content = printable(row.text ?? row.message ?? row.content ?? row.detail);
-  if (type === "tool_result") return [{ category: "tool", title: "Tool result", text: content, callId: text(row.callId), block: -1 }];
+  if (type === "tool_result") return [{ category: "tool", title: "Tool result", text: content, callId: text(row.callId),
+    ...(row.is_error === true || row.isError === true || row.error ? { error: true } : {}), block: -1 }];
   const category: Category | null = type === "reasoning" ? "reasoning" : /assistant/.test(type) ? "assistant" : /user/.test(type) ? "user" : null;
   return category ? [{ category, title: type, text: content, block: -1 }] : [];
 }

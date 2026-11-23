@@ -15,7 +15,7 @@ const mocks = vi.hoisted(() => ({
   settings: {
     status: "ready" as "loading" | "ready" | "error" | "invalid",
     revision: "rev-1",
-    values: { defaultPlacement: "all", fleetTab: true } as Record<string, unknown>,
+    values: { defaultPlacement: "all", fleetTab: true, defaultTrendMode: "total" } as Record<string, unknown>,
     save: vi.fn(async (_next?: Record<string, unknown>, _rev?: string) => true),
     reload: vi.fn(async () => {}),
     error: undefined as string | undefined,
@@ -79,7 +79,7 @@ beforeEach(() => {
   mocks.locale = "zh-CN";
   mocks.settings.status = "ready";
   mocks.settings.revision = "rev-1";
-  mocks.settings.values = { defaultPlacement: "all", fleetTab: true };
+  mocks.settings.values = { defaultPlacement: "all", fleetTab: true, defaultTrendMode: "total" };
   mocks.settings.error = undefined;
   mocks.settings.save.mockResolvedValue(true);
 });
@@ -217,12 +217,19 @@ describe("WebFrame and shared bridge helpers", () => {
 
     await act(async () => {
       dispatchMessage(frameWindow, { type: "paseo-context:rpc", nonce, id: 2, route: "settings.set", payload: { field: "fleetTab", value: "hide" } });
-      dispatchMessage(frameWindow, { type: "paseo-context:rpc", nonce, id: 3, route: "settings.set", payload: { field: "defaultPlacement", value: "tab" } });
+      dispatchMessage(frameWindow, { type: "paseo-context:rpc", nonce, id: 3, route: "settings.set", payload: { field: "defaultTimelineMode", value: "delta" } });
       await Promise.resolve();
     });
     expect(callOrder).toEqual(["first:rev-1"]);
     await act(async () => { resolveFirst(true); await Promise.resolve(); await Promise.resolve(); });
     expect(callOrder).toEqual(["first:rev-1", "second:rev-2"]);
+    // Upstream defaultTimelineMode persists transparently to legacy defaultTrendMode and exposes both keys.
+    expect(mocks.settings.values.defaultTrendMode).toBe("delta");
+    expect(mocks.settings.values).not.toHaveProperty("defaultTimelineMode");
+    expect(postMessageMock).toHaveBeenCalledWith(expect.objectContaining({
+      id: 3,
+      value: expect.objectContaining({ defaultTrendMode: "delta", defaultTimelineMode: "delta" }),
+    }), "*");
 
     // Preview mode still executes clipboard.write locally.
     await act(async () => renderer!.unmount());

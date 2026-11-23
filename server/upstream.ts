@@ -1,5 +1,6 @@
 import type { Agent, Parts, Request } from "../shared/contracts";
-import type { ContextHeaders, ContextTimeline, ContextTimelineDetail, HeaderRecord, SessionCostUsage, SurfaceNode } from "../shared/core/types";
+import type { ContextHeaders, ContextTimeline, ContextTimelineDetail, HeaderRecord, RequestRecord, SessionCostUsage, SurfaceNode } from "../shared/core/types";
+import { attachTurnSpans } from "../shared/core/turnSpans";
 import type { LoadedSession } from "./service";
 import { toolKind } from "./normalize";
 import type { ContextFold } from "./fold";
@@ -35,7 +36,7 @@ export function rowOf(a: Agent, head?: ContextTimeline) {
       pressureTokens: head.last?.prompt, contextWindow: head.contextWindow,
     }, subagentTiming: { settledMs: head.timing?.wallMs ?? 0 } } : {} };
 }
-function eventsOf(fold: ContextFold): ContextTimeline["events"] {
+function eventsOf(fold: ContextFold, requests: readonly RequestRecord[]): ContextTimeline["events"] {
   const removals = new Map<number, { count: number; tokens: number }>();
   const replacements = new Map<number, number>();
   for (const node of fold.nodes) {
@@ -47,19 +48,23 @@ function eventsOf(fold: ContextFold): ContextTimeline["events"] {
     }
     if (node.replayed || node.category === "inject") replacements.set(node.line, (replacements.get(node.line) ?? 0) + node.tokens);
   }
-  return fold.events.map((event) => {
+  const events = fold.events.map((event, index): ContextTimeline["events"][number] => {
     const seq = event.seq;
     const removed = removals.get(seq);
     const gross = removed?.tokens ?? 0, replacement = replacements.get(Math.floor(seq / 1_000_000)) ?? 0;
-    return { id: event.id, seq, time: event.time, kind: event.kind === "skill" ? "inject" : event.kind,
+    return { id: event.id, seq, ord: event.ord ?? index, time: event.time, kind: event.kind === "skill" ? "inject" : event.kind,
       name: event.title, detail: event.detail, ...(event.kind === "skill" ? { sub: "skill" } : {}),
+      ...(event.count === undefined ? {} : { count: event.count }),
+      ...(event.items === undefined ? {} : { items: event.items }),
+      ...(event.agent === undefined ? {} : { agent: event.agent }),
       ...(event.kind === "model" ? { to: event.title, from: event.detail.split(" → ")[0] } : {}),
       ...(event.kind === "compaction" || event.kind === "prune"
         ? { count: removed?.count ?? 0, grossTokens: gross, tokens: Math.max(0, gross - replacement) } : {}) };
   });
+  return attachTurnSpans(events, requests);
 }
 
-const requestSeq = (r: Request) => r.seq ?? r.boundary * 10 + 1 - 1 / (r.index + 1);
+const requestSeq = (r: Request) => r.seq ?? r.boundary * 10 + 1;
 export type Loaded = LoadedSession;
 export function upstreamOf(data: Loaded, graph = false): { head: ContextTimeline; headers: ContextHeaders } {
   const { summary: s, fold } = data;
@@ -95,6 +100,9 @@ export function upstreamOf(data: Loaded, graph = false): { head: ContextTimeline
       ...(r.duration === null ? {} : { activeMs: r.duration }),
     };
   });
+  if (requests.some((row, index) => index > 0 && row.seq < requests[index - 1].seq)) {
+    requests.sort((a, b) => a.seq - b.seq);
+  }
   const last = data.requests.at(-1), cost = hasUsage ? costOf(s.agent.provider, data.requests) : undefined;
   const hasTiming = fold.hasToolTiming || s.source !== "timeline" &&
     (s.agent.provider !== "antigravity" || s.modelMs > 0 || (s.ttftMs ?? 0) > 0);
@@ -113,7 +121,7 @@ export function upstreamOf(data: Loaded, graph = false): { head: ContextTimeline
       compactions: fold.events.filter((e) => e.kind === "compaction").length, prunes: fold.events.filter((e) => e.kind === "prune").length,
       skills: s.skills.reduce((n, t) => n + t.count, 0), events: fold.events.length,
       modelSwitches: fold.events.filter((e) => e.kind === "model").length },
-    events: graph ? [] : eventsOf(fold),
+    events: graph ? [] : eventsOf(fold, requests),
     systems: graph ? [] : fold.nodes.filter((n) => n.category === "system").map((n) => ({ seq: nodeSeq(fold, n.id), time: n.time, tokens: n.tokens })),
     fileOps: graph ? [] : fold.files.map((f) => ({ seq: nodeSeq(fold, f.id), path: f.path, kind: f.kind === "image" ? "read" : f.kind,
       tool: toolKind(f.tool), time: f.time, err: f.error, added: f.added, removed: f.removed })),

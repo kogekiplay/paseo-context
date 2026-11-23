@@ -130,12 +130,14 @@ loader.visibility(!document.hidden);
 document.addEventListener("visibilitychange", () => {
   loader.visibility(!document.hidden);
 });
+const root = createRoot(document.getElementById("root")!);
 window.addEventListener("pagehide", () => {
   stopped = true;
   loader.dispose();
   imagePool.dispose();
+  root.unmount();
   listeners.clear();
 });
-createRoot(document.getElementById("root")!).render(<><App /><div id="pc-error" role="status" /></>);
+root.render(<><App /><div id="pc-error" role="status" /></>);
 (globalThis as any).__PASEO_CONTEXT_BOOTED__ = true;
 send({ type: "paseo-context:ready", nonce: (globalThis as any).__PASEO_CONTEXT_NONCE__ });

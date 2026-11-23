@@ -21,6 +21,7 @@ import { reportedUsageOf } from "../shared/usage";
 import { hostMessage } from "./host-messages";
 import { PageLoader } from "./page-loader";
 import { fullMaxBytes, ImageUrlPool } from "./image-urls";
+import { watchBackfillMotion } from "./backfill-motion";
 import "../web/vendor/theme/theme.css";
 import "../.tmp/web/tailwind.css";
 import "../src/client/styles/base.css";
@@ -28,7 +29,8 @@ import "../src/client/styles/stats.css";
 import "../src/client/styles/jump.css";
 import "../src/client/styles/settings.css";
 import "../src/client/styles/stackedBar.css";
-import "../src/client/styles/trendChart.css";
+import "../src/client/styles/timelineChart.css";
+import "../src/client/styles/timelineMilestone.css";
 import "../src/client/styles/requestDetail.css";
 import "../src/client/styles/events.css";
 import "../src/client/styles/fileCard.css";
@@ -71,7 +73,7 @@ type State = {
 };
 
 const CONTEXT_PREVIEW_KEYS = [
-  "defaultGranularity", "defaultTrendMode", "defaultDurationCurve",
+  "defaultGranularity", "defaultTimelineMode", "defaultTrendMode", "defaultDurationCurve",
   "overviewAutoSteps", "defaultDeltaBase", "defaultToolSort", "defaultFileSort",
 ] as const;
 
@@ -234,7 +236,7 @@ function App() {
   const previewKey = previewKeyFor(s.mode, s.preferences, s.preview);
   if (s.mode === "insights") return <Overview key={previewKey} useSessions={useSessions} />;
   if (s.mode === "settings") return <div className="pc-settings"><Config useContextSettings={(selector) => useSyncExternalStore(settings.store.subscribe, () => selector(settings.store.getSnapshot()))} set={(field, value) => settings.set(field, value)} /></div>;
-  if (!s.current) return <div className="pc-status">{t("trend.empty")}</div>;
+  if (!s.current) return <div className="pc-status">{t("timeline.empty")}</div>;
   if (!s.selected) return <div className="pc-status" role="status">{loadingLabel}</div>;
   const props = { sessionId: s.current, useProjection };
   if (s.mode === "statistics") return <Statistics key={s.current} {...props} locale={s.locale} snapshot={s.selected?.statistics ?? null} loadImage={(attachment) => loadThumbImage(s.current, attachment)} />;
@@ -369,6 +371,8 @@ document.addEventListener("visibilitychange", () => {
   loader.visibility(!document.hidden);
   if (document.hidden) { familyRead?.abort(); familyRead = null; }
 });
+const rootNode = document.getElementById("root")!;
+const root = createRoot(rootNode);
 window.addEventListener("pagehide", () => {
   stopped = true; loader.dispose();
   familyRead?.abort(); familyRead = null; familyStamp = "";
@@ -377,8 +381,10 @@ window.addEventListener("pagehide", () => {
   modalOff?.(); modalOff = null;
   if (modalSession) modalStoreOf(modalSession).set(false);
   for (const cleanup of cleanups.splice(0)) cleanup();
+  root.unmount();
   disposeRetention(); listeners.clear();
 });
-createRoot(document.getElementById("root")!).render(<><App /><ImagePreview /><div id="pc-error" role="status" /></>);
+cleanups.push(watchBackfillMotion(rootNode));
+root.render(<><App /><ImagePreview /><div id="pc-error" role="status" /></>);
 (globalThis as any).__PASEO_CONTEXT_BOOTED__ = true;
 send({ type: "paseo-context:ready", nonce: (globalThis as any).__PASEO_CONTEXT_NONCE__ });

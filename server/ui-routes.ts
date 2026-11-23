@@ -18,6 +18,7 @@ import { statisticsDetails } from "./statistics-details";
 import { grammarOf } from "./grammars";
 import { createHash } from "node:crypto";
 import { dayKeyOf, startOfDayKey } from "../shared/core/days";
+import { historyPage, historyPart } from "./history";
 
 export class UiRoutes {
   private metadata: Metadata;
@@ -170,6 +171,11 @@ export class UiRoutes {
     }
     if (name === "fleet") return this.fleet.handle(body, paseo);
     if (!id) throw new Error("An agent is required for this context request");
+    if (name === "history") {
+      const part = historyPart(body.part);
+      const { head } = await this.load(id, paseo);
+      return { ok: true, value: historyPage(head, part, body) };
+    }
     if (name === "detail" && body.head === true) {
       const data = await this.service.load(await this.service.agent(id, paseo), paseo);
       return { ok: true, value: { head: upstreamOf(data, true).head, rev: data.revision } };

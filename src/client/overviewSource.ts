@@ -362,7 +362,7 @@ function useOverviewPart<T>(options: PartOptions<T>): PartState<T> {
         }
         setError(false)
         setStale(read.refreshFailed === true)
-        if (read.refreshing) schedule(600)
+        if (read.refreshing) schedule(250)
         if ('unchanged' in read) {
           notePricingPending(pricingReady.current)
           return

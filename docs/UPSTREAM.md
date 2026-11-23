@@ -2,6 +2,10 @@
 
 This is a public GitHub fork of bowenliang123/dsh-context. The initial Paseo migration is based on `9e221195ac7c02cff9a21311dda6d61f50cf50d3` (v0.85.1 plus its next fix).
 
+Paseo Context v0.2.14 uses upstream `fa98a621e7aabdebdb04fc935221a4ba5bf72883` (v0.87.1) as its baseline. This update brings Context Timeline, workflow milestones, and history pagination. `api/paseo-context/history` serves requests, events, milestones, nodes, archive, files, and timing spans from the same context projection as facts and detail. Sequence pages keep rows with the same sequence together. Workflow milestones use recorded tool calls, delegation, and task transitions. The settings bridge exposes `defaultTimelineMode` while preserving the stored `defaultTrendMode` preference.
+
+Both `history.live` and `facts.live` are `true` for Paseo's unified, revisioned projection, including idle and archived sessions. The client detail store uses `rev` to match and refresh pages. The agent's running state is reported separately in the session row.
+
 Paseo Context v0.2.8 merges upstream `504bbac49dcaa5d7933027263bfa65178cdc2d48` (v0.86.0 plus subsequent fixes). Project distribution, scan progress and retries use the Paseo overview corpus. The upstream DSH log workers, persisted projection shards, and benchmark harness are tied to its own event stream and storage. Paseo continues to read native logs incrementally and uses Paseo timeline fallback, with public pricing and recommendation catalogs cached separately on disk.
 
 Keep the original component and stylesheet paths under `src/client`. Changes there should be limited to module imports, brand text and host calls. Preserve upstream layout, chart algorithms and CSS. The static primitives, store, language/path utilities and base theme under `web/vendor` originate from DeepSeek's MIT packages at `0.2.0-rc.2`; they are UI assets, not a host compatibility layer.
@@ -17,7 +21,7 @@ Skip `remote add` if the remote already exists. Merge on a branch and review con
 
 Protect the Paseo-only runtime entries, manifest, package metadata, build scripts and documentation. Do not restore `src/host`, Cordis registration, DSH compatibility matrices, account/credential access, original release tooling or the original package name.
 
-When upstream shared algorithms change, update their copies under `shared/core` used by daemon code. When updating the UI primitives, preserve their complete license texts and rebuild the bundled third-party notices.
+When upstream shared algorithms change, update their copies under `shared/core` used by daemon code. Keep `shared/locales` synchronized with the eight Paseo-branded dictionaries in `src/client`. When updating the UI primitives, preserve their complete license texts and rebuild the bundled third-party notices.
 
 The native adapter uses Paseo's already registered RNCWebView component. Verify native registration and commands when updating Paseo. Android uses acknowledged same-document history events rather than replacing the host's global WebView emitter.
 

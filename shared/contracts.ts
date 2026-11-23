@@ -45,8 +45,11 @@ export const requestSchema = z.object({
 });
 export type Request = z.infer<typeof requestSchema>;
 export const eventSchema = z.object({
-  id: z.number(), time: z.number(), seq: z.number().optional(), kind: z.enum(["compaction", "prune", "inject", "model", "mode", "skill"]),
+  id: z.number(), time: z.number(), seq: z.number().optional(), ord: z.number().optional(),
+  kind: z.enum(["compaction", "prune", "inject", "model", "mode", "skill",
+    "agent", "goal-create", "goal-complete", "todo-add", "todo-done", "ask", "team-task-create", "team-task-complete"]),
   title: z.string(), detail: z.string(),
+  count: z.number().optional(), items: z.array(z.string()).optional(), agent: z.string().optional(),
 });
 export type ContextEvent = z.infer<typeof eventSchema>;
 export const fileSchema = z.object({

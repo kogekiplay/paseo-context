@@ -20,6 +20,11 @@ test("all preview pages use the same sample sessions, with drill-down and no ext
   const { selected: { head } } = await read("bootstrap", { ...input, mode: "context" });
   expect(head.requests.length).toBeGreaterThan(100);
   expect(head.contextWindow).toBe(400000);
+  const { value: milestones } = await read("api/paseo-context/history", { ...input, part: "milestones" });
+  expect(milestones).toMatchObject({ rev: head.detailRev, live: true, part: "milestones" });
+  expect(milestones.rows).toContainEqual(expect.objectContaining({
+    kind: "ask", count: 1, name: "Which layout should the dashboard use?",
+  }));
   const edit = head.fileOps.find((file: any) => file.kind === "write");
   expect(edit).toMatchObject({ path: "src/chart.tsx", added: 1, removed: 1 });
   await expect(read("api/paseo-context/file.preview", { path: edit.path })).resolves.toMatchObject({ name: edit.path });

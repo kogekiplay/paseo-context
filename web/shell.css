@@ -9,3 +9,88 @@ button, input, select, textarea, div { box-sizing: border-box; }
 #pc-error:empty { display: none; }
 #pc-error:not(:empty) { position: fixed; bottom: 8px; right: 8px; max-width: min(560px, 90%); padding: 10px; border: 1px solid var(--dsw-alias-state-error-primary); background: var(--dsw-alias-bg-layer-1); border-radius: 8px; font-size: 12px; z-index: 10000; }
 [data-pc-preview] .lc-ov-pagehead > .lc-ov-settings { display: none; }
+
+/* Insights active backfill capsule spinner + subtle sheen and KPI refresh tick */
+.lc-ov-folding:not(.lc-ov-folding-action) { position: relative; isolation: isolate; }
+.lc-ov-folding:not(.lc-ov-folding-action)::before {
+  content: "";
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--color-blue-500, var(--dsw-alias-brand-primary, #3b82f6));
+  opacity: 0.8;
+}
+
+@keyframes pc-spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes pc-shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+@keyframes pc-kpi-tick {
+  0% { opacity: 0.72; transform: translateY(1px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .lc-ov-folding:not(.lc-ov-folding-action) {
+    background-image: linear-gradient(
+      110deg,
+      transparent 22%,
+      color-mix(in srgb, var(--color-blue-500, var(--dsw-alias-brand-primary, #3b82f6)) 12%, transparent) 50%,
+      transparent 78%
+    );
+    background-size: 220% 100%;
+    animation: pc-shimmer 1.8s ease-in-out infinite;
+  }
+  .lc-ov-folding:not(.lc-ov-folding-action)::before {
+    width: 11px;
+    height: 11px;
+    box-sizing: border-box;
+    background: transparent;
+    opacity: 1;
+    border: 1.5px solid color-mix(in srgb, var(--color-blue-500, var(--dsw-alias-brand-primary, #3b82f6)) 28%, transparent);
+    border-top-color: var(--color-blue-500, var(--dsw-alias-brand-primary, #3b82f6));
+    animation: pc-spin 0.85s linear infinite;
+  }
+  .lc-ov-folding:not(.lc-ov-folding-action)[data-pc-animating="1"] {
+    color: transparent;
+  }
+  .lc-ov-folding:not(.lc-ov-folding-action)[data-pc-animating="1"]::after {
+    content: attr(data-pc-display);
+    position: absolute;
+    inset: 2px 10px 2px 27px;
+    display: flex;
+    align-items: center;
+    color: var(--dsw-alias-label-secondary);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    pointer-events: none;
+  }
+  .lc-ov-kpi .lc-stat-value[data-pc-animating="1"] {
+    position: relative;
+    color: transparent;
+  }
+  .lc-ov-kpi .lc-stat-value[data-pc-animating="1"]::after {
+    content: attr(data-pc-display);
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--dsw-alias-label-primary);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    pointer-events: none;
+  }
+  .lc-ov-kpi .lc-stat-value.pc-kpi-bump {
+    display: inline-block;
+    animation: pc-kpi-tick 200ms ease-out;
+  }
+}

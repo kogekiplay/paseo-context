@@ -11,6 +11,7 @@ import { unionMs } from "./timing";
 import { usageKeys } from "./usage-fields";
 import { StatisticsSpans } from "./statistics-spans";
 import { createHash, randomUUID } from "node:crypto";
+import { goalOf, type WorkflowEvent } from "./workflow";
 
 interface PendingRequest { boundary: number; seq: number; parts: Parts; start: number; anchor: number }
 type RequestTiming = Partial<Pick<Request,
@@ -73,7 +74,10 @@ export class ContextFold {
     for (const hash of this.contentHashes) bytes += 8 + stringBytes(hash);
     for (const request of this.requests) bytes += 384 + stringBytes(request.id) + stringBytes(request.model)
       + stringBytes(request.prompt) + stringBytes(request.response);
-    for (const event of this.events) bytes += 96 + stringBytes(event.title) + stringBytes(event.detail);
+    for (const event of this.events) {
+      bytes += 144 + stringBytes(event.title) + stringBytes(event.detail) + stringBytes(event.agent);
+      if (event.items) bytes += 32 + event.items.reduce((n, item) => n + 8 + stringBytes(item), 0);
+    }
     for (const file of this.files) bytes += 128 + stringBytes(file.path) + stringBytes(file.tool);
     for (const command of this.commands) {
       bytes += 224 + stringBytes(command.command) + stringBytes(command.cwd) + stringBytes(command.tool)
@@ -102,8 +106,9 @@ export class ContextFold {
     t.last = Math.max(t.last, at);
     map.set(name, t);
   }
-  private event(kind: ContextEvent["kind"], at: number, title: string, detail: string) {
-    this.events.push({ id: this.events.length, seq: this.line * 1_000_000, time: at, kind, title, detail });
+  private event(kind: ContextEvent["kind"], at: number, title: string, detail: string, fields?: Omit<WorkflowEvent, "kind" | "title">) {
+    const ord = this.events.length;
+    this.events.push({ id: ord, ord, seq: this.line * 1_000_000, time: at, kind, title, detail, ...fields });
   }
   private observeModel(model: string, at: number) {
     if (!model || model === this.model) return;
@@ -131,7 +136,8 @@ export class ContextFold {
       start: anchor && this.boundaryAt > 0 ? this.boundaryAt : at, anchor };
   }
   private add(message: Message, at: number, row: RecordValue, replayed: boolean, metadataOnly: boolean) {
-    if (!message.text && !message.tool && !message.images && !(this.antigravityCalls && message.callId)) return;
+    if (!message.text && !message.tool && !message.images && !(message.callId
+      && (this.antigravityCalls || message.category === "tool" && this.calls.has(message.callId)))) return;
     if (!replayed && this.provider === "timeline" && message.category === "calls"
       && message.callId && this.calls.has(message.callId)) return;
     const preview = detachPreview(message.text, 180);
@@ -159,6 +165,9 @@ export class ContextFold {
     if (!replayed && ["assistant", "reasoning", "calls"].includes(message.category) && this.pending === null) {
       this.pending = this.startRequest(at);
     }
+    const collaborationFailed = !replayed && this.collaboration.apply(message, this.nodes.length, at,
+      ({ kind, title, ...fields }) => this.event(kind, at, title, "", fields));
+    if (collaborationFailed && !message.error) message = { ...message, error: true };
     const tokens = metadataOnly ? 0 : message.images ? 1024 * message.images : estimateTextTokens(message.text);
     const node: ContextNode = {
       id: this.nodes.length, seq: this.line * 1_000_000 + this.slot++, line: this.line, block: message.block, category: message.category, time: at,
@@ -225,7 +234,6 @@ export class ContextFold {
     this.active[message.category] += tokens;
     if (!replayed) {
       this.images += message.images ?? 0;
-      this.collaboration.apply(message, node.id, at);
       if (message.category === "tool" && message.callId && !message.pending) this.toolResults.set(message.callId, node);
       if (message.category === "calls" && (message.tool || this.antigravityCalls && message.callId)) this.call(node, message, at);
       if (message.category === "inject") this.event("inject", at, message.title, node.preview);
@@ -421,6 +429,11 @@ export class ContextFold {
         model, timing, antigravity ? { start: providerTiming?.start ?? at, checkpoint } : undefined);
     }
     if (row.type === "event_msg" && p.type === "thread_settings_applied") this.observeModel(text(p.model), at);
+    if (row.type === "goal/change") {
+      const data = record(row.data);
+      const goal = goalOf(data.operation, record(data.goal).objective);
+      if (goal) this.event(goal.kind, at, goal.title, "", { count: goal.count });
+    }
     const close = row.type === "event_msg" && ["task_complete", "task_completed", "turn_aborted"].includes(text(p.type))
       ? p.type === "turn_aborted" ? "abort" : "complete"
       : row.type === "system" && row.subtype === "turn_duration" ? "complete" : undefined;

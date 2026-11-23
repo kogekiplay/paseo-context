@@ -23,8 +23,12 @@ export interface SettingsStateLike<T extends Record<string, unknown>> {
 }
 
 export function originalPreferences(values: Record<string, unknown>): Record<string, unknown> {
-  return Object.fromEntries(Object.entries(values).map(([key, value]) =>
+  const out = Object.fromEntries(Object.entries(values).map(([key, value]) =>
     [key, typeof value === "boolean" ? value ? "show" : "hide" : value]));
+  if (out.defaultTimelineMode === undefined && out.defaultTrendMode !== undefined) {
+    out.defaultTimelineMode = out.defaultTrendMode;
+  }
+  return out;
 }
 
 /** Parse 3/4/6/8-digit hex or rgb()/rgba() CSS colors to decide dark mode. */
@@ -107,9 +111,14 @@ export function createSettingsSaver<T extends Record<string, unknown>>(getLatest
       if (current.status !== "ready" || !current.values || !current.save) {
         throw new Error("Preferences are not ready");
       }
-      if (!Object.hasOwn(current.values, field)) throw new Error("Unknown preference");
-      const value = typeof current.values[field] === "boolean" ? rawValue === "show" : rawValue;
-      const next = { ...current.values, [field]: value } as T;
+      const targetField = field === "defaultTimelineMode"
+        && !Object.hasOwn(current.values, "defaultTimelineMode")
+        && Object.hasOwn(current.values, "defaultTrendMode")
+        ? "defaultTrendMode"
+        : field;
+      if (!Object.hasOwn(current.values, targetField)) throw new Error("Unknown preference");
+      const value = typeof current.values[targetField] === "boolean" ? rawValue === "show" : rawValue;
+      const next = { ...current.values, [targetField]: value } as T;
       if (!await current.save(next, current.revision)) {
         throw new Error("Could not save preferences; reload and retry");
       }

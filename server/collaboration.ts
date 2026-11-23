@@ -1,16 +1,18 @@
 import type { CollaborationRecord } from "../shared/contracts";
 import type { Message } from "./normalize";
 import { detachSlice, parseArgs, printable, record, stringBytes, text, type RecordValue } from "./value";
+import { askOf, workflowLabel, type EmitWorkflow } from "./workflow";
+import { notePlan, type TaskStatus } from "./workflow-plan";
+import { dispatchedChildId, dispatchAcknowledged, goalToolEvent, resultHeader, taskAcknowledged, workflowResultFailed } from "./workflow-result";
 
-type TaskStatus = "pending" | "in_progress" | "completed";
 export interface CapturedTask {
   id: string; subject: string; description: string; status: TaskStatus; blockedBy: string[];
-  owner?: string; group?: string; writeScopes?: string[];
+  owner?: string; group?: string; writeScopes?: string[]; unkeyed?: boolean;
 }
 interface TaskUpdate {
   id: string; subject?: string; description?: string; status?: TaskStatus | "deleted";
   blockedBy?: string[]; addBlockedBy?: string[]; removeBlockedBy?: string[];
-  owner?: string; group?: string; writeScopes?: string[];
+  owner?: string; group?: string; writeScopes?: string[]; unkeyed?: boolean;
 }
 export interface NativeChild {
   sessionId: string; title: string; time: number; status: string;
@@ -20,8 +22,9 @@ export type FleetRecord = Omit<CollaborationRecord, "agentId"> & {
   from?: string; textLength?: number; contentKind?: "message" | "report" | "delegation-result";
 };
 interface Pending {
-  nodeId: number; title: string; tool: string; kind: "delegation" | "message" | "task" | "wait";
+  nodeId: number; title: string; tool: string; kind: "delegation" | "message" | "task" | "wait" | "goal";
   updates?: TaskUpdate[]; snapshot?: string; mode?: NativeChild["mode"]; synchronous?: boolean;
+  dispatched?: boolean; childSessionId?: string; objective?: string;
 }
 const strings = (value: unknown): string[] =>
   Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
@@ -70,7 +73,8 @@ export class CollaborationLedger {
     for (const child of this.children.values()) bytes += 176 + stringBytes(child.sessionId) + stringBytes(child.title);
     for (const task of this.tasks.values()) bytes += taskBytes(task);
     for (const [id, call] of this.pending) {
-      bytes += 224 + stringBytes(id) + stringBytes(call.title) + stringBytes(call.tool);
+      bytes += 224 + stringBytes(id) + stringBytes(call.title) + stringBytes(call.tool)
+        + stringBytes(call.objective) + stringBytes(call.childSessionId);
       for (const task of call.updates ?? []) bytes += taskBytes(task);
     }
     return bytes;
@@ -80,9 +84,13 @@ export class CollaborationLedger {
     const list = Array.isArray(args.plan) ? args.plan : Array.isArray(args.todos) ? args.todos : null;
     if (list) {
       const group = tool.includes("todo") ? "todos" : "plan";
-      return { snapshot: group, updates: list.map((value, index) => {
-        const row = record(value);
-        return { id: taskId(row.id) || `${group}-${index}`, group, owner: "@self",
+      const rows = list.map(record);
+      const explicitIds = new Set(rows.map((row) => taskId(row.id)));
+      return { snapshot: group, updates: rows.map((row, index) => {
+        const explicit = taskId(row.id);
+        let id = explicit || `${group}-${index}`;
+        if (!explicit) while (explicitIds.has(id)) id += "-unnamed";
+        return { id, unkeyed: !explicit, group, owner: "@self",
           subject: text(row.step ?? row.content ?? row.subject ?? row.description),
           description: text(row.description), status: taskStatus(row.status) ?? "pending",
           blockedBy: strings(row.blockedBy), writeScopes: strings(row.writeScopes) };
@@ -98,13 +106,16 @@ export class CollaborationLedger {
       ...(args.owner !== undefined ? { owner: text(args.owner) } : {}),
       ...(args.writeScopes !== undefined ? { writeScopes: strings(args.writeScopes) } : {}) }] };
   }
-  private applyTasks(pending: Pending, result: RecordValue = {}, content = "") {
+  private applyTasks(pending: Pending, result: RecordValue = {}, content = "", emit?: EmitWorkflow) {
     if (pending.snapshot) {
+      if (emit) notePlan(this.tasks.values(), pending.updates ?? [], pending.snapshot, emit);
       for (const [id, task] of this.tasks) if (task.group === pending.snapshot) this.tasks.delete(id);
     }
     const returned = record(result.task);
     const returnedId = taskId(result.taskId ?? result.task_id ?? returned.id ?? result.id)
       || detachSlice(/Task\s+#(\d+)\s+created/i.exec(content)?.[1] ?? "");
+    const entry = pending.updates?.length === 1
+      ? this.records.find((r) => r.nodeId === pending.nodeId && r.kind === "task") : undefined;
     for (const update of pending.updates ?? []) {
       const id = update.id.startsWith("capture-") && returnedId ? returnedId : update.id;
       if (update.status === "deleted") { this.tasks.delete(id); continue; }
@@ -113,60 +124,90 @@ export class CollaborationLedger {
       for (const dependency of update.addBlockedBy ?? []) blockedBy.add(dependency);
       for (const dependency of update.removeBlockedBy ?? []) blockedBy.delete(dependency);
       const scopes = update.writeScopes ?? previous?.writeScopes;
-      this.tasks.set(id, { id, subject: update.subject ?? previous?.subject ?? id,
-        description: update.description ?? previous?.description ?? "", status: update.status ?? previous?.status ?? "pending",
+      const subject = update.subject ?? previous?.subject ?? id;
+      const status = update.status ?? previous?.status ?? "pending";
+      const group = update.group ?? previous?.group;
+      this.tasks.set(id, { id, subject, description: update.description ?? previous?.description ?? "", status,
         blockedBy: [...blockedBy], ...(previous?.owner === undefined ? {} : { owner: previous.owner }),
         ...(update.owner === undefined ? {} : { owner: update.owner }),
-        ...(update.group ? { group: update.group } : {}),
+        ...(group ? { group, unkeyed: update.unkeyed ?? previous?.unkeyed } : {}),
         ...(scopes ? { writeScopes: scopes } : {}) });
-      const entry = this.records.find((r) => r.nodeId === pending.nodeId && r.kind === "task");
-      if (entry && pending.updates?.length === 1) entry.taskId = id;
+      if (emit && !group) {
+        const creating = (pending.tool === "task_create" || pending.tool === "taskcreate") && !previous;
+        const completing = previous && previous.status !== "completed" && status === "completed";
+        if (creating || completing) emit({ kind: creating ? "team-task-create" : "team-task-complete",
+          title: workflowLabel(subject), count: 1 });
+      }
+      if (entry) entry.taskId = id;
     }
   }
-  apply(message: Message, nodeId: number, at: number) {
+  apply(message: Message, nodeId: number, at: number, emit?: EmitWorkflow) {
     if (message.category === "calls") {
       const tool = (message.tool ?? "").split(".").at(-1)!.replace(/^mcp__.*?__/, "").toLowerCase();
-      const kind = /(?:spawn_agent|create_agent|delegate|^task$|^agent$)/.test(tool) ? "delegation"
+      if (emit && ["ask_user_question", "askuserquestion", "ask_question", "request_user_input"].includes(tool)) {
+        const event = askOf(message.args ?? parseArgs(message.text));
+        if (event) emit(event);
+      }
+      const kind = message.delegation || /(?:spawn_agent|create_agent|delegate|^task$|^agent$)/.test(tool) ? "delegation"
         : /(?:send_input|send_message|sendmessage|agent_send|message_agent)/.test(tool) ? "message"
         : /(?:task_create|taskcreate|task_update|taskupdate|update_plan|todowrite)/.test(tool) ? "task"
+        : /^(?:create_goal|update_goal|complete_goal)$/.test(tool) ? "goal"
         : /^(?:wait|wait_agent|wait_agents)$/.test(tool) ? "wait" : null;
       if (!kind) return;
       const args = message.args ?? parseArgs(message.text);
-      const title = text(args.message ?? args.content ?? args.prompt ?? args.description ?? args.subject ?? args.explanation) || tool;
+      const title = text(message.delegation?.description ?? args.message ?? args.content ?? args.prompt ?? args.description ?? args.subject ?? args.explanation) || tool;
       const preview = detachSlice(title, 500);
-      const to = text(args.agent_id ?? args.recipient ?? args.to ?? args.id ?? args.target) || (args.type === "broadcast" ? "*" : "");
+      const childSessionId = message.delegation ? dispatchedChildId({ childSessionId: message.delegation.childId }) : "";
+      const to = childSessionId || text(args.agent_id ?? args.recipient ?? args.to ?? args.id ?? args.target)
+        || (args.type === "broadcast" ? "*" : "");
       const pending: Pending = { nodeId, title: preview, tool, kind,
         ...(kind === "task" ? this.tasksOf(args, tool, nodeId) : {}),
+        ...(kind === "goal" ? { objective: workflowLabel(text(args.objective)) } : {}),
         ...(kind === "delegation" ? { mode: args.mode === "one-shot" || args.mode === "continuable" ? args.mode
           : tool === "task" || tool === "agent" ? "one-shot" : "continuable",
-          synchronous: (tool === "task" || tool === "agent") && args.run_in_background !== true } : {}) };
-      if (kind !== "wait") {
+          ...(childSessionId ? { childSessionId } : {}),
+          synchronous: !message.delegation && (tool === "task" || tool === "agent") && args.run_in_background !== true } : {}) };
+      if (kind !== "wait" && kind !== "goal") {
         const status = taskStatus(args.status);
         this.records.push({ id: `${nodeId}`, nodeId, time: at, kind, title: preview, to,
           taskId: taskId(args.taskId ?? args.task_id), status: status === "deleted" ? "unknown" : status ?? "unknown",
           blockedBy: strings(args.blockedBy), textLength: title.length,
           ...(kind === "message" ? { contentKind: "message" as const } : {}) });
       }
+      if (message.delegation?.running && childSessionId) {
+        pending.dispatched = true;
+        emit?.({ kind: "agent", title: workflowLabel(preview), count: 1, agent: childSessionId });
+      }
       if (message.callId) this.pending.set(message.callId, pending);
       else if (kind === "task") this.applyTasks(pending);
-    } else if (message.category === "tool" && message.callId) {
+    } else if (message.category === "tool" && message.callId && !message.pending) {
       const pending = this.pending.get(message.callId);
       if (!pending) return;
       const result = parseArgs(message.text), call = this.records.find((r) => r.nodeId === pending.nodeId);
-      if (message.error && call) call.status = "failed";
-      if (pending.kind === "delegation" && !message.error) {
-        const captured = childId(result)
-          || /(?:agentId|agent_id|session_id)["':=\s]+([a-zA-Z0-9_-]{8,})/.exec(message.text)?.[1] || "";
-        const id = detachSlice(captured);
-        if (id && /^[a-zA-Z0-9_-]+$/.test(id)) {
+      const header = resultHeader(message.text);
+      const failed = message.error === true || workflowResultFailed(result, header);
+      if (failed && call) call.status = "failed";
+      if (pending.kind === "delegation" && !failed) {
+        const id = dispatchedChildId(result, header);
+        if (id) {
           this.children.set(id, { sessionId: id, title: detachSlice(pending.title, 180), time: at, status: "unknown", mode: pending.mode });
           if (call) call.to = id;
         }
+        const child = id || pending.childSessionId;
+        if (!pending.dispatched && (child || message.resultConfirmed || dispatchAcknowledged(result, header))) {
+          emit?.({ kind: "agent", title: workflowLabel(pending.title), count: 1, ...(child ? { agent: child } : {}) });
+        }
       }
-      if (pending.kind === "task" && !message.error) this.applyTasks(pending, result, message.text);
+      if (pending.kind === "task" && !failed && (message.resultConfirmed || taskAcknowledged(result, header, !!pending.snapshot, pending.tool))) {
+        this.applyTasks(pending, result, header, emit);
+      }
+      if (pending.kind === "goal" && !failed && emit) {
+        const event = goalToolEvent(pending.tool, pending.objective, result, header, message.resultConfirmed);
+        if (event) emit(event);
+      }
       if (pending.kind === "wait" || pending.kind === "delegation") {
         const reports = agentReportsOf(message.text);
-        const synchronous = pending.synchronous && call?.to && !message.error && result.isAsync !== true
+        const synchronous = pending.synchronous && call?.to && !failed && result.isAsync !== true
           && result.status !== "running" && result.status !== "pending";
         const delegationResult = synchronous && reports.length === 0;
         if (delegationResult) {
@@ -181,6 +222,7 @@ export class CollaborationLedger {
         }
       }
       this.pending.delete(message.callId);
+      return failed;
     }
   }
 }

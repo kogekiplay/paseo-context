@@ -8,11 +8,13 @@ const mocks = vi.hoisted(() => ({
   renderedTree: null as ReactNode,
   statsRenders: 0,
   lastProps: null as any,
+  unmountRoot: vi.fn(),
 }));
 
 vi.mock("react-dom/client", () => ({
   createRoot: () => ({
     render: (node: ReactNode) => { mocks.renderedTree = node; },
+    unmount: () => { mocks.unmountRoot(); },
   }),
 }));
 vi.mock("../web/statistics", () => ({
@@ -58,6 +60,7 @@ beforeEach(() => {
   mocks.renderedTree = null;
   mocks.statsRenders = 0;
   mocks.lastProps = null;
+  mocks.unmountRoot.mockClear();
   winListeners = {};
   docListeners = {};
   posted = [];
@@ -187,5 +190,8 @@ describe("web/statistics-entry standalone lifecycle", () => {
       data: { ...initMsg, agentId: "" },
     }));
     expect(JSON.stringify(renderer!.toJSON())).toContain("暂无记录");
+
+    emitWin("pagehide", { type: "pagehide" });
+    expect(mocks.unmountRoot).toHaveBeenCalledTimes(1);
   });
 });

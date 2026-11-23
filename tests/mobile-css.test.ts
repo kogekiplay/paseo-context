@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, test } from "vitest";
-import { DICTS } from "../shared/locales/i18n";
+import { DICTS } from "../src/client/i18n";
 import { preferenceLabels } from "../client/preferences-copy";
 
 describe("Narrow-screen CSS, build seams, and preference locale contracts", () => {
@@ -35,7 +35,7 @@ describe("Narrow-screen CSS, build seams, and preference locale contracts", () =
     expect(buildWeb).toContain('globalThis.__PASEO_CONTEXT_NONCE__="%%PASEO_CONTEXT_NONCE%%";');
   });
 
-  test("client/preferences-copy.ts labels match shared/locales across all 8 locales with zero drift", () => {
+  test("client/preferences-copy.ts labels match src/client/i18n across all 8 locales with zero drift", () => {
     const locales = Object.keys(DICTS) as Array<keyof typeof DICTS>;
     expect(Object.keys(preferenceLabels).sort()).toEqual([...locales].sort());
     for (const locale of locales) {

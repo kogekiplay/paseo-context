@@ -141,7 +141,7 @@ export interface FleetBatchValue {
 
 export type DefaultGranularity = 'step' | 'turn'
 
-export type DefaultTrendMode = 'total' | 'delta'
+export type DefaultTimelineMode = 'total' | 'delta'
 
 export type DefaultDeltaBase = 'step' | 'turn'
 
@@ -164,7 +164,7 @@ export type FleetTab = 'show' | 'hide'
 export interface PluginSettings {
   defaultPlacement: DefaultPlacement
   defaultGranularity: DefaultGranularity
-  defaultTrendMode: DefaultTrendMode
+  defaultTimelineMode: DefaultTimelineMode
   defaultDeltaBase: DefaultDeltaBase
   defaultToolSort: DefaultToolSort
   defaultFileSort: DefaultFileSort
@@ -462,8 +462,11 @@ export interface RequestRecord extends SlimRequestRecord {
 export interface ContextEventRecord {
   id?: number
   seq: number
+  ord?: number
   time: number
-  kind: 'compaction' | 'prune' | 'inject' | 'model' | 'mode'
+  kind: 'compaction' | 'prune' | 'inject' | 'model' | 'mode' | 'agent'
+    | 'goal-create' | 'goal-complete' | 'todo-add' | 'todo-done' | 'ask'
+    | 'team-task-create' | 'team-task-complete'
   form?: string
   tokens?: number
   grossTokens?: number
@@ -472,6 +475,7 @@ export interface ContextEventRecord {
   name?: string
   agent?: string
   detail?: string
+  items?: string[]
   from?: string
   to?: string
   fromTurn?: number
@@ -711,4 +715,24 @@ export type OverviewValue = (OverviewUnchanged | OverviewSummaryValue | Overview
   refreshing?: boolean
   refreshFailed?: boolean
   partial?: boolean
+}
+
+export const HISTORY_PARTS = ['requests', 'events', 'milestones', 'nodes', 'archive', 'files', 'spans'] as const
+
+export type HistoryPart = (typeof HISTORY_PARTS)[number]
+
+export type HistoryRow = RequestRecord | ContextEventRecord | SurfaceNode | FileOpRecord | TimingSpan
+
+export interface HistoryPage {
+  rev: number
+  live: boolean
+  part: HistoryPart
+  rows: HistoryRow[]
+  first: number
+  last: number
+  total: number
+  atStart: boolean
+  atEnd: boolean
+  beforeSeq?: number
+  beforeIndex?: number
 }

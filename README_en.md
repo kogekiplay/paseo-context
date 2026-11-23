@@ -37,7 +37,7 @@ After editing, build again and run `paseo plugin reload paseo-context`.
 
 ## Features
 
-- Context panels in workspace tabs and Explorer: composition, usage, timing, trends, steps/turns, full/incremental views and comparison against the previous step or turn.
+- Context panels in workspace tabs and Explorer show composition, usage, timing, and Context Timeline. Switch between steps and turns or total and delta views, and inspect historical requests and recorded workflow milestones.
 - Original context browser: DNA, grouped rows, treemap, filtering, content expansion, system prompts and captured tool schemas.
 - File activity and commands: reads, writes, searches, counts, line changes, failures, duration and background process state.
 - Fleet: agent network, communication timeline, delegations, captured tasks/dependencies, Paseo Subtasks, prompts and replies. Subtasks come directly from Paseo's timeline, retain running/completed/failed/canceled status and link to existing children.
@@ -59,7 +59,7 @@ Pages fetch only their required data. Context paints the selected session before
 
 ## Data and limits
 
-The daemon reads complete local Codex rollout and Claude Code JSONL records when available, preserving historical billed requests, compaction replacement history, rollbacks and tool results. Other providers and sessions without native logs use paginated Paseo timeline fallback.
+The daemon reads complete local Codex, Claude Code, and Antigravity session records when available, preserving historical usage, compaction, rollbacks, and tool results. Antigravity's companion database can supply additional provider usage and timing. Sessions without native data use paginated Paseo timeline fallback.
 
 Actual usage means provider-reported usage. Colored composition uses the upstream fixed-density text estimate. Unlogged system prompts, schemas, encrypted reasoning, server injections and internal timing phases cannot be reconstructed. Empty values are not evidence of zero usage. Timeline fallback exposes less information.
 
@@ -90,7 +90,7 @@ npm run build
 
 `src/client` and `src/shared` preserve the upstream layout. `web/` builds the original DOM UI and its bridge; `client/` contains the Paseo wrapper; `server/` contains native log/SDK adapters; `shared/core/` contains reusable upstream algorithms for the daemon.
 
-The public GitHub fork retains upstream history. Baseline: **`9e221195ac7c02cff9a21311dda6d61f50cf50d3`**, immediately after v0.85.1. See [docs/UPSTREAM.md](docs/UPSTREAM.md) for merging updates.
+The public GitHub fork retains upstream history. The current baseline is **v0.87.1 (`fa98a621e7aabdebdb04fc935221a4ba5bf72883`)**. See [docs/UPSTREAM.md](docs/UPSTREAM.md) for merging updates.
 
 ## License
 

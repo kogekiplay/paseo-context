@@ -10,11 +10,13 @@ const mocks = vi.hoisted(() => ({
   contextMounts: 0,
   renderedTree: null as ReactNode,
   modalCloseTrigger: null as (() => void) | null,
+  unmountRoot: vi.fn(),
 }));
 
 vi.mock("react-dom/client", () => ({
   createRoot: () => ({
     render: (node: ReactNode) => { mocks.renderedTree = node; },
+    unmount: () => { mocks.unmountRoot(); },
   }),
 }));
 
@@ -71,6 +73,7 @@ beforeEach(() => {
   mocks.overviewRenders = 0;
   mocks.contextMounts = 0;
   mocks.renderedTree = null;
+  mocks.unmountRoot.mockClear();
   winListeners = {};
   docListeners = {};
   posted = [];
@@ -191,6 +194,9 @@ describe("web/main entry lifecycle", () => {
     posted = [];
     await act(async () => { modalStoreOf("agent-modal").set(false); });
     expect(posted).toContainEqual(expect.objectContaining({ type: "paseo-context:action", nonce: "main-nonce", name: "close", payload: {}, aid: expect.any(Number) }));
+
+    emitWin("pagehide", { type: "pagehide" });
+    expect(mocks.unmountRoot).toHaveBeenCalledTimes(1);
   });
 
   test("compactDigest produces a tiny fixed-size hash for large family payloads", async () => {
