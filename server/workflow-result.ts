@@ -1,9 +1,59 @@
 import { detachSlice, record, text, type RecordValue } from "./value";
 import { goalOf, type WorkflowEvent } from "./workflow";
+import { antigravityConversationId } from "./antigravity-log";
 
 // Only inspect the tool's leading acknowledgement, never arbitrary text in a
 // subsequent agent report or the original contents of a large result.
 export const resultHeader = (value: string) => detachSlice(value, 512).trimStart();
+
+const RESULT_PREFIX = 2 * 1024;
+const JSON_LIMIT = 512 * 1024;
+const WORKFLOW_FIELDS = new Set(["agentId", "agent_id", "sessionId", "session_id", "childSessionId", "child_session_id",
+  "conversationId", "conversation_id", "taskId", "task_id", "task", "goal", "status", "success", "ok",
+  "error", "isError", "is_error", "result", "output", "message"]);
+
+export function prefixedWorkflowResult(value: string, accept?: (candidate: RecordValue) => boolean): RecordValue {
+  const prefix = detachSlice(value, RESULT_PREFIX);
+  const first = prefix.length - prefix.trimStart().length;
+  const relevant = (result: RecordValue) => Object.keys(result).some((key) => WORKFLOW_FIELDS.has(key));
+  const legacy = (result: RecordValue) => ["content", "objective", "id"].some((key) => Object.hasOwn(result, key));
+  if (prefix[first] === "{" && value.length <= JSON_LIMIT && Buffer.byteLength(value, "utf8") <= JSON_LIMIT) {
+    try {
+      const parsed = record(JSON.parse(value));
+      return accept?.(parsed) || relevant(parsed) || legacy(parsed) ? parsed : {};
+    } catch {}
+  }
+  // The CLI can lead with a short description or a set of key=value lines.
+  // Look for JSON near the beginning and cap the work to extract it.
+  let budget = JSON_LIMIT;
+  let through = 0;
+  let fallback: RecordValue | undefined;
+  for (const match of prefix.matchAll(/\{(?=\s*["}])/g)) {
+    const start = match.index;
+    if (start < through) continue;
+    let depth = 0, quoted = false;
+    for (let index = start; index < value.length && budget-- > 0; index++) {
+      const char = value[index];
+      if (char === '"') quoted = !quoted;
+      else if (quoted && char === "\\") { index++; budget--; }
+      else if (!quoted && char === "{") depth++;
+      else if (!quoted && char === "}" && --depth === 0) {
+        try {
+          const json = value.slice(start, index + 1);
+          if (Buffer.byteLength(json, "utf8") > JSON_LIMIT) break;
+          const candidate = record(JSON.parse(json));
+          if (accept?.(candidate) || !accept && relevant(candidate)) return candidate;
+          if (!fallback && (relevant(candidate) || start === first && legacy(candidate))) fallback = candidate;
+          through = index + 1;
+          break;
+        }
+        catch { break; }
+      }
+    }
+    if (budget <= 0) break;
+  }
+  return fallback ?? {};
+}
 
 const denial = [
   /^Tool (?:execution|call) (?:failed|denied|rejected)\b/i,
@@ -33,15 +83,22 @@ export function dispatchAcknowledged(result: RecordValue, header: string) {
     || agentStarted.test(header);
 }
 
-export function dispatchedChildId(result: RecordValue, header = "") {
+export function dispatchedChildId(result: RecordValue, header = "", nativeAntigravity = false) {
+  if (nativeAntigravity) {
+    const id = text(result.conversationId ?? result.conversation_id)
+      || /^conversation(?:Id|_id):[ \t]*([a-zA-Z0-9_-]+)(?=\s|$)/im.exec(header)?.[1] || "";
+    return id.length === 36 ? antigravityConversationId(id) ?? "" : "";
+  }
   const value = text(result.agent_id ?? result.agentId ?? result.session_id ?? result.sessionId
     ?? result.child_session_id ?? result.childSessionId)
     || /^(?:agentId|agent_id|session_id):[ \t]*([a-zA-Z0-9_-]+)(?=\s|$)/im.exec(header)?.[1] || "";
-  return /^[a-zA-Z0-9_-]+$/.test(value) ? detachSlice(value) : "";
+  const id = detachSlice(value, 512);
+  return value.length === id.length && /^[a-zA-Z0-9_-]+$/.test(id) ? id : "";
 }
 
 export function taskAcknowledged(result: RecordValue, header: string, snapshot: boolean, tool: string) {
   if (acknowledged(result)) return true;
+  if (tool === "update_steps") return /^OK(?:\s|$)/.test(header);
   if (snapshot) return /^(?:Plan updated|Updated|Todos? (?:updated|have been modified successfully))\b/i.test(header);
   const id = record(result.task).id ?? result.taskId ?? result.task_id ?? result.id;
   if ((typeof id === "number" && Number.isFinite(id)) || text(id).trim()) return true;

@@ -1,18 +1,34 @@
 import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
-import { appendFile, mkdir, mkdtemp, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { appendFile, chmod, copyFile, mkdir, mkdtemp, open, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import type * as Sqlite from "node:sqlite";
 import { afterEach, expect, test, vi } from "vitest";
-import { antigravityArgs, antigravityConversationId } from "../server/antigravity-log";
+import { antigravityArgs, antigravityConversationId, antigravityTaskResult, stripAntigravityEnvelope } from "../server/antigravity-log";
 import { SessionReader } from "../server/reader";
 import { agentOf, ContextService } from "../server/service";
 import { UiRoutes } from "../server/ui-routes";
+import { nodeSeq } from "../server/upstream";
+import { ContextFold } from "../server/fold";
+import { prefixedWorkflowResult } from "../server/workflow-result";
+import { antigravityImage } from "../server/images";
+import { agentReportsOf } from "../server/collaboration";
+import { MIB, ReadBudget } from "../server/read-budget";
+import { estimateTextTokens } from "../shared/core/estimate";
 import { dayKeyOf } from "../shared/core/days";
+import { MAX_IMAGE_THUMB_BYTES } from "../shared/limits";
 
 const ID = "247c9c90-1492-43b9-86ba-b49825487f4e";
+const NATIVE_CHILD = "84ec504d-1492-43b9-86ba-b49825487f4e";
+const PASEO_CHILD = "d58e5bb5-1492-43b9-86ba-b49825487f4e";
+const PNG_PIXEL = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVQI12P4z8AAAAMBAQAY3Y2wAAAAAElFTkSuQmCC", "base64");
+const JPEG_PIXEL = Buffer.from("/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgICAgMCAgIDAwMDBAYEBAQEBAgGBgUGCQgKCgkICQkKDA8MCgsOCwkJDRENDg8QEBEQCgwSExIQEw8QEBD/2wBDAQMDAwQDBAgEBAgQCwkLEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBD/wAARCAABAAEDAREAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAACP/EABQQAQAAAAAAAAAAAAAAAAAAAAD/xAAVAQEBAAAAAAAAAAAAAAAAAAAHCf/EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAMAwEAAhEDEQA/ADoDFU3/2Q==", "base64");
+const AVIF_PIXEL = Buffer.from("AAAAHGZ0eXBhdmlmAAAAAG1pZjFhdmlmbWlhZgAAANZtZXRhAAAAAAAAACFoZGxyAAAAAAAAAABwaWN0AAAAAAAAAAAAAAAAAAAAACJpbG9jAAAAAERAAAEAAQAAAAAA+gABAAAAAAAAACgAAAAjaWluZgAAAAAAAQAAABVpbmZlAgAAAAABAABhdjAxAAAAAA5waXRtAAAAAAABAAAAVmlwcnAAAAA4aXBjbwAAAAxhdjFDgUBsAAAAABRpc3BlAAAAAAAAAAEAAAABAAAAEHBpeGkAAAAAAwwMDAAAABZpcG1hAAAAAAAAAAEAAQOBAgMAAAAwbWRhdBIACghYAAa0BDQbhDIaGUeHhiGJpppmgAAAkD+bDGFLK02PUUVOpCA=", "base64");
 const model = "gemini-4-neon-high";
 const wrapped = (conversationId: unknown = ID, version = 1) => `plugin:${JSON.stringify({ version, data: { conversationId } })}`;
+const acp = (sessionId: unknown = ID, version = 1) => ({ version, data: { sessionId } });
+const acpHandle = (sessionId: unknown = ID, version = 1) => `plugin:${JSON.stringify(acp(sessionId, version))}`;
 const start = new Date(2026, 10, 22, 23, 59, 58, 500).getTime();
 const iso = (at: number) => new Date(at).toISOString();
 const row = (type: string, index: number, offset: number, data = {}) => ({
@@ -36,15 +52,15 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-async function fixture() {
+async function fixture(budget?: ReadBudget) {
   const root = await mkdtemp(join(await realpath(tmpdir()), "paseo-context-agy-"));
   cleanups.push(() => rm(root, { recursive: true, force: true }));
   const logs = join(root, "brain", ID, ".system_generated", "logs");
   const conversations = join(root, "conversations");
   await Promise.all([mkdir(logs, { recursive: true }), mkdir(conversations)]);
-  const reader = new SessionReader({ antigravity: root });
+  const reader = new SessionReader({ antigravity: root, codex: join(root, "codex") }, budget);
   const raw = { id: "agy-agent", provider: "antigravity", model, title: "Antigravity fixture",
-    cwd: root, persistence: { nativeHandle: wrapped() }, labels: {}, status: "idle",
+    cwd: root, persistence: { sessionId: acpHandle() }, labels: {}, status: "idle",
     createdAt: iso(start - 500), updatedAt: iso(start + 10000) } as PaseoAgent;
   const agent = agentOf(raw);
   const refetch = vi.fn(async () => { throw new Error("Fixture native session used the Paseo timeline"); });
@@ -153,13 +169,14 @@ sqliteTest("evicts companion database snapshots after idle time and releases the
 });
 
 test("resolves bare and versioned Antigravity UUIDs and rejects traversal and symlink escapes", async () => {
-  const { agent, root, file, short, database, reader } = await fixture();
+  const { agent, raw, root, file, short, database, reader } = await fixture();
   expect(agent.sessionId).toBe(ID);
-  for (const handle of [ID, ID.toUpperCase(), wrapped(), wrapped(ID.toUpperCase())]) {
+  for (const handle of [ID, ID.toUpperCase(), wrapped(), wrapped(ID.toUpperCase()), acpHandle(), acpHandle(ID.toUpperCase())]) {
     expect(antigravityConversationId(handle)).toBe(ID);
   }
   for (const handle of [null, "bad-id", `${ID}\n`, `../${ID}`, wrapped(`../../${ID}`), wrapped(ID, 2),
-    wrapped({ id: ID }), `plugin:{"conversationId":"${ID}"}`, "plugin:{"]) {
+    wrapped({ id: ID }), acpHandle(`../${ID}`), acpHandle(ID, 2), acpHandle({ id: ID }),
+    `plugin:{"version":1,"data":{"sessionId":"bad","conversationId":"${ID}"}}`, `plugin:{"conversationId":"${ID}"}`, "plugin:{"]) {
     expect(antigravityConversationId(handle)).toBeNull();
     await expect(reader.read({ ...agent, sessionId: handle })).resolves.toBeNull();
   }
@@ -170,6 +187,26 @@ test("resolves bare and versioned Antigravity UUIDs and rejects traversal and sy
   await expect(reader.locate(agent)).resolves.toBeNull();
   await writeFile(short, jsonl(user()));
   await expect(reader.locate({ ...agent, sessionId: wrapped() })).resolves.toBe(short);
+  const fromMetadata = (value: unknown) => agentOf({ ...raw, persistence: {
+    provider: "antigravity", nativeHandle: "invalid-native-handle", sessionId: "invalid-session-id",
+    metadata: { pluginProviderPersistence: value },
+  } });
+  expect(fromMetadata(acp()).sessionId).toBe(ID);
+  expect(fromMetadata({ version: 1, data: { conversationId: ID.toUpperCase() } }).sessionId).toBe(ID);
+  expect(agentOf({ ...raw, persistence: null,
+    runtimeInfo: { ...raw.runtimeInfo, provider: "antigravity", sessionId: acpHandle() } }).sessionId).toBe(ID);
+  for (const invalid of [acp(ID, 2), acp(`../${ID}`), acp(`${ID}\n`), acp({ id: ID }), null]) {
+    expect(fromMetadata(invalid).sessionId).toBeNull();
+    await expect(reader.locate(fromMetadata(invalid))).resolves.toBeNull();
+  }
+  await expect(reader.locate(fromMetadata(acp()))).resolves.toBe(short);
+  const candidate = (nativeHandle: string | undefined, sessionId: string, runtimeId: string) => agentOf({ ...raw,
+    persistence: { provider: "antigravity", nativeHandle, sessionId, metadata: { pluginProviderPersistence: acp() } },
+    runtimeInfo: { ...raw.runtimeInfo, provider: "antigravity", sessionId: runtimeId },
+  }).sessionId;
+  expect(candidate(acpHandle(ID), acpHandle(NATIVE_CHILD), acpHandle(PASEO_CHILD))).toBe(ID);
+  expect(candidate("invalid", acpHandle(NATIVE_CHILD), acpHandle(PASEO_CHILD))).toBe(NATIVE_CHILD);
+  expect(candidate("", acpHandle(NATIVE_CHILD, 2), acpHandle(PASEO_CHILD))).toBe(PASEO_CHILD);
 });
 
 test("reads the transcript incrementally and links shell, skill and file activity in FIFO order", async () => {
@@ -353,6 +390,172 @@ sqliteTest("refreshes consumed WAL metadata and preserves the transcript fold fo
   expect(appended.summary).toMatchObject({ steps: 2, contextTokens: 200, modelMs: 2250, ttftMs: 1050 });
 });
 
+sqliteTest("treats absent and empty WALs alike and ignores WAL metadata-only changes", async () => {
+  const { file, reader, database, agent } = await fixture();
+  const db = new sqlite!.DatabaseSync(database);
+  try {
+    db.exec("PRAGMA journal_mode = WAL; CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB)");
+    step(db, 1, 15, proto({ 6: time(start + 20), 7: time(start + 60), 1: time(start), 9: proto({ 9: 12 }) }));
+  } finally { db.close(); }
+  await writeFile(file, jsonl(user(), planner(1, 0, { content: "Quiet snapshot" })));
+  const companion = reader["paths"].antigravity, wal = `${database}-wal`;
+  const locate = async () => (await reader.locateSource(agent))!.antigravity!.database!;
+  await expect(stat(wal)).rejects.toMatchObject({ code: "ENOENT" });
+  const absent = await locate();
+  const read = (await reader.read(agent))!;
+  expect(read.companionFailed).toBeFalsy();
+  expect(read.entry.fold.summary(agent)).toMatchObject({ modelMs: 60, ttftMs: 20, usage: { reasoning: 12 } });
+  const cached = companion["cache"].peek(database);
+  expect(cached?.fingerprint).toBe(absent.fingerprint);
+  await writeFile(wal, "");
+  await chmod(wal, 0o600);
+  expect(await locate()).toEqual(absent);
+  expect(await companion.read(absent, () => {})).toBe(cached);
+
+  const writer = new sqlite!.DatabaseSync(database);
+  cleanups.push(() => writer.close());
+  step(writer, 1, 15, proto({ 9: proto({ 9: 20 }) }));
+  const active = await locate();
+  expect(active.fingerprint).not.toBe(absent.fingerprint);
+  const activeSnapshot = await companion.read(active, () => {});
+  await chmod(wal, 0o640);
+  expect(await locate()).toEqual(active);
+  expect(await companion.read(active, () => {})).toBe(activeSnapshot);
+  writer.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  expect((await stat(wal)).size).toBe(0);
+  const checkpointed = await locate();
+  expect(checkpointed.fingerprint).not.toBe(active.fingerprint);
+  expect((await companion.read(checkpointed, () => {})).steps.get(1)?.facts).toMatchObject({ usage: { reasoning: 20 } });
+});
+
+sqliteTest("detects a WAL-index commit change with identical WAL size, inode, and mtime", async () => {
+  const { database, reader } = await fixture();
+  const db = databaseAt(database, false);
+  step(db, 0, 14, proto({ 1: time(start) }));
+  const wal = `${database}-wal`, file = await open(`${database}-shm`, "r+");
+  const companion = reader["paths"].antigravity;
+  const stableTime = new Date(1700000000000);
+  try {
+    const offset = 8;
+    const byte = Buffer.alloc(1);
+    await file.read(byte, 0, 1, offset);
+    await utimes(wal, stableTime, stableTime);
+    const first = await companion.locate(ID);
+    const before = await stat(wal, { bigint: true });
+    try {
+      await file.write(Buffer.from([byte[0] ^ 1]), 0, 1, offset);
+      await utimes(wal, stableTime, stableTime);
+      const after = await stat(wal, { bigint: true });
+      expect([after.size, after.ino, after.mtimeNs]).toEqual([before.size, before.ino, before.mtimeNs]);
+      expect((await companion.locate(ID))?.fingerprint).not.toBe(first?.fingerprint);
+    } finally { await file.write(byte, 0, 1, offset); }
+  } finally { await file.close(); }
+});
+
+sqliteTest("keeps an active WAL without its index out of the disk snapshot cache", async () => {
+  const { reader, database } = await fixture();
+  const db = databaseAt(database, false);
+  step(db, 0, 14, proto({ 1: time(start) }));
+  const copy = join(dirname(database), `${NATIVE_CHILD}.db`);
+  await Promise.all([copyFile(database, copy), copyFile(`${database}-wal`, `${copy}-wal`)]);
+  const companion = reader["paths"].antigravity;
+  const source = (await companion.locate(NATIVE_CHILD))!;
+  expect(source.fingerprint).toBe("");
+  const snapshot = await companion.read(source, () => {});
+  expect(snapshot.fingerprint).toBe("");
+  expect(snapshot.steps.get(0)?.facts.type).toBe("USER_INPUT");
+  expect(companion["cache"].peek(copy)).toBeUndefined();
+});
+
+sqliteTest("requeues a full transcript replay behind an active read instead of exceeding capacity", async () => {
+  const budget = new ReadBudget(4 * MIB, 2);
+  const { reader, file, database, agent } = await fixture(budget);
+  const db = databaseAt(database, false);
+  step(db, 1, 15, proto({ 9: proto({ 9: 10 }) }));
+  await writeFile(file, jsonl(user(), planner(1, 0, { content: "x".repeat(420 * 1024) })));
+  const first = (await reader.read(agent))!;
+  step(db, 1, 15, proto({ 9: proto({ 9: 20 }) }));
+  let release!: () => void, admitted!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const started = new Promise<void>((resolve) => { admitted = resolve; });
+  const blocker = budget.run(2 * MIB, new AbortController().signal, async () => { admitted(); await held; });
+  await started;
+  const run = vi.spyOn(budget, "run");
+  const pending = reader.read(agent);
+  try {
+    await vi.waitFor(() => expect(run.mock.calls).toHaveLength(2));
+    expect(run.mock.calls[1][0]).toBeGreaterThan(2 * MIB);
+    expect(budget["used"]).toBe(2 * MIB);
+    expect(budget["waiting"].size).toBe(1);
+    expect(reader["cache"].peek(file)).toBe(first.entry);
+  } finally { release(); await blocker; }
+  expect((await pending)!.entry.fold.summary(agent).usage.reasoning).toBe(20);
+  expect(budget["used"]).toBe(0);
+});
+
+sqliteTest("uses an uncached transaction snapshot when the WAL changes twice and rechecks consumed facts", async () => {
+  const { file, reader, database, agent } = await fixture(new ReadBudget(MIB));
+  const db = databaseAt(database, false);
+  await writeFile(file, jsonl(user(), planner(1, 0, { content: "Active snapshot" })));
+  const companion = reader["paths"].antigravity;
+  const read = companion.read.bind(companion);
+  let writes = 0;
+  const snapshots: Array<Awaited<ReturnType<typeof read>>> = [];
+  vi.spyOn(companion, "read").mockImplementation(async (source, account) => {
+    const snapshot = await read(source, (bytes) => {
+      account(bytes);
+      // A commit at the read boundary invalidates the sampled WAL key on both attempts.
+      step(db, 1, 15, proto({ 9: proto({ 2: 100 + ++writes, 9: writes }) }));
+    });
+    snapshots.push(snapshot);
+    return snapshot;
+  });
+  const first = (await reader.read(agent))!;
+  const second = (await reader.read(agent))!;
+  expect(writes).toBe(4);
+  expect(snapshots.map((snapshot) => snapshot.fingerprint)).toEqual(["", ""]);
+  expect(companion["cache"].peek(database)).toBeUndefined();
+  expect(first.companionFailed).toBeFalsy();
+  expect(second.companionFailed).toBeFalsy();
+  expect(first.entry.fold.summary(agent).usage).toMatchObject({ input: 102, reasoning: 2 });
+  expect(second.entry.fold.summary(agent).usage).toMatchObject({ input: 104, reasoning: 4 });
+  expect(second.entry.fold).not.toBe(first.entry.fold);
+  await expect(first.bodies([1], (_id, body) => body)).rejects.toThrow(/changed/i);
+  await rm(file);
+  const databaseOnly = await reader.read(agent);
+  const refreshed = await reader.read(agent);
+  expect(databaseOnly?.metadataOnly).toBe(true);
+  expect(databaseOnly?.entry.fold.summary(agent).usage).toMatchObject({ input: 106, reasoning: 6 });
+  expect(refreshed?.entry.fold.summary(agent).usage).toMatchObject({ input: 108, reasoning: 8 });
+  expect(reader["cache"].peek(database)?.fold).toBe(refreshed?.entry.fold);
+});
+
+sqliteTest("reuses identical transient fold content without reserving bytes to replay an intact transcript", async () => {
+  const { file, reader, database, agent } = await fixture();
+  const db = databaseAt(database, false);
+  step(db, 1, 15, proto({ 9: proto({ 9: 10 }) }));
+  db.exec("CREATE TABLE churn (value INTEGER)");
+  const companion = reader["paths"].antigravity, read = companion.read.bind(companion);
+  const databaseOnly = (await reader.read(agent))!;
+  const stable = companion["cache"].peek(database)!;
+  companion.clear();
+  const snapshots: Array<Awaited<ReturnType<typeof read>>> = [];
+  vi.spyOn(companion, "read").mockImplementation(async (source, account) => {
+    const snapshot = await read(source, (bytes) => { account(bytes); db.exec("INSERT INTO churn VALUES (1)"); });
+    snapshots.push(snapshot);
+    return snapshot;
+  });
+  expect((await reader.read(agent))!.entry).toBe(databaseOnly.entry);
+  expect(snapshots[0]).toMatchObject({ fingerprint: "", contentKey: stable.contentKey });
+  expect(companion["cache"].peek(database)).toBeUndefined();
+  await writeFile(file, jsonl(user(), planner(1, 0, { content: "x".repeat(64 * 1024) })));
+  const transcript = (await reader.read(agent))!;
+  const source = (await reader.locateSource(agent))!;
+  const budget = vi.spyOn(reader.budget, "run");
+  expect((await reader.read(agent, source))!.entry).toBe(transcript.entry);
+  expect(budget.mock.calls[0]?.[0]).toBe(1024 * 1024 + 4 * source.antigravity!.database!.bytes);
+});
+
 sqliteTest("serves SQLite-only metrics and keeps request and tool bodies absent", async () => {
   const { database, service, raw, paseo, refetch, routes } = await fixture();
   const db = databaseAt(database, false);
@@ -436,4 +639,330 @@ sqliteTest("resets partial tool queues across planner/checkpoint, handles 100%-c
   // Cost usage stays populated for the session despite the 100% cache hit step.
   const ctx = await routes.handle("bootstrap", { agentId: raw.id, mode: "context" }, paseo) as any;
   expect(ctx.selected.head.cost?.antigravity?.[model]?.off).toMatchObject({ uncached: 50, cacheRead: 80100, output: 170 });
+});
+
+test("reads Antigravity collaboration and step milestones and resolves native and Paseo Fleet members", async () => {
+  const { root, file, raw, service, paseo, routes, refetch } = await fixture();
+  const nativeId = `native:antigravity:${NATIVE_CHILD}`;
+  const hosted = { ...raw, id: PASEO_CHILD, provider: "codex", title: "Hosted child", model: "gpt-5",
+    persistence: { provider: "codex", sessionId: "codex-child-session" } } as PaseoAgent;
+  const collision = { ...hosted, id: NATIVE_CHILD, persistence: { provider: "codex", sessionId: "other-codex-session" } } as PaseoAgent;
+  const otherWorkspace = { ...raw, id: "foreign", workspaceId: "other-workspace", cwd: join(root, "elsewhere"), persistence: null };
+  const listed = [raw, hosted, collision, otherWorkspace];
+  paseo.agents.list = (async () => ({ entries: listed.map((agent) => ({ agent })), pageInfo: { hasMore: false } })) as typeof paseo.agents.list;
+  const nativeLogs = join(root, "brain", NATIVE_CHILD, ".system_generated", "logs");
+  const codexLogs = join(root, "codex", "sessions");
+  await Promise.all([mkdir(nativeLogs, { recursive: true }), mkdir(codexLogs, { recursive: true })]);
+  await writeFile(join(nativeLogs, "transcript_full.jsonl"), jsonl(user(), planner(1, 0, { content: "Native answer" })));
+  await writeFile(join(codexLogs, "codex-child-session.jsonl"), jsonl(
+    { type: "response_item", payload: { type: "message", role: "user", content: [{ text: "Paseo child input" }] } },
+    { type: "response_item", payload: { type: "message", role: "assistant", content: [{ text: "Paseo child answer" }] } },
+  ));
+  if (sqlite) {
+    const db = databaseAt(join(root, "conversations", `${NATIVE_CHILD}.db`), false);
+    step(db, 1, 15, proto({ 1: time(start), 7: time(start + 300), 9: proto({ 2: 120, 3: 40, 5: 80, 9: 10 }) }));
+  }
+  const envelope = (body: string) => `${toolOutput(100, 200, "").replaceAll("\n", "\r\n")}${toolOutput(100, 200, "")}`
+    + `A pre-tool hook changed the arguments of this tool call before it ran. Changed: {"key":true}\n${body}`;
+  expect(stripAntigravityEnvelope(envelope("OK\nCreated At: inside the original body")))
+    .toBe("OK\nCreated At: inside the original body");
+  expect(stripAntigravityEnvelope(`Created At: ${iso(start)}\nOK`)).toBe("OK");
+  expect(antigravityArgs({ Prompt: "alias", prompt: "explicit", Role: "backend", Recipient: "child", Message: "body" }))
+    .toMatchObject({ prompt: "explicit", description: "backend", recipient: "child", message: "body" });
+  const tasks = (statuses: string[]) => ({ steps: ["Ship", "Skip", "Fail"].map((title, index) => ({ title, status: statuses[index] })) });
+  const args = [
+    { name: "invoke_subagent", args: { Model: model, Prompt: "Native delegation", Role: "Builder" } },
+    { name: "send_message", args: JSON.stringify({ Recipient: NATIVE_CHILD.toUpperCase(), Message: "Native message " + "n".repeat(600) }) },
+    { name: "mcp_paseo_create_agent", args: { title: "Codex delegation", initialPrompt: "Initial input", provider: "codex" } },
+    { name: "mcp_paseo_send_agent_prompt", args: { agentId: PASEO_CHILD, prompt: "Hosted message " + "p".repeat(600) } },
+    { name: "update_steps", args: tasks(["pending", "in_progress", "pending"]) },
+    { name: "update_steps", args: tasks(["done", "skipped", "failed"]) },
+    { name: "update_steps", args: { steps: [] } },
+    { name: "ask_question", args: { questions: [{ question: "Continue?" }] } },
+    { name: "invoke_subagent", args: { Prompt: "Denied delegation" } },
+    { name: "invoke_subagent", args: { Prompt: "Distant JSON" } },
+  ];
+  const results = [
+    `Created the following subagent:\n{"message":"preface"}\n${JSON.stringify({ conversationId: NATIVE_CHILD, data: { text: 'Quoted brace } and "' } })}`,
+    "OK",
+    `availableModes_count=2\navailableModes_ids=default,full\n\n{"debug":true}\n${JSON.stringify({ agentId: PASEO_CHILD })}\nTrailing text`,
+    "OK",
+    "OK",
+    "OK\nRecovered",
+    "OKAY",
+    "OK",
+    `Error: denied\n${JSON.stringify({ conversation_id: NATIVE_CHILD })}`,
+    `${"x".repeat(2048)}\n${JSON.stringify({ conversation_id: "another" })}`,
+  ];
+  await writeFile(file, jsonl(user(), planner(1, 0, { tool_calls: args }),
+    ...results.map((body, index) => result(index + 2, index * 10 + 200, envelope(body)))));
+  const load = vi.spyOn(service, "load");
+  expect(service["discoveredChildren"].size).toBe(0);
+  expect((await service.fleet(PASEO_CHILD, paseo)).rootId).toBe(raw.id);
+  expect(load.mock.calls.some(([agent]) => agent.id === otherWorkspace.id)).toBe(false);
+  const data = await service.load(raw, paseo);
+  expect(data.fold.collaboration.children.get(NATIVE_CHILD)).toMatchObject({ title: "Native delegation", mode: "continuable" });
+  expect(data.fold.collaboration.child(PASEO_CHILD, true)).toMatchObject({ title: "Codex delegation", mode: "continuable" });
+  expect(data.fold.collaboration.children.size).toBe(2);
+  expect(data.fold.collaboration.records.filter((entry) => entry.kind === "message").map((entry) => entry.to))
+    .toEqual([NATIVE_CHILD.toUpperCase(), PASEO_CHILD]);
+  expect([...data.fold.collaboration.tasks.values()]).toMatchObject([
+    { subject: "Ship", status: "completed", group: "plan" },
+    { subject: "Skip", status: "canceled", group: "plan" },
+    { subject: "Fail", status: "failed", group: "plan" },
+  ]);
+  expect(data.fold.events.filter((event) => ["agent", "todo-add", "todo-done", "ask"].includes(event.kind))).toMatchObject([
+    { kind: "ask", title: "Continue?" },
+    { kind: "agent", agent: NATIVE_CHILD },
+    { kind: "agent", agent: PASEO_CHILD },
+    { kind: "todo-add", items: ["Ship", "Skip", "Fail"] },
+    { kind: "todo-done", items: ["Ship"], count: 1 },
+  ]);
+  expect(data.fold.toolResults.get("agy:1:0")).toMatchObject({ toolStartedAt: start + 100, toolEndedAt: start + 200 });
+  expect((await service.content(raw.id, data.fold.toolResults.get("agy:1:0")!.id, paseo)).startsWith("Created At:")).toBe(true);
+  const remember = vi.spyOn(service as unknown as { rememberChild: (parent: PaseoAgent, child: { sessionId: string }) => PaseoAgent }, "rememberChild");
+  const fleet = await service.fleet(raw.id, paseo, { details: true });
+  expect(fleet.failed).toBe(0);
+  expect(fleet.agents.map((agent) => agent.id).sort()).toEqual([raw.id, nativeId, PASEO_CHILD].sort());
+  expect(fleet.loaded.get(PASEO_CHILD)?.agent).toMatchObject({ provider: "codex", parentId: raw.id });
+  expect(fleet.loaded.get(nativeId)?.summary).toMatchObject({ source: "native",
+    usage: { input: 200, output: 40, ...(sqlite ? { reasoning: 10 } : {}) }, ...(sqlite ? { modelMs: 300 } : {}) });
+  expect(remember.mock.calls.some(([, child]) => child.sessionId === PASEO_CHILD)).toBe(false);
+  expect((await service.directory(paseo)).map((agent) => agent.id).sort())
+    .toEqual([raw.id, nativeId, PASEO_CHILD, NATIVE_CHILD, otherWorkspace.id].sort());
+  expect((await service.fleet(PASEO_CHILD, paseo)).rootId).toBe(raw.id);
+  expect((await service.collaboration(raw.id, paseo)).records.filter((item) => item.kind === "message").map((item) => item.to))
+    .toEqual([nativeId, PASEO_CHILD]);
+  await expect(routes.handle("fleet", { sessionId: raw.id, batch: { ids: [nativeId, PASEO_CHILD], mode: "history" } }, paseo))
+    .resolves.toMatchObject({ ok: true, value: { missing: [], rows: {
+      [nativeId]: { messages: [{ text: "Native message " + "n".repeat(600) }] },
+      [PASEO_CHILD]: { messages: [{ text: "Hosted message " + "p".repeat(600) }] },
+    } } });
+  expect(refetch).not.toHaveBeenCalled();
+  listed.splice(1, 1);
+  expect((await service.fleet(raw.id, paseo)).agents.map((agent) => agent.id)).toEqual([raw.id, nativeId]);
+  expect(remember.mock.calls.some(([, child]) => child.sessionId === PASEO_CHILD)).toBe(false);
+  listed.push(hosted);
+  await writeFile(file, jsonl(user(), planner(1, 0, { content: "Parent rewrite without a delegation" })));
+  expect((await service.fleet(PASEO_CHILD, paseo)).rootId).toBe(PASEO_CHILD);
+  expect(service["discoveredChildren"].get(raw.id)?.ids.size).toBe(0);
+  const emptyFold = new ContextFold("antigravity");
+  for (let i = 0; i < 512; i++) service["replaceChildEdges"]({ ...data, fold: emptyFold, agent: { ...data.agent, id: `parent-${i}` } });
+  expect(service["discoveredChildren"].size).toBe(512);
+  expect(service["discoveredChildren"].has(raw.id)).toBe(false);
+  service.clear();
+  expect(service["discoveredChildren"].size).toBe(0);
+});
+
+test("keeps Antigravity history text, reads indexed local images, and rejects unsafe or oversized media", async () => {
+  const { root, file, raw, service, routes, paseo } = await fixture();
+  const brain = join(root, "brain", ID);
+  const png = PNG_PIXEL, jpeg = JPEG_PIXEL;
+  const images = [join(brain, "space in image.png"), join(brain, "local.jpg"), join(brain, "large.png")];
+  const outside = join(root, "brain", `${ID}-neighbor`, "outside.png");
+  const escaped = join(brain, "escape.png");
+  const spoofed = join(brain, "spoofed.png"), linked = join(brain, "linked");
+  await mkdir(join(root, "brain", `${ID}-neighbor`));
+  await Promise.all([
+    writeFile(images[0], png), writeFile(images[1], jpeg),
+    writeFile(images[2], Buffer.concat([png, Buffer.alloc(MAX_IMAGE_THUMB_BYTES)])),
+    writeFile(outside, png), symlink(outside, escaped), symlink(brain, linked, "dir"), writeFile(spoofed, "private text"),
+  ]);
+  const media = (uri: string, mime_type = "image/png") => ({ uri, mime_type });
+  await writeFile(file, jsonl(
+    user({ content: "https://example.test/text-and-image", media: [media(pathToFileURL(images[0]).href)] }),
+    planner(1, 0, { content: "Text with assistant image", media: [media(images[1], "image/jpeg")],
+      tool_calls: [{ name: "read_file", args: { Path: images[0] } }] }),
+    result(2, 200, "Text with tool images", { media: [
+      media(images[0]), media(images[1], "image/jpg"), media(images[2]), media(outside), media(escaped),
+      media(`../${ID}-neighbor/outside.png`), media(images[0], "image/svg+xml"), media(images[1]),
+      media(join(linked, "space in image.png")), media(spoofed), media("file://remote-host/share/image.png"),
+      media("//remote-host/share/image.png"), media("\\\\remote-host\\share\\image.png"), media("file://localhost/share/image.png"),
+    ] }),
+  ));
+  const { fold, media: readMedia } = await service.load(raw, paseo);
+  const page = (seq: number) => routes.handle("history.page", { address: { sessionId: raw.id }, throughSeq: seq }, paseo);
+  const key = (node: number, index?: number) => `paseo-context-image:${node}${index === undefined ? "" : `:${index}`}`;
+  const block = (node: number, index?: number) => ({ type: "image", attachment: { attachmentId: key(node, index), name: "Image" } });
+  const userNode = fold.nodes.find((node) => node.category === "user")!;
+  const assistantNode = fold.nodes.find((node) => node.category === "assistant")!;
+  const toolNode = fold.nodes.find((node) => node.category === "tool")!;
+  await expect(page(nodeSeq(fold, userNode.id))).resolves.toMatchObject({ records: [{ event: { data: { content: [
+    { type: "text", text: "https://example.test/text-and-image" }, block(userNode.id),
+  ] } } }] });
+  await expect(page(nodeSeq(fold, assistantNode.id))).resolves.toMatchObject({ records: [{ event: { data: { message: { content: [
+    { type: "text", text: "Text with assistant image" }, block(assistantNode.id),
+  ] } } } }] });
+  await expect(page(nodeSeq(fold, toolNode.id))).resolves.toMatchObject({ records: [{ event: { type: "tool/call" } },
+    { event: { type: "tool/result", data: { message: { content: [
+      { type: "text", text: "Text with tool images" }, ...Array.from({ length: 14 }, (_, index) => block(toolNode.id, index)),
+    ] } } } }] });
+  const preview = (attachmentId: string, options = {}) => routes.rpc("api/paseo-context/image", { sessionId: raw.id, attachmentId, ...options }, paseo);
+  const pngUrl = `data:image/png;base64,${png.toString("base64")}`, jpegUrl = `data:image/jpeg;base64,${jpeg.toString("base64")}`;
+  await expect(preview(key(userNode.id))).resolves.toBe(pngUrl);
+  await expect(preview(key(assistantNode.id))).resolves.toBe(jpegUrl);
+  await expect(preview(key(toolNode.id))).resolves.toBe(pngUrl);
+  await expect(preview(key(toolNode.id, 1), { variant: "thumb" })).resolves.toBe(jpegUrl);
+  await expect(preview(key(toolNode.id, 2), { variant: "thumb" })).rejects.toThrow("2 MiB");
+  await expect(preview(key(toolNode.id, 2), { variant: "thumb", maxBytes: 6 * 1024 * 1024 })).resolves.toMatch(/^data:image\/png;base64,/);
+  await expect(preview(key(toolNode.id, 2), { variant: "full" })).resolves.toMatch(/^data:image\/png;base64,/);
+  for (let index = 3; index <= 14; index++) {
+    await expect(preview(key(toolNode.id, index))).rejects.toThrow("Image bytes were not retained");
+  }
+  await expect(preview(key(toolNode.id, Number.MAX_SAFE_INTEGER + 1))).rejects.toThrow("Unknown image");
+  expect(JSON.stringify(fold.nodes.filter((node) => node.images))).not.toContain(brain);
+  for (const [node, body] of [[userNode, "https://example.test/text-and-image"], [assistantNode, "Text with assistant image"],
+    [toolNode, "Text with tool images"]] as const) {
+    expect(node.tokens).toBe(1024 * node.images! + estimateTextTokens(body));
+  }
+  expect(fold.requests[0].usage).toMatchObject({ input: 200, output: 40 });
+  await writeFile(file, jsonl(user({ media: [media(outside)] })));
+  await expect(readMedia!(userNode.id, 0, MAX_IMAGE_THUMB_BYTES)).rejects.toThrow(/changed/i);
+});
+
+test("uses Completed At to settle background commands without a companion database", async () => {
+  const { file, agent, reader } = await fixture();
+  const background = `Tool is running as a background task with task id: ${ID}/task-22`;
+  const command = { name: "run_command", args: { CommandLine: "echo ready" } };
+  await writeFile(file, jsonl(user(), planner(1, 0, { tool_calls: [command, command, command] }),
+    result(2, 150, toolOutput(100, 130, background), { status: "DONE" }),
+    result(3, 200, `Created At: ${iso(start + 150)}\n${background.replace("task-22", "task-23")}`),
+    result(4, 550, toolOutput(200, 550, `${background.replace("task-22", "task-24")}\nProcess exited with code 0`), { status: "RUNNING" }),
+  ));
+  const { fold } = (await reader.read(agent))!.entry;
+  expect(fold.commands.map(({ status, duration }) => ({ status, duration }))).toEqual([
+    { status: "running", duration: null }, { status: "running", duration: null }, { status: "completed", duration: 350 },
+  ]);
+  expect(fold.toolResults.has("agy:1:0")).toBe(false);
+  expect(fold.commands[0].outputNode).not.toBeNull();
+  expect(fold.nodes[fold.commands[0].outputNode!].toolEndedAt).toBeUndefined();
+  expect(fold.toolResults.get("agy:1:2")).toMatchObject({ toolEndedAt: start + 550, toolDurationMs: 350 });
+  const check = { name: "manage_task", args: { Action: "status", TaskId: `${ID}/task-22` } };
+  await appendFile(file, jsonl(planner(5, 600, { tool_calls: [check] }),
+    result(6, 610, toolOutput(605, 610, "Status: In_Progress\nLog:\nExit Code: 9"))));
+  expect((await reader.read(agent))!.entry.fold.commands[0]).toMatchObject({ status: "running", duration: null });
+  await appendFile(file, jsonl(planner(7, 650, { tool_calls: ["list", "send_input"].map((Action) => ({
+    name: "manage_task", args: { Action, TaskId: `${ID}/task-22` },
+  })) }), result(8, 660, "Status: DONE\nExit Code: 0"), result(9, 670, "Status: DONE\nExit Code: 0")));
+  expect((await reader.read(agent))!.entry.fold.commands[0]).toMatchObject({ status: "running", exit: null });
+  await appendFile(file, jsonl(planner(10, 700, { tool_calls: [check] }),
+    result(11, 710, toolOutput(705, 710, "Status: DONE\nExit Code: 9"))));
+  expect((await reader.read(agent))!.entry.fold.commands[0]).toMatchObject({ status: "failed", exit: 9, duration: null, time: start + 100 });
+  expect(fold.commands[0].outputNodes).toHaveLength(2);
+  const kill = { name: "manage_task", args: { Action: "kill", TaskId: `${ID}/task-23` } };
+  await appendFile(file, jsonl(planner(12, 800, { tool_calls: [kill] }),
+    result(13, 810, toolOutput(805, 810, `Task "${ID}/task-23" canceled.`))));
+  expect((await reader.read(agent))!.entry.fold.commands[1]).toMatchObject({ status: "failed", exit: null, duration: null });
+
+  const native = new ContextFold("antigravity");
+  native.apply(planner(1, 0, { tool_calls: [command] }));
+  native.apply(result(2, 150, toolOutput(100, 130, background), { status: "RUNNING" }),
+    { type: "GENERIC", times: { start: start + 100, end: start + 500 } });
+  expect(native.commands[0]).toMatchObject({ status: "completed", duration: 400 });
+  expect(native.toolResults.get("agy:1:0")?.toolEndedAt).toBe(start + 500);
+  const partial = new ContextFold("antigravity");
+  partial.apply(planner(1, 0, { tool_calls: [command] }));
+  partial.apply(result(2, 150, toolOutput(100, 130, background), { status: "RUNNING" }),
+    { type: "GENERIC", times: { end: start + 500 } });
+  expect(partial.commands[0]).toMatchObject({ status: "completed", duration: 400 });
+});
+
+test("counts terminal Antigravity steps in same-title matching and keeps keyed identities", () => {
+  const fold = new ContextFold("antigravity");
+  const capture = (index: number, steps: unknown[]) => {
+    fold.apply(planner(index, index, { tool_calls: [{ name: "update_steps", args: { steps } }] }));
+    fold.apply(result(index + 1, index + 1, toolOutput(index, index + 1, "OK")));
+  };
+  capture(1, [{ title: "Same", status: "pending" }, { id: "stable", title: "First", status: "pending" }]);
+  capture(3, [{ title: "Same", status: "skipped" }, { title: "Same", status: "done" },
+    { id: "stable", title: "Renamed", status: "done" }, { title: "Failed", status: "failed" }]);
+  expect([...fold.collaboration.tasks.values()].map(({ id, subject, status }) => [id, subject, status])).toEqual([
+    ["plan-0", "Same", "canceled"], ["plan-1", "Same", "completed"],
+    ["stable", "Renamed", "completed"], ["plan-3", "Failed", "failed"],
+  ]);
+  expect(fold.events.filter((event) => event.kind === "todo-done").map((event) => event.items)).toEqual([["Renamed"]]);
+  for (const status of ["skipped", "failed", "pending"]) {
+    capture(5, [{ title: "Only", status }]);
+    const before = fold.events.filter((event) => event.kind === "todo-done").length;
+    capture(7, [{ title: "Only", status: "done" }]);
+    expect(fold.events.filter((event) => event.kind === "todo-done")).toHaveLength(before + (status === "pending" ? 1 : 0));
+  }
+});
+
+test("scopes Antigravity and Paseo tool names and bounds result parsing", () => {
+  const args = { steps: [{ title: "Ignored", status: "pending" }] };
+  for (const provider of ["codex", "claude", "antigravity"]) {
+    const ledger = new ContextFold(provider).collaboration;
+    const events = vi.fn();
+    const send = (tool: string, value: string) => {
+      ledger.apply({ category: "calls", tool, title: tool, args, text: "", block: 0, callId: tool }, 1, start, events);
+      ledger.apply({ category: "tool", title: tool, text: value, block: 0, callId: tool }, 2, start, events);
+    };
+    send("mcp__other__update_steps", "OK");
+    send("mcp__other__invoke_subagent", JSON.stringify({ conversationId: ID }));
+    send("mcp__other__send_agent_prompt", "OK");
+    if (provider !== "antigravity") {
+      send("update_steps", "OK");
+      send("invoke_subagent", JSON.stringify({ conversationId: ID }));
+    } else send("invoke_subagent", JSON.stringify({ conversation_id: "report-id" }));
+    send("Task", JSON.stringify({ conversationId: "report-id" }));
+    expect(ledger.tasks.size).toBe(0);
+    expect(ledger.children.size).toBe(0);
+    expect(ledger.records.some((row) => row.kind === "message")).toBe(false);
+    send("paseo.create_agent", JSON.stringify({ agentId: PASEO_CHILD }));
+    send("paseo.send_agent_prompt", "OK");
+    expect(ledger.child(PASEO_CHILD, true)?.paseoAgent).toBe(true);
+    expect(ledger.records.some((row) => row.kind === "message")).toBe(true);
+    if (provider === "antigravity") {
+      send("invoke_subagent", JSON.stringify({ conversation_id: PASEO_CHILD.toUpperCase() }));
+      expect(ledger.child(PASEO_CHILD, false)?.paseoAgent).toBe(false);
+      expect(ledger.children.size).toBe(2);
+    }
+  }
+  expect(prefixedWorkflowResult(`{"debug":true}\n{"agentId":"${PASEO_CHILD}"}`)).toEqual({ agentId: PASEO_CHILD });
+  expect(prefixedWorkflowResult(`{"id":1}\n{"agentId":"${PASEO_CHILD}"}`)).toEqual({ agentId: PASEO_CHILD });
+  expect(prefixedWorkflowResult(`leading\n${JSON.stringify({ message: "x".repeat(512 * 1024), success: true })}`)).toEqual({});
+  expect(prefixedWorkflowResult(`leading\n${JSON.stringify({ message: "\\".repeat(300 * 1024) })}`)).toEqual({});
+  expect(prefixedWorkflowResult(JSON.stringify({ message: "图".repeat(200 * 1024) }))).toEqual({});
+  const longReport = "report ".repeat(15 * 1024);
+  expect(agentReportsOf(JSON.stringify({ agentId: PASEO_CHILD, status: "completed", result: longReport }), true)[0]?.text).toBe(longReport);
+  expect(agentReportsOf(`{"message":"preface"}\n{"status":{"${PASEO_CHILD}":{"completed":"report"}}}`, true))
+    .toEqual([{ from: PASEO_CHILD, status: "completed", text: "report" }]);
+  const longHook = "A pre-tool hook changed the arguments of this tool call before it ran. " + "x".repeat(4096);
+  expect(stripAntigravityEnvelope(`${longHook}\nOK`)).toBe(`${longHook}\nOK`);
+});
+
+test("checks signatures for the remaining supported Antigravity media types", async () => {
+  const { root } = await fixture();
+  const images = [
+    ["bmp", Buffer.from("BM"), 1], ["gif", Buffer.from("GIF89a"), 5], ["webp", Buffer.from("RIFF\0\0\0\0WEBP"), 11],
+    ["png", PNG_PIXEL, 7], ["jpeg", JPEG_PIXEL, 2], ["avif", AVIF_PIXEL, 15],
+  ] as const;
+  for (const [extension, bytes, cutoff] of images) {
+    const path = join(root, "brain", ID, `proof.${extension}`), mime = `image/${extension}`;
+    await writeFile(path, bytes);
+    await expect(antigravityImage(root, ID, { uri: path, mime_type: mime }, 1024))
+      .resolves.toBe(`data:${mime};base64,${bytes.toString("base64")}`);
+    await writeFile(path, bytes.subarray(0, cutoff));
+    await expect(antigravityImage(root, ID, { uri: path, mime_type: mime }, 100)).resolves.toBeNull();
+  }
+  const heif = join(root, "brain", ID, "heif.avif");
+  await writeFile(heif, Buffer.concat([Buffer.from([0, 0, 0, 20]), Buffer.from("ftypmif1\0\0\0\0msf1")]));
+  await expect(antigravityImage(root, ID, { uri: heif, mime_type: "image/avif" }, 100)).resolves.toBeNull();
+});
+
+test("manage_task completion only accepts the requested action and bounded control fields", () => {
+  for (const state of ["canceled", "cancelled", "killed", "terminated", "timed out", "timeout"]) {
+    expect(antigravityTaskResult(toolOutput(0, 1, `Task: task-1\nStatus: ${state}\nLog:\nExit Code: 0`), "status", "task-1"))
+      .toEqual({ status: "failed", exit: null });
+  }
+  for (const action of ["list", "send_input"]) {
+    expect(antigravityTaskResult("Status: DONE\nExit Code: 9", action, "task-1")).toBeNull();
+  }
+  expect(antigravityTaskResult("Task: other-task\nStatus: DONE", "status", "task-1")).toBeNull();
+  expect(antigravityTaskResult("Task: task-1\nStatus: DONE\nLog:\nExit Code: 9", "status", "task-1")).toEqual({ status: "completed", exit: null });
+  const output = "x".repeat(4 * MIB) + "\nCommand exited with code 9";
+  const result = antigravityTaskResult(output, "status", "task-1"), regexInputLength = RegExp.input.length;
+  expect(result).toEqual({ status: "failed", exit: 9 });
+  expect(regexInputLength).toBeLessThanOrEqual(2048);
 });

@@ -5,6 +5,7 @@ import { basename, isAbsolute, join } from "node:path";
 import type { Agent } from "../shared/contracts";
 import { antigravityConversationId } from "./antigravity-log";
 import { AntigravityDatabase, type AntigravityDatabaseFile } from "./antigravity-db";
+import { antigravityImage } from "./images";
 
 const DIRECTORY_TTL_MS = 4_000;
 const PATH_LIMIT = 512;
@@ -166,6 +167,11 @@ export class NativePaths {
     ensureActive(this.signal);
     if (location) this.remember(key, location);
     return location ?? null;
+  }
+
+  image(agent: Agent, media: unknown, maxBytes: number) {
+    const id = agent.provider === "antigravity" ? antigravityConversationId(agent.sessionId) : null;
+    return id ? antigravityImage(this.roots.antigravity, id, media, maxBytes) : null;
   }
 
   // Scope the index to a scan as well. Very large directories can still be

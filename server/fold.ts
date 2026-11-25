@@ -5,7 +5,7 @@ import { opsOfCall, opBearingTool, patchFiles, IMAGE_FILE_EXT } from "../shared/
 import { SessionFold, type UsageObservation } from "./meter";
 import { CollaborationLedger } from "./collaboration";
 import { messagesOf, toolKind, type Message } from "./normalize";
-import { AntigravityCalls, antigravityMessages, type AntigravityStep } from "./antigravity-log";
+import { AntigravityCalls, antigravityBackgroundTask, antigravityMessages, antigravityTaskResult, commandExitCode, type AntigravityStep } from "./antigravity-log";
 import { count, detachPreview, detachSlice, parseArgs, record, stringBytes, stringIndexBytes, text, timestamp, type RecordValue } from "./value";
 import { unionMs } from "./timing";
 import { usageKeys } from "./usage-fields";
@@ -31,7 +31,7 @@ export class ContextFold {
   readonly programs = new Map<string, Tally>();
   readonly toolEpochs: Array<{ seq: number; time: number; nodeIds: number[] }> = [];
   readonly meter: SessionFold;
-  readonly collaboration = new CollaborationLedger();
+  readonly collaboration: CollaborationLedger;
   readonly statistics = new StatisticsSpans();
   contextTokens: number | null = null;
   contextWindow: number | null = null;
@@ -43,7 +43,8 @@ export class ContextFold {
   private turn = 0;
   private active = emptyParts();
   private pending: PendingRequest | null = null;
-  private calls = new Map<string, { node: ContextNode; command?: Command; files: FileActivity[]; skill?: string }>();
+  private calls = new Map<string, { node: ContextNode; command?: Command; files: FileActivity[]; skill?: string;
+    managed?: { action: string; taskId: string } }>();
   private toolCallCount = 0;
   private antigravityCalls?: AntigravityCalls;
   private requestIds = new Map<string, number>();
@@ -89,7 +90,8 @@ export class ContextFold {
     for (const map of [this.requestIds, this.toolResults, this.toolDurations, this.background, this.toolIntervals, this.calls]) {
       bytes += stringIndexBytes(map.keys());
     }
-    for (const call of this.calls.values()) bytes += 112 + call.files.length * 8 + stringBytes(call.skill);
+    for (const call of this.calls.values()) bytes += 112 + call.files.length * 8 + stringBytes(call.skill)
+      + stringBytes(call.managed?.action) + stringBytes(call.managed?.taskId);
     bytes += this.toolIntervals.size * 64 + stringIndexBytes(this.turnIds) + stringIndexBytes(this.claudeNodes.keys());
     for (const nodes of this.claudeNodes.values()) bytes += 80 + stringIndexBytes(nodes.keys());
     return bytes;
@@ -97,6 +99,7 @@ export class ContextFold {
 
   constructor(readonly provider: string, readonly epoch: string = randomUUID()) {
     this.meter = new SessionFold(provider === "claude" || provider === "antigravity" ? provider : "codex");
+    this.collaboration = new CollaborationLedger(provider === "antigravity");
     if (provider === "antigravity") this.antigravityCalls = new AntigravityCalls();
   }
   private tally(map: Map<string, Tally>, name: string, at: number) {
@@ -168,7 +171,9 @@ export class ContextFold {
     const collaborationFailed = !replayed && this.collaboration.apply(message, this.nodes.length, at,
       ({ kind, title, ...fields }) => this.event(kind, at, title, "", fields));
     if (collaborationFailed && !message.error) message = { ...message, error: true };
-    const tokens = metadataOnly ? 0 : message.images ? 1024 * message.images : estimateTextTokens(message.text);
+    const imageTokens = 1024 * (message.images ?? 0);
+    const tokens = metadataOnly ? 0 : imageTokens
+      + (this.antigravityCalls || !imageTokens ? estimateTextTokens(message.text) : 0);
     const node: ContextNode = {
       id: this.nodes.length, seq: this.line * 1_000_000 + this.slot++, line: this.line, block: message.block, category: message.category, time: at,
       tokens, title: message.title || message.category, preview,
@@ -194,6 +199,10 @@ export class ContextFold {
         else if (paired) this.toolIntervals.set(message.callId, { start: call.node.time, end: at, kind: "tools" });
       }
       if (call) {
+        const manageTask = call.managed;
+        const taskId = this.antigravityCalls && call.command && !manageTask ? antigravityBackgroundTask(message.text) : undefined;
+        const code = call.command && !manageTask ? commandExitCode(message.text, Boolean(this.antigravityCalls)) : undefined;
+        const launch = taskId && code === undefined;
         loadedSkill = call.skill;
         node.tool = call.node.tool;
         node.title = call.node.title;
@@ -201,7 +210,7 @@ export class ContextFold {
         if (!replayed && start !== undefined) {
           call.node.toolStartedAt = start;
           call.node.time = start;
-          if (call.command) call.command.time = start;
+          if (call.command && !manageTask) call.command.time = start;
           for (const file of call.files) file.time = start;
           const tally = call.node.tool && this.tools.get(call.node.tool);
           if (tally) tally.last = Math.max(tally.last, start);
@@ -211,20 +220,26 @@ export class ContextFold {
           }
         }
         if (!replayed && !message.pending) for (const file of call.files) file.error = message.error === true;
-        if (!replayed && !message.pending && call.command) {
+        if (!replayed && call.command && (!message.pending || launch)) {
           const c = call.command;
-          const code = /(?:exit(?:ed)?(?:\s+with)?(?:\s+code)?[=: ]+|Process exited with code )(-?\d+)/i.exec(message.text);
-          const background = /Process running with session ID|still running|background job/i.test(message.text);
-          c.exit = code ? Number(code[1]) : null;
-          c.status = background ? "running" : message.error || (c.exit !== null && c.exit !== 0) ? "failed" : "completed";
-          c.duration = background ? null : duration
-            ?? (!this.antigravityCalls && c.time > 0 && at >= c.time && (this.provider !== "timeline" || paired) ? at - c.time : null);
-          c.outputNode = node.id;
-          c.outputNodes ??= [];
-          if (!c.outputNodes.includes(node.id)) c.outputNodes.push(node.id);
-          const processId = /Process running with session ID\s+([a-zA-Z0-9_-]+)/.exec(message.text)?.[1];
-          if (processId) this.background.set(detachSlice(processId), c);
-          if (!background) for (const [id, command] of this.background) if (command === c) this.background.delete(id);
+          const managed = manageTask && this.background.get(manageTask.taskId) === c && !message.error
+            ? antigravityTaskResult(message.text, manageTask.action, manageTask.taskId) : null;
+          if (!manageTask || managed && managed.status !== "running") {
+            const head = detachSlice(message.text, 2048);
+            const background = !manageTask && end === undefined && (Boolean(launch)
+              || !this.antigravityCalls && /Process running with session ID|still running|background job/i.test(head));
+            c.exit = managed ? managed.exit : code === undefined ? null : Number(code);
+            c.status = managed?.status ?? (background ? "running"
+              : message.error || (c.exit !== null && c.exit !== 0) ? "failed" : "completed");
+            c.duration = background || manageTask ? null : duration
+              ?? (!this.antigravityCalls && c.time > 0 && at >= c.time && (this.provider !== "timeline" || paired) ? at - c.time : null);
+            c.outputNode = node.id;
+            c.outputNodes ??= [];
+            if (!c.outputNodes.includes(node.id)) c.outputNodes.push(node.id);
+            const processId = taskId ?? /Process running with session ID\s+([a-zA-Z0-9_-]+)/.exec(head)?.[1];
+            if (background && processId) this.background.set(detachSlice(processId), c);
+            if (!background) for (const [id, command] of this.background) if (command === c) this.background.delete(id);
+          }
         }
       }
     }
@@ -281,10 +296,15 @@ export class ContextFold {
       }
     }
     if (kind === "write_stdin") command = this.background.get(String(args.session_id ?? ""));
+    const managed = this.antigravityCalls && name === "manage_task" ? {
+      action: detachSlice(text(args.Action ?? args.action).trim().toLowerCase(), 32),
+      taskId: detachSlice(text(args.TaskId ?? args.task_id), 160),
+    } : undefined;
+    if (managed?.action === "status" || managed?.action === "kill") command = this.background.get(managed.taskId);
     const skillPath = files.find((f) => /(?:^|[/\\])SKILL\.md$/i.test(f.path))?.path
       ?? (command && /\b(?:cat|sed|head|bat)\b/.test(command.command) ? command.command.match(/(?:^|\s)([^\s'"]*SKILL\.md)\b/)?.[1] : undefined);
     const skill = skillPath ? skillPath.replace(/[/\\]SKILL\.md$/i, "").split(/[/\\]/).at(-1) : /(?:^|[._])skill$/i.test(name) ? text(args.name) || "skill" : undefined;
-    if (message.callId) this.calls.set(message.callId, { node, command, files, skill: skill === undefined ? undefined : detachSlice(skill) });
+    if (message.callId) this.calls.set(message.callId, { node, command, files, managed, skill: skill === undefined ? undefined : detachSlice(skill) });
   }
 
   private responsePreview(boundary: number) {

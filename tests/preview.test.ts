@@ -46,9 +46,11 @@ describe("Retained image and current file previews", () => {
     await writeFile(join(root, "small.txt"), "text");
     const src = `data:image/png;base64,${payload.toString("base64")}`;
     const small = `data:image/png;base64,${Buffer.alloc(64 * 1024).toString("base64")}`;
+    const overDesktopThumb = `data:image/png;base64,${Buffer.alloc(6 * 1024 * 1024 + 1).toString("base64")}`;
     const service = { pricing: { refresh: vi.fn(async () => {}) }, agent: async () => ({}),
       load: async () => ({ agent: { cwd: root }, fold: { files: [] } }),
-      content: async (_id: string, node: number) => node === 0 ? src : small } as unknown as ContextService;
+      image: async (_id: string, node: number, _index: number, maxBytes: number) =>
+        imageUrlOf(node === 0 ? src : node === 1 ? small : overDesktopThumb, maxBytes) } as unknown as ContextService;
     const routes = new UiRoutes(service), paseo = {} as PaseoApi;
     const image = (options: { variant?: string; maxBytes?: number } = {}, node = 0) =>
       routes.rpc("api/paseo-context/image", { agentId: "a", attachmentId: `paseo-context-image:${node}`, ...options }, paseo);
@@ -57,8 +59,10 @@ describe("Retained image and current file previews", () => {
       await expect(image()).resolves.toBe(src);
       await expect(image({ variant: "full" })).resolves.toBe(src);
       await expect(image({ variant: "thumb" })).rejects.toThrow("2 MiB");
-      await expect(image({ variant: "thumb", maxBytes: payload.length })).resolves.toBe(src);
-      await expect(image({ variant: "thumb", maxBytes: Infinity })).resolves.toBe(src);
+      await expect(image({ variant: "thumb", maxBytes: 6 * 1024 * 1024 })).resolves.toBe(src);
+      await expect(image({ variant: "thumb", maxBytes: 2 * 1024 * 1024 })).rejects.toThrow("2 MiB");
+      await expect(image({ variant: "thumb", maxBytes: 20 * 1024 * 1024 }, 2)).rejects.toThrow("6 MiB");
+      await expect(image({ variant: "full", maxBytes: 20 * 1024 * 1024 }, 2)).resolves.toBe(overDesktopThumb);
       await expect(image({ maxBytes: 1 }, 1)).resolves.toBe(small);
       await expect(image({ maxBytes: 1 })).rejects.toThrow("0.0625 MiB");
       await expect(file("large.png", 2 * 1024 * 1024)).rejects.toThrow("2 MiB");

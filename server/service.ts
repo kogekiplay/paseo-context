@@ -2,7 +2,7 @@ import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 import { stat } from "node:fs/promises";
 import type { Agent, Request, Scope, Summary } from "../shared/contracts";
 import type { ContextFold } from "./fold";
-import { SessionReader, type ReadBodies } from "./reader";
+import { SessionReader, type ReadBodies, type ReadMedia } from "./reader";
 import { Pricing } from "./pricing";
 import { detachSlice, timestamp } from "./value";
 import { createHash } from "node:crypto";
@@ -10,10 +10,12 @@ import { ensureActive, nextCursor } from "./paging";
 import { TimelineReader, timelineFingerprint } from "./timeline";
 import type { NativeLocation } from "./native-paths";
 import type { NativeChild } from "./collaboration";
-import { antigravityConversationId } from "./antigravity-log";
+import { antigravityConversationId, antigravityPersistenceId } from "./antigravity-log";
 import { MIB, sessionReadBudget, type ReadBudget } from "./read-budget";
 import { RetainedCache, SESSION_IDLE_MS } from "./retained-cache";
 import { aggregateScope, overviewPage, sessionShard, type SessionShard } from "./corpus";
+import { imageUrlOf } from "./images";
+import { fleetResolver } from "./fleet-aliases";
 
 export { aggregate } from "./corpus";
 
@@ -25,7 +27,8 @@ const DERIVED_BYTES = 48 * MIB;
 const SUMMARY_BYTES = 16 * MIB;
 interface Reader {
   read(agent: Agent, location?: NativeLocation | null): Promise<{
-    entry: { fold: ContextFold }; bodies?: ReadBodies; residentBytes?: number; metadataOnly?: boolean; companionFailed?: boolean;
+    entry: { fold: ContextFold }; bodies?: ReadBodies; media?: ReadMedia; residentBytes?: number;
+    metadataOnly?: boolean; companionFailed?: boolean;
   } | null>;
   locate(agent: Agent): Promise<string | null>;
   locateSource?(agent: Agent): Promise<NativeLocation | null>;
@@ -41,6 +44,7 @@ export interface LoadedSession {
   revision: number;
   foldRevision?: number;
   bodies?: ReadBodies;
+  media?: ReadMedia;
   residentBytes?: number;
   companionFailed?: boolean;
 }
@@ -50,6 +54,13 @@ const identityOf = (raw: PaseoAgent) => {
   const sessionId = agentOf(raw).sessionId;
   return JSON.stringify([raw.provider, sessionId === null ? "agent" : "session", sessionId ?? raw.id]);
 };
+type AgentDirectory = ReadonlyMap<string, PaseoAgent>;
+const explicitParent = (raw: PaseoAgent, directory: AgentDirectory) => directory.get(raw.labels[PARENT]);
+
+function canClaimChild(parent: PaseoAgent, child: PaseoAgent, directory: AgentDirectory) {
+  const explicit = explicitParent(child, directory);
+  return !explicit || identityOf(explicit) === identityOf(parent);
+}
 interface FleetData {
   rootId: string;
   agents: Agent[];
@@ -74,9 +85,15 @@ interface Corpus {
 
 export function agentOf(a: PaseoAgent): Agent {
   const handle = a.persistence?.nativeHandle ?? a.persistence?.sessionId ?? a.runtimeInfo?.sessionId ?? null;
+  const sessionId = a.provider === "antigravity"
+    ? antigravityConversationId(a.persistence?.nativeHandle ?? null)
+      ?? antigravityConversationId(a.persistence?.sessionId ?? null)
+      ?? antigravityConversationId(a.runtimeInfo?.sessionId ?? null)
+      ?? antigravityPersistenceId(a.persistence?.metadata?.pluginProviderPersistence)
+    : handle;
   return { id: a.id, workspaceId: a.workspaceId ?? null, parentId: a.labels[PARENT] ?? null,
     title: a.title || a.id, cwd: a.cwd, provider: a.provider, model: a.runtimeInfo?.model ?? a.model ?? "",
-    sessionId: a.provider === "antigravity" ? antigravityConversationId(handle) ?? handle : handle,
+    sessionId,
     createdAt: timestamp(a.createdAt), updatedAt: timestamp(a.updatedAt),
     archived: !!a.archivedAt, running: a.status === "running" || a.status === "initializing" };
 }
@@ -114,6 +131,7 @@ export class ContextService {
   private overviewCacheRevision = "";
   private get closed() { return this.lifetime.signal.aborted; }
   private nativeMembers = new Map<string, PaseoAgent>();
+  private discoveredChildren = new Map<string, { revision: number; ids: Set<string> }>();
   private revisions = new Map<string, { fingerprint: string; revision: number }>();
   private serial = 0;
   // Only the source cache or an active caller owns the Entry/Frame. A derived
@@ -127,8 +145,9 @@ export class ContextService {
   private loading = new Map<string, Promise<LoadedSession>>();
   async directory(paseo: PaseoApi) {
     const agents = await listAgents(paseo, this.lifetime.signal);
-    const sessions = new Set(agents.map((raw) => `${raw.provider}:${agentOf(raw).sessionId}`));
-    return [...agents, ...[...this.nativeMembers.values()].filter((raw) => !sessions.has(`${raw.provider}:${agentOf(raw).sessionId}`))];
+    const ids = new Set(agents.map((raw) => raw.id)), sessions = new Set(agents.map(identityOf));
+    return [...agents, ...[...this.nativeMembers.values()].filter((raw) =>
+      !ids.has(raw.id) && !sessions.has(identityOf(raw)))];
   }
   async agent(id: string, paseo: PaseoApi) {
     ensureActive(this.lifetime.signal);
@@ -139,15 +158,32 @@ export class ContextService {
     if (!result) throw new Error("Agent is no longer available");
     return result.agent;
   }
-  async load(raw: PaseoAgent, paseo: PaseoApi, location?: NativeLocation | null): Promise<LoadedSession> {
+  async load(raw: PaseoAgent, paseo: PaseoApi, location?: NativeLocation | null, directory?: AgentDirectory): Promise<LoadedSession> {
     // Simultaneous surfaces share a read. Different agent metadata must never
     // inherit an in-flight result from an older snapshot.
     const key = JSON.stringify([agentOf(raw), raw.lastUsage, this.pricing.revision]);
-    const busy = this.loading.get(key);
-    if (busy) return busy;
-    const pending = this.loadSession(raw, paseo, key, location);
-    this.loading.set(key, pending);
-    try { return await pending; } finally { if (this.loading.get(key) === pending) this.loading.delete(key); }
+    let pending = this.loading.get(key);
+    if (!pending) {
+      pending = this.loadSession(raw, paseo, key, location);
+      this.loading.set(key, pending);
+    }
+    try {
+      const data = await pending;
+      const known = this.discoveredChildren.get(raw.id);
+      if (!directory && (!known || known.revision < data.revision)) {
+        for (const child of data.fold.collaboration.children.values()) {
+          if (!child.paseoAgent) continue;
+          const listed = await listAgents(paseo, this.lifetime.signal).catch(() => {
+            ensureActive(this.lifetime.signal);
+            return [];
+          });
+          directory = new Map([...this.nativeMembers, ...listed.map((agent) => [agent.id, agent] as const)]);
+          break;
+        }
+      }
+      if (directory || known?.revision !== data.revision) this.replaceChildEdges(data, directory);
+      return data;
+    } finally { if (this.loading.get(key) === pending) this.loading.delete(key); }
   }
   private async loadSession(raw: PaseoAgent, paseo: PaseoApi, key: string, location?: NativeLocation | null): Promise<LoadedSession> {
     ensureActive(this.lifetime.signal);
@@ -164,7 +200,9 @@ export class ContextService {
         return data;
       }
     }
-    for (const child of fold.collaboration.children.values()) this.rememberChild(raw, child);
+    for (const child of fold.collaboration.children.values()) {
+      if (!child.paseoAgent) this.rememberChild(raw, child);
+    }
     const summary = fold.summary(agent, native ? "native" : "timeline");
     const last = raw.lastUsage;
     if (last?.contextWindowMaxTokens !== undefined) summary.contextWindow = last.contextWindowMaxTokens;
@@ -192,7 +230,8 @@ export class ContextService {
     }
     const bytes = native?.residentBytes ?? (timeline ? this.timeline.weight(timeline) : fold.residentBytes);
     const data: LoadedSession = { agent, fold, summary, requests, revision, foldRevision: fold.revision, residentBytes: bytes,
-      bodies: native?.bodies ?? (timeline ? this.timeline.bodyReader(timeline) : undefined), companionFailed: native?.companionFailed };
+      bodies: native?.bodies ?? (timeline ? this.timeline.bodyReader(timeline) : undefined), media: native?.media,
+      companionFailed: native?.companionFailed };
     const weight = 1024 + requests.length * 192 + (summary.intervals?.length ?? 0) * 64
       + summary.activity.reduce((total, day) => total + 128 + 64 * (day.tools.length + day.skills.length + day.programs.length), 0);
     if (this.derived.set(agent.id, { source: new WeakRef(source), key }, weight)) {
@@ -222,6 +261,18 @@ export class ContextService {
     }
     return contents;
   }
+  async image(id: string, nodeId: number, index: number, maxBytes: number, paseo: PaseoApi) {
+    const data = await this.load(await this.agent(id, paseo), paseo);
+    const node = data.fold.nodes[nodeId];
+    if (!node || index >= (node.images ?? 1)) return null;
+    if (data.agent.provider === "antigravity" && node.images && data.media) return data.media(nodeId, index, maxBytes);
+    if (index === 0) {
+      const value = (await this.contents(data, [nodeId])).get(nodeId);
+      const inline = imageUrlOf(value, maxBytes);
+      if (inline) return inline;
+    }
+    return null;
+  }
   async summary(raw: PaseoAgent, paseo: PaseoApi) {
     return (await this.shard(raw, paseo)).summary;
   }
@@ -234,13 +285,15 @@ export class ContextService {
     const key = JSON.stringify([agent, raw.lastUsage, path, source?.dev, source?.ino, source?.size,
       source?.mtimeMs, source?.ctimeMs, location?.antigravity?.database?.fingerprint, this.pricing.revision]);
     const ttl = path ? 600_000 : 15_000;
-    const valid = (entry: SessionShard | undefined): entry is SessionShard => entry?.key === key && !entry.retry && Date.now() - entry.at < ttl;
+    const transient = location?.antigravity?.database?.fingerprint === "";
+    const valid = (entry: SessionShard | undefined): entry is SessionShard =>
+      !transient && entry?.key === key && !entry.retry && Date.now() - entry.at < ttl;
     if (valid(previous)) return previous;
     const cached = this.summaries.get(raw.id);
     if (valid(cached)) return cached;
     const data = await this.load(raw, paseo, location);
     const value = sessionShard(data.summary, data.requests, key, Date.now(), data.companionFailed);
-    if (!this.closed) this.summaries.set(raw.id, value, value.bytes);
+    if (!this.closed && !transient) this.summaries.set(raw.id, value, value.bytes);
     return value;
   }
   async overview(scope: Scope, offset: number, paseo: PaseoApi) {
@@ -402,17 +455,94 @@ export class ContextService {
     return agent;
   }
 
+  private replaceChildEdges(data: LoadedSession, directory?: AgentDirectory) {
+    const { agent, fold, revision } = data;
+    const previous = this.discoveredChildren.get(agent.id);
+    if (previous && previous.revision > revision) return;
+    const ids = new Set<string>();
+    const parent = directory?.get(agent.id);
+    for (const child of fold.collaboration.children.values()) {
+      if (!child.paseoAgent || child.sessionId === agent.id) continue;
+      const existing = directory?.get(child.sessionId);
+      if (directory && existing && parent && canClaimChild(parent, existing, directory)) ids.add(child.sessionId);
+      if (ids.size === 512) break;
+    }
+    if (!previous && !ids.size && agent.provider !== "antigravity") return;
+    this.discoveredChildren.delete(agent.id);
+    this.discoveredChildren.set(agent.id, { revision, ids });
+    let size = 0;
+    for (const children of this.discoveredChildren.values()) size += Math.max(1, children.ids.size);
+    for (const [parent, children] of this.discoveredChildren) {
+      if (size <= 512) break;
+      size -= Math.max(1, children.ids.size);
+      this.discoveredChildren.delete(parent);
+    }
+  }
+
   async fleet(id: string, paseo: PaseoApi, options?: { details?: boolean; seed?: LoadedSession }): Promise<FleetData> {
     const signal = this.lifetime.signal;
     const listed = await listAgents(paseo, signal);
-    const directory = new Map([...listed, ...this.nativeMembers.values()].map((agent) => [agent.id, agent]));
+    const listedById = new Map(listed.map((agent) => [agent.id, agent]));
+    const directory = new Map([...this.nativeMembers, ...listedById]);
     const selected = directory.get(id);
     if (!selected) throw new Error("Agent is no longer available");
+    for (const [parentId, edge] of this.discoveredChildren) {
+      const parent = directory.get(parentId);
+      if (!parent) continue;
+      for (const id of edge.ids) {
+        const child = directory.get(id);
+        if (!child || !canClaimChild(parent, child, directory)) edge.ids.delete(id);
+      }
+    }
     let root = selected;
     const visited = new Set<string>();
-    while (root.labels[PARENT] && directory.has(root.labels[PARENT]) && !visited.has(root.id)) {
+    let staged: LoadedSession | undefined;
+    const inspected = new Set<string>();
+    const loadMember = async (raw: PaseoAgent) => {
+      const seed = staged?.agent.id === raw.id ? staged : options?.seed;
+      const latest = this.revisions.get(raw.id)?.revision;
+      if (seed?.agent.id === raw.id && (latest === undefined || latest <= seed.revision)
+        && (seed.foldRevision === undefined || seed.foldRevision === seed.fold.revision)) {
+        this.replaceChildEdges(seed, directory);
+        return seed;
+      }
+      return this.load(raw, paseo, undefined, directory);
+    };
+    let searches = 8;
+    while (!visited.has(root.id)) {
       visited.add(root.id);
-      root = directory.get(root.labels[PARENT])!;
+      const explicit = explicitParent(root, directory);
+      if (explicit) {
+        if (visited.has(explicit.id)) break;
+        root = explicit;
+        continue;
+      }
+      const matches = async (candidate: PaseoAgent) => {
+        inspected.add(candidate.id);
+        try {
+          const data = await loadMember(candidate);
+          if (!data.fold.collaboration.child(root.id, true)) return false;
+          staged = data;
+          return true;
+        } catch { ensureActive(signal); return false; }
+      };
+      let parent: PaseoAgent | undefined;
+      for (const [parentId, edge] of this.discoveredChildren) {
+        const candidate = directory.get(parentId);
+        if (candidate && !visited.has(parentId) && edge.ids.has(root.id) && await matches(candidate)) { parent = candidate; break; }
+      }
+      if (!parent && searches) {
+        const candidates = listed.filter((candidate) => candidate.provider === "antigravity" && !visited.has(candidate.id)
+          && !inspected.has(candidate.id) && timestamp(candidate.createdAt) <= timestamp(root.createdAt)
+          && (candidate.workspaceId ?? null) === (root.workspaceId ?? null))
+          .sort((a, b) => timestamp(b.updatedAt) - timestamp(a.updatedAt));
+        for (const candidate of candidates.slice(0, searches)) {
+          searches--;
+          if (await matches(candidate)) { parent = candidate; break; }
+        }
+      }
+      if (!parent) break;
+      root = parent;
     }
 
     const canonical = new Map<string, PaseoAgent>([[identityOf(root), root]]);
@@ -449,19 +579,28 @@ export class ContextService {
       agents.push(agent);
       const descendants = children.get(raw.id) ?? [];
       try {
-        const seed = options?.seed;
-        const data = seed?.agent.id === raw.id && (seed.foldRevision === undefined || seed.foldRevision === seed.fold.revision)
-          ? seed : await this.load(raw, paseo);
+        const data = await loadMember(raw);
         ensureActive(signal);
         const summary = { ...data.summary, agent: { ...data.summary.agent, parentId: parent } };
         members.push(summary);
         if (options?.details) loaded.set(raw.id, { ...data, agent, summary });
         for (const child of data.fold.collaboration.children.values()) {
+          if (child.paseoAgent) {
+            const existing = listedById.get(child.sessionId);
+            if (existing && canClaimChild(raw, existing, directory)) descendants.push(canonical.get(identityOf(existing))!);
+            continue;
+          }
+          const key = JSON.stringify([raw.provider, "session", child.sessionId]);
+          const existing = canonical.get(key);
+          if (existing) {
+            descendants.push(existing);
+            continue;
+          }
           const native = this.rememberChild(raw, child);
-          const key = identityOf(native), primary = canonical.get(key) ?? native;
-          canonical.set(key, primary);
-          aliases.set(native.id, primary.id);
-          descendants.push(primary);
+          canonical.set(key, native);
+          directory.set(native.id, native);
+          aliases.set(native.id, native.id);
+          descendants.push(native);
         }
       } catch {
         ensureActive(signal);
@@ -478,9 +617,10 @@ export class ContextService {
   }
   async collaboration(id: string, paseo: PaseoApi) {
     const family = await this.fleet(id, paseo, { details: true }), records = [];
+    const resolve = fleetResolver(family.agents, family.aliases);
     for (const { fold, agent } of family.loaded.values()) for (const record of fold.collaboration.records) {
-      records.push({ ...record, agentId: agent.id,
-        to: family.aliases.get(record.to) ?? family.aliases.get(nativeId(agent.provider, record.to)) ?? record.to });
+      const { paseoAgent, ...visible } = record;
+      records.push({ ...visible, agentId: agent.id, to: resolve(record.to, agent.provider, paseoAgent) });
     }
     return { records: records.sort((a, b) => a.time - b.time), failed: family.failed };
   }
@@ -489,7 +629,7 @@ export class ContextService {
     clearTimeout(this.corpusTimer);
     this.corpusTimer = undefined;
     this.reader.clear(); this.timeline.clear(); this.pricing.clear();
-    this.summaries.clear(); this.nativeMembers.clear(); this.revisions.clear(); this.derived.clear(); this.loading.clear();
+    this.summaries.clear(); this.nativeMembers.clear(); this.discoveredChildren.clear(); this.revisions.clear(); this.derived.clear(); this.loading.clear();
     this.overviewCache.clear(); this.refreshIssues = []; this.corpus = null; this.scanning = null;
     this.corpusBusy = null;
   }

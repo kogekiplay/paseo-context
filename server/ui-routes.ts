@@ -10,7 +10,7 @@ import { Metadata } from "./metadata";
 import type { PublicCache } from "./public-cache";
 import { UiFleet } from "./ui-fleet";
 import { uiDocument } from "./assets";
-import { imageByteLimit, imageUrlOf } from "./images";
+import { imageByteLimit } from "./images";
 import { MAX_IMAGE_THUMB_BYTES } from "../shared/limits";
 import { previewFile } from "./files";
 import { statisticsOf } from "./statistics";
@@ -19,6 +19,8 @@ import { grammarOf } from "./grammars";
 import { createHash } from "node:crypto";
 import { dayKeyOf, startOfDayKey } from "../shared/core/days";
 import { historyPage, historyPart } from "./history";
+
+const MAX_IMAGE_THUMB_REQUEST_BYTES = 6 * 1024 * 1024;
 
 export class UiRoutes {
   private metadata: Metadata;
@@ -111,7 +113,14 @@ export class UiRoutes {
       const content = outputIds.map((id) => bodies.get(id)).join("\n");
       const records: unknown[] = [];
       const ev = (type: string, data: unknown) => ({ event: { type, seq, data } });
-      const image = node.images ? { type: "image", attachment: { attachmentId: `paseo-context-image:${node.id}`, name: "Image" } } : null;
+      const images = Array.from({ length: node.images ?? 0 }, (_, index) => ({
+        type: "image", attachment: {
+          attachmentId: `paseo-context-image:${node.id}${node.images === 1 ? "" : `:${index}`}`, name: "Image",
+        },
+      }));
+      // Other native normalizers represent inline image data in its own block.
+      const blocks = !images.length || data.agent.provider === "antigravity" && content
+        ? [{ type: "text", text: content }, ...images] : images;
       if (node.category === "system") records.push(ev("system/message", { message: { content: [{ type: "text", text: content }] } }));
       else if (node.category === "tools") {
         let tool: unknown; try { tool = JSON.parse(content); } catch { tool = { name: node.title, description: content }; }
@@ -121,12 +130,12 @@ export class UiRoutes {
         if (call) records.push({ event: { type: "tool/call", seq: nodeSeq(data.fold, call.id), data: {
           callId, name: call.tool, arguments: bodies.get(call.id),
         } } });
-        records.push(ev("tool/result", { message: { toolCallId: callId, isError: node.error === true || command?.status === "failed", content: [{ type: "text", text: content }] } }));
+        records.push(ev("tool/result", { message: { toolCallId: callId, isError: node.error === true || command?.status === "failed", content: blocks } }));
       } else if (node.category === "assistant" || node.category === "reasoning" || node.category === "calls") {
-        records.push(ev("assistant/message", { message: { content: [image ?? (node.category === "calls"
-          ? { type: "tool-call", name: node.tool, arguments: content }
-          : { type: node.category === "reasoning" ? "reasoning" : "text", text: content })] } }));
-      } else records.push(ev("user/message", { content: [image ?? { type: "text", text: content }] }));
+        const assistant = node.category === "calls" ? [{ type: "tool-call", name: node.tool, arguments: content }]
+          : node.category === "reasoning" ? [{ type: "reasoning", text: content }] : blocks;
+        records.push(ev("assistant/message", { message: { content: assistant } }));
+      } else records.push(ev("user/message", { content: blocks }));
       return { records };
     }
     const name = route.replace(/^api\/paseo-context\//, "");
@@ -146,10 +155,13 @@ export class UiRoutes {
     }
     if (name === "image") {
       if (!id) throw new Error("An agent is required");
-      const match = /^paseo-context-image:(\d+)$/.exec(text(body.attachmentId));
-      if (!match) throw new Error("Unknown image");
-      const maxBytes = imageByteLimit(body.maxBytes, body.variant === "thumb" ? MAX_IMAGE_THUMB_BYTES : undefined);
-      const url = imageUrlOf(await this.service.content(id, Number(match[1]), paseo), maxBytes);
+      const match = /^paseo-context-image:(\d+)(?::(\d+))?$/.exec(text(body.attachmentId));
+      const nodeId = Number(match?.[1]), index = Number(match?.[2] ?? 0);
+      if (!Number.isSafeInteger(nodeId) || !Number.isSafeInteger(index)) throw new Error("Unknown image");
+      const maxBytes = body.variant === "thumb"
+        ? Math.min(MAX_IMAGE_THUMB_REQUEST_BYTES, imageByteLimit(body.maxBytes, MAX_IMAGE_THUMB_BYTES))
+        : imageByteLimit(body.maxBytes);
+      const url = await this.service.image(id, nodeId, index, maxBytes, paseo);
       if (!url) throw new Error("Image bytes were not retained in this session");
       return url;
     }

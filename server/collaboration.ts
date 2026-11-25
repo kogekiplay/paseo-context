@@ -1,9 +1,11 @@
 import type { CollaborationRecord } from "../shared/contracts";
 import type { Message } from "./normalize";
+import { stripAntigravityEnvelope } from "./antigravity-log";
 import { detachSlice, parseArgs, printable, record, stringBytes, text, type RecordValue } from "./value";
 import { askOf, workflowLabel, type EmitWorkflow } from "./workflow";
 import { notePlan, type TaskStatus } from "./workflow-plan";
-import { dispatchedChildId, dispatchAcknowledged, goalToolEvent, resultHeader, taskAcknowledged, workflowResultFailed } from "./workflow-result";
+import { dispatchedChildId, dispatchAcknowledged, goalToolEvent, prefixedWorkflowResult, resultHeader, taskAcknowledged,
+  workflowResultFailed } from "./workflow-result";
 
 export interface CapturedTask {
   id: string; subject: string; description: string; status: TaskStatus; blockedBy: string[];
@@ -17,30 +19,50 @@ interface TaskUpdate {
 export interface NativeChild {
   sessionId: string; title: string; time: number; status: string;
   mode?: "one-shot" | "continuable";
+  paseoAgent?: boolean;
 }
 export type FleetRecord = Omit<CollaborationRecord, "agentId"> & {
   from?: string; textLength?: number; contentKind?: "message" | "report" | "delegation-result";
+  paseoAgent?: boolean;
 };
 interface Pending {
   nodeId: number; title: string; tool: string; kind: "delegation" | "message" | "task" | "wait" | "goal";
   updates?: TaskUpdate[]; snapshot?: string; mode?: NativeChild["mode"]; synchronous?: boolean;
-  dispatched?: boolean; childSessionId?: string; objective?: string;
+  dispatched?: boolean; childSessionId?: string; objective?: string; paseoAgent?: boolean;
 }
 const strings = (value: unknown): string[] =>
   Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
-const taskStatus = (value: unknown): TaskUpdate["status"] =>
+const taskStatus = (value: unknown) =>
   value === "pending" || value === "in_progress" || value === "completed" || value === "deleted" ? value : undefined;
 const taskId = (value: unknown): string => typeof value === "number" ? String(value) : text(value);
+const childKey = (id: string, paseoAgent?: boolean) => paseoAgent ? `paseo:${id}` : id;
 const childId = (value: RecordValue): string =>
   text(value.agent_id ?? value.agentId ?? value.session_id ?? value.sessionId);
-export function delegationTextOf(content: string): string {
-  const value = parseArgs(content);
-  return printable(value.result ?? value.output ?? value.message ?? value.content) || content;
+function collaborationResult(content: string, antigravity: boolean, accept?: (candidate: RecordValue) => boolean) {
+  const body = antigravity ? stripAntigravityEnvelope(content) : content;
+  return { body, result: antigravity ? prefixedWorkflowResult(body, accept) : parseArgs(body) };
+}
+
+export function delegationTextOf(content: string, antigravity = false): string {
+  const { body, result } = collaborationResult(content, antigravity);
+  return printable(result.result ?? result.output ?? result.message ?? result.content) || body;
 }
 
 /** Only explicit terminal agent states are reports; tool acknowledgements are not. */
-export function agentReportsOf(content: string): Array<{ from: string; text: string; status: "completed" | "failed" }> {
-  const result = parseArgs(content), reports: Array<{ from: string; text: string; status: "completed" | "failed" }> = [];
+export function agentReportsOf(content: string, antigravity = false): Array<{ from: string; text: string; status: "completed" | "failed" }> {
+  return agentReports(collaborationResult(content, antigravity, hasAgentReport).result);
+}
+
+function hasAgentReport(result: RecordValue) {
+  return Boolean(childId(result) && (result.status === "completed" || result.status === "failed"))
+    || Object.values(record(result.status)).some((value) => {
+      const state = record(value);
+      return state.completed !== undefined || state.errored !== undefined || state.error !== undefined;
+    });
+}
+
+function agentReports(result: RecordValue): ReturnType<typeof agentReportsOf> {
+  const reports: ReturnType<typeof agentReportsOf> = [];
   for (const [from, value] of Object.entries(record(result.status))) {
     const state = record(value);
     if (state.completed !== undefined) reports.push({ from, text: printable(state.completed), status: "completed" });
@@ -62,6 +84,10 @@ export class CollaborationLedger {
   readonly tasks = new Map<string, CapturedTask>();
   private pending = new Map<string, Pending>();
 
+  constructor(private readonly antigravity = false) {}
+
+  child(id: string, paseoAgent?: boolean) { return this.children.get(childKey(id, paseoAgent)); }
+
   get residentBytes() {
     const stringsBytes = (values?: string[]) => values?.reduce((n, value) => n + 8 + stringBytes(value), 32) ?? 0;
     const taskBytes = (task: TaskUpdate) => 256 + stringBytes(task.id) + stringBytes(task.subject) + stringBytes(task.description)
@@ -81,6 +107,18 @@ export class CollaborationLedger {
   }
 
   private tasksOf(args: RecordValue, tool: string, nodeId: number): Pick<Pending, "updates" | "snapshot"> {
+    if (tool === "update_steps") {
+      if (!Array.isArray(args.steps)) return {};
+      const rows = args.steps.map(record), ids = new Set(rows.map((row) => taskId(row.id)));
+      return { snapshot: "plan", updates: rows.map((row, index) => {
+        const explicit = taskId(row.id);
+        let id = explicit || `plan-${index}`;
+        if (!explicit) while (ids.has(id)) id += "-unnamed";
+        const status = row.status === "done" ? "completed" : row.status === "pending" || row.status === "in_progress"
+          ? row.status : row.status === "skipped" ? "canceled" : row.status === "failed" ? "failed" : "deleted";
+        return { id: detachSlice(id), unkeyed: !explicit, group: "plan", owner: "@self", subject: detachSlice(text(row.title)), status };
+      }) };
+    }
     const list = Array.isArray(args.plan) ? args.plan : Array.isArray(args.todos) ? args.todos : null;
     if (list) {
       const group = tool.includes("todo") ? "todos" : "plan";
@@ -143,35 +181,44 @@ export class CollaborationLedger {
   }
   apply(message: Message, nodeId: number, at: number, emit?: EmitWorkflow) {
     if (message.category === "calls") {
-      const tool = (message.tool ?? "").split(".").at(-1)!.replace(/^mcp__.*?__/, "").toLowerCase();
+      const fullTool = message.tool ?? "";
+      const tool = fullTool.split(".").at(-1)!.replace(/^mcp__.*?__/, "").toLowerCase();
+      const nativeDelegation = this.antigravity && fullTool === "invoke_subagent";
+      const nativeSteps = this.antigravity && fullTool === "update_steps";
+      const paseoTool = /(?:^paseo\.|(?:^|\.)mcp(?:_paseo_|__paseo__))(create_agent|send_agent_prompt)$/i.exec(fullTool)?.[1]?.toLowerCase();
+      const paseoAgent = paseoTool ? true : nativeDelegation || this.antigravity && fullTool === "send_message" ? false : undefined;
       if (emit && ["ask_user_question", "askuserquestion", "ask_question", "request_user_input"].includes(tool)) {
         const event = askOf(message.args ?? parseArgs(message.text));
         if (event) emit(event);
       }
-      const kind = message.delegation || /(?:spawn_agent|create_agent|delegate|^task$|^agent$)/.test(tool) ? "delegation"
-        : /(?:send_input|send_message|sendmessage|agent_send|message_agent)/.test(tool) ? "message"
-        : /(?:task_create|taskcreate|task_update|taskupdate|update_plan|todowrite)/.test(tool) ? "task"
+      const kind = nativeDelegation || message.delegation || /(?:spawn_agent|create_agent|delegate|^task$|^agent$)/.test(tool) ? "delegation"
+        : paseoTool === "send_agent_prompt" || /(?:send_input|send_message|sendmessage|agent_send|message_agent)/.test(tool) ? "message"
+        : nativeSteps || /(?:task_create|taskcreate|task_update|taskupdate|update_plan|todowrite)/.test(tool) ? "task"
         : /^(?:create_goal|update_goal|complete_goal)$/.test(tool) ? "goal"
         : /^(?:wait|wait_agent|wait_agents)$/.test(tool) ? "wait" : null;
       if (!kind) return;
       const args = message.args ?? parseArgs(message.text);
-      const title = text(message.delegation?.description ?? args.message ?? args.content ?? args.prompt ?? args.description ?? args.subject ?? args.explanation) || tool;
+      const title = text(message.delegation?.description ?? args.message ?? args.content ?? args.prompt ?? args.description
+        ?? args.subject ?? args.explanation) || text(args.title) || text(args.initialPrompt) || tool;
       const preview = detachSlice(title, 500);
       const childSessionId = message.delegation ? dispatchedChildId({ childSessionId: message.delegation.childId }) : "";
-      const to = childSessionId || text(args.agent_id ?? args.recipient ?? args.to ?? args.id ?? args.target)
+      const to = childSessionId || text(args.agent_id ?? args.recipient ?? args.to ?? args.id ?? args.target ?? args.agentId)
         || (args.type === "broadcast" ? "*" : "");
       const pending: Pending = { nodeId, title: preview, tool, kind,
+        ...(paseoAgent === undefined ? {} : { paseoAgent }),
         ...(kind === "task" ? this.tasksOf(args, tool, nodeId) : {}),
         ...(kind === "goal" ? { objective: workflowLabel(text(args.objective)) } : {}),
-        ...(kind === "delegation" ? { mode: args.mode === "one-shot" || args.mode === "continuable" ? args.mode
-          : tool === "task" || tool === "agent" ? "one-shot" : "continuable",
+        ...(kind === "delegation" ? { mode: nativeDelegation ? "continuable"
+          : args.mode === "one-shot" || args.mode === "continuable" ? args.mode
+            : tool === "task" || tool === "agent" ? "one-shot" : "continuable",
           ...(childSessionId ? { childSessionId } : {}),
           synchronous: !message.delegation && (tool === "task" || tool === "agent") && args.run_in_background !== true } : {}) };
       if (kind !== "wait" && kind !== "goal") {
         const status = taskStatus(args.status);
-        this.records.push({ id: `${nodeId}`, nodeId, time: at, kind, title: preview, to,
+        this.records.push({ id: `${nodeId}`, nodeId, time: at, kind, title: preview, to: detachSlice(to),
           taskId: taskId(args.taskId ?? args.task_id), status: status === "deleted" ? "unknown" : status ?? "unknown",
           blockedBy: strings(args.blockedBy), textLength: title.length,
+          ...(paseoAgent === undefined ? {} : { paseoAgent }),
           ...(kind === "message" ? { contentKind: "message" as const } : {}) });
       }
       if (message.delegation?.running && childSessionId) {
@@ -183,14 +230,18 @@ export class CollaborationLedger {
     } else if (message.category === "tool" && message.callId && !message.pending) {
       const pending = this.pending.get(message.callId);
       if (!pending) return;
-      const result = parseArgs(message.text), call = this.records.find((r) => r.nodeId === pending.nodeId);
-      const header = resultHeader(message.text);
+      const native = pending.paseoAgent === false && pending.tool === "invoke_subagent";
+      const accept = pending.kind === "wait" ? hasAgentReport
+        : pending.kind === "delegation" ? (candidate: RecordValue) => Boolean(dispatchedChildId(candidate, "", native)) : undefined;
+      const { body, result } = collaborationResult(message.text, this.antigravity, accept);
+      const call = this.records.find((r) => r.nodeId === pending.nodeId), header = resultHeader(body);
       const failed = message.error === true || workflowResultFailed(result, header);
       if (failed && call) call.status = "failed";
       if (pending.kind === "delegation" && !failed) {
-        const id = dispatchedChildId(result, header);
+        const id = dispatchedChildId(result, header, native);
         if (id) {
-          this.children.set(id, { sessionId: id, title: detachSlice(pending.title, 180), time: at, status: "unknown", mode: pending.mode });
+          this.children.set(childKey(id, pending.paseoAgent), { sessionId: id, title: detachSlice(pending.title, 180), time: at, status: "unknown", mode: pending.mode,
+            ...(pending.paseoAgent === undefined ? {} : { paseoAgent: pending.paseoAgent }) });
           if (call) call.to = id;
         }
         const child = id || pending.childSessionId;
@@ -206,18 +257,20 @@ export class CollaborationLedger {
         if (event) emit(event);
       }
       if (pending.kind === "wait" || pending.kind === "delegation") {
-        const reports = agentReportsOf(message.text);
+        const reports = agentReports(result);
         const synchronous = pending.synchronous && call?.to && !failed && result.isAsync !== true
           && result.status !== "running" && result.status !== "pending";
         const delegationResult = synchronous && reports.length === 0;
         if (delegationResult) {
-          reports.push({ from: call.to, text: delegationTextOf(message.text), status: "completed" });
+          reports.push({ from: call.to, text: printable(result.result ?? result.output ?? result.message ?? result.content) || body,
+            status: "completed" });
         }
         for (const report of reports) {
           this.records.push({ id: `${nodeId}:${report.from}`, nodeId, time: at, kind: "report", from: report.from,
             title: detachSlice(report.text, 500), to: "", taskId: "", status: report.status, blockedBy: [],
+            ...(pending.paseoAgent === undefined ? {} : { paseoAgent: pending.paseoAgent }),
             textLength: report.text.length, contentKind: delegationResult ? "delegation-result" : "report" });
-          const child = this.children.get(report.from);
+          const child = this.child(report.from, pending.paseoAgent);
           if (child) child.status = report.status;
         }
       }

@@ -5,6 +5,8 @@ import { agentReportsOf, delegationTextOf, type CapturedTask, type FleetRecord }
 import type { ContextService } from "./service";
 import { nodeSeq, rowOf, upstreamOf } from "./upstream";
 import { detachSlice, parseArgs, text } from "./value";
+import { antigravityArgs } from "./antigravity-log";
+import { fleetResolver } from "./fleet-aliases";
 import { PaseoSubtasks, type PaseoSubtask } from "./subtasks";
 
 type Loaded = Awaited<ReturnType<ContextService["load"]>>;
@@ -43,17 +45,7 @@ async function mapBounded<T, U>(values: readonly T[], read: (value: T) => Promis
 }
 
 function resolverOf(family: FleetRead) {
-  const aliases = new Map(family.aliases), names = new Map<string, string | null>();
-  for (const agent of family.agents) {
-    aliases.set(agent.id, agent.id);
-    if (agent.sessionId) {
-      aliases.set(`${agent.provider}:${agent.sessionId}`, agent.id);
-      aliases.set(`native:${agent.provider}:${agent.sessionId}`, agent.id);
-    }
-    names.set(agent.title, names.has(agent.title) ? null : agent.id);
-  }
-  return (value: string, provider: string): string =>
-    aliases.get(value) ?? aliases.get(`${provider}:${value}`) ?? names.get(value) ?? value;
+  return fleetResolver(family.agents, family.aliases);
 }
 
 const compareMessages = (a: MessageSource, b: MessageSource) => a.record.time - b.record.time
@@ -66,14 +58,14 @@ function sourcesOf(family: FleetRead) {
   for (const data of family.loaded.values()) for (const entry of data.fold.collaboration.records) {
     if (entry.kind !== "message" && entry.kind !== "report") continue;
     if (entry.kind === "message" && entry.status === "failed") continue;
-    const from = entry.kind === "report" && entry.from ? resolve(entry.from, data.agent.provider) : data.agent.id;
+    const from = entry.kind === "report" && entry.from ? resolve(entry.from, data.agent.provider, entry.paseoAgent) : data.agent.id;
     const source = { data, record: entry, from, order: order++ };
     if (entry.kind === "message" && entry.to === "*") {
       broadcasts.push(source);
       sent.set(from, (sent.get(from) ?? 0) + 1);
       continue;
     }
-    const recipient = entry.kind === "report" ? data.agent.id : entry.to ? resolve(entry.to, data.agent.provider) : "";
+    const recipient = entry.kind === "report" ? data.agent.id : entry.to ? resolve(entry.to, data.agent.provider, entry.paseoAgent) : "";
     if (!recipient) continue;
     const rows = incoming.get(recipient);
     if (rows) rows.push(source); else incoming.set(recipient, [source]);
@@ -131,7 +123,7 @@ export function teamOfFleet(family: FleetRead): AgentTeam {
     const source = family.loaded.get(agentId);
     const assignment = source?.fold.collaboration.records.find((row) => source.fold.nodes[row.nodeId]?.callId === task.callId);
     const childId = task.childId || assignment?.to;
-    const owner = childId ? resolve(childId, provider) : undefined;
+    const owner = childId ? resolve(childId, provider, assignment?.paseoAgent) : undefined;
     tasks.push({ id: `${agentId}:subtask:${task.callId}`, subject: task.subject, description: task.description,
       status: task.status, blockedBy: [], writeScopes: [], ready: false, warnings: [],
       ...(owner && family.agents.some((agent) => agent.id === owner) ? { ownerId: owner } : owner ? { ownerName: owner } : {}) });
@@ -244,19 +236,20 @@ export class UiFleet {
   private delegations(family: FleetRead, data: Loaded): FleetDelegation[] {
     const resolve = resolverOf(family);
     return data.fold.collaboration.records.filter((r) => r.kind === "delegation" && r.to && r.status !== "failed").map((r): FleetDelegation => {
-      const to = resolve(r.to, data.agent.provider);
-      const child = data.fold.collaboration.children.get(r.to);
+      const to = resolve(r.to, data.agent.provider, r.paseoAgent);
+      const child = data.fold.collaboration.child(r.to, r.paseoAgent);
       return { seq: nodeSeq(data.fold, r.nodeId), time: r.time, to, mode: child?.mode ?? "unknown", label: r.title };
     });
   }
   private messageText(source: MessageSource, value: string): string {
-    if (source.record.contentKind === "delegation-result") return delegationTextOf(value);
+    const antigravity = source.data.fold.provider === "antigravity";
+    if (source.record.contentKind === "delegation-result") return delegationTextOf(value, antigravity);
     if (source.record.contentKind === "report") {
-      const report = agentReportsOf(value).find((r) => r.from === source.record.from);
+      const report = agentReportsOf(value, antigravity).find((r) => r.from === source.record.from);
       if (!report) throw new Error("Agent report is no longer available");
       return report.text;
     }
-    const args = parseArgs(value);
+    const args = antigravity ? antigravityArgs(value) : parseArgs(value);
     return text(args.message ?? args.content ?? args.prompt ?? args.description ?? args.subject ?? args.explanation) || value;
   }
   private async bodies(data: Loaded, ids: number[], paseo: PaseoApi) {

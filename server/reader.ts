@@ -8,8 +8,8 @@ import { NativePaths, type NativeLocation, type NativeRoots } from "./native-pat
 import { messagesOf } from "./normalize";
 import { antigravityStepIndex, type AntigravityStep } from "./antigravity-log";
 import type { AntigravitySnapshot } from "./antigravity-db";
-import { detachSlice, record, stringBytes } from "./value";
-import { MIB, sessionReadBudget, type ReadBudget } from "./read-budget";
+import { detachSlice, record, stringBytes, type RecordValue } from "./value";
+import { MIB, sessionReadBudget, type AccountRead, type ReadBudget } from "./read-budget";
 import { RetainedCache } from "./retained-cache";
 
 const BOUNDARY_BYTES = 4_096;
@@ -27,13 +27,14 @@ interface Entry extends FileIdentity, FoldEntry {
   offset: number; tail: Buffer; tailOffset: number; finalized: boolean;
   locations: Location[]; boundary?: Boundary; valid: boolean;
   mtimeMs: number; ctimeMs: number;
-  companion?: { fingerprint?: string; applied: AppliedMetadata[]; bytes: number };
+  companion?: { contentKey?: string; applied: AppliedMetadata[]; bytes: number };
 }
-interface DatabaseEntry extends FoldEntry { fingerprint: string }
+interface DatabaseEntry extends FoldEntry { contentKey: string }
 export type ReadBodies = <T>(ids: readonly number[], project: (id: number, body: string) => T) => Promise<Map<number, T>>;
+export type ReadMedia = (id: number, index: number, maxBytes: number) => Promise<string | null>;
 export interface NativeRead {
   path: string; entry: FoldEntry; bodies: ReadBodies; residentBytes: number;
-  metadataOnly?: boolean; companionFailed?: boolean;
+  media?: ReadMedia; metadataOnly?: boolean; companionFailed?: boolean;
 }
 
 function sameFile(a: FileIdentity, b: FileIdentity) { return a.dev === b.dev && a.ino === b.ino; }
@@ -43,6 +44,10 @@ function sameTimes(a: Pick<Stats, "mtimeMs" | "ctimeMs">, b: Pick<Stats, "mtimeM
 
 class ChangedLog extends Error {
   constructor() { super("Session log changed while reading; refresh the session and retry"); }
+}
+
+class NeedsLargerBudget extends Error {
+  constructor(readonly bytes: number) { super("Session size changed while reserving read capacity; retry the read"); }
 }
 
 async function readExactly(file: FileHandle, offset: number, length: number) {
@@ -81,8 +86,8 @@ function matchedMetadata(snapshot: AntigravitySnapshot | undefined, index: numbe
 
 function sameMetadata(entry: Entry, snapshot: AntigravitySnapshot | undefined) {
   const companion = entry.companion;
-  return !companion || companion.fingerprint === snapshot?.fingerprint || companion.applied.every(({ index, type, key }) =>
-    matchedMetadata(snapshot, index, type)?.key === key);
+  return !companion || companion.contentKey === snapshot?.contentKey
+    || companion.applied.every(({ index, type, key }) => matchedMetadata(snapshot, index, type)?.key === key);
 }
 
 function foldDatabase(snapshot: AntigravitySnapshot) {
@@ -142,19 +147,37 @@ export class SessionReader {
     const sealed = source.sealed || agent.archived && !agent.running;
     const info = antigravity?.databaseOnly ? undefined : await stat(path);
     const cached = this.cache.peek(path);
+    // A freshly read snapshot can reuse the transcript even while the WAL
+    // changes. Reserve for a replay only if its applied facts differ.
     const unchanged = info && cached && "valid" in cached && cached.valid && sameFile(cached, info)
-      && info.size === cached.offset && sameTimes(cached, info) && !(sealed && cached.tail.length)
-      && cached.companion?.fingerprint === antigravity?.database?.fingerprint;
+      && info.size === cached.offset && sameTimes(cached, info) && !(sealed && cached.tail.length);
     let logBytes = unchanged ? 0 : info?.size ?? 0;
     let dbBytes = antigravity?.database?.bytes ?? 0;
     const estimate = () => MIB + logReadBytes(logBytes) + 4 * dbBytes;
-    return this.budget.run(estimate(), signal, (account) => this.readReserved(agent, source, sealed, (bytes) => {
-      dbBytes = bytes;
-      account(estimate());
-    }, (bytes) => {
-      logBytes = bytes;
-      account(estimate());
-    }));
+    const limit = this.budget.maxBytes;
+    let reserved = Math.min(estimate(), limit);
+    for (let retries = 0; ; retries++) {
+      const account = (grow?: AccountRead) => {
+        const required = Math.min(estimate(), limit);
+        if (required <= reserved) return;
+        // Small live WAL growth can use free capacity without making a queued replay bypass it.
+        if (!grow || required - reserved > MIB || !grow(required, true)) throw new NeedsLargerBudget(required);
+        reserved = required;
+      };
+      try {
+        return await this.budget.run(reserved, signal, (grow) => this.readReserved(agent, source, sealed, (bytes) => {
+          dbBytes = bytes;
+          account(grow);
+        }, (bytes) => {
+          logBytes = bytes;
+          account();
+        }));
+      } catch (error) {
+        if (!(error instanceof NeedsLargerBudget) || error.bytes <= reserved) throw error;
+        // If the source keeps growing, reserve the full capacity for the final retry.
+        reserved = retries >= 3 ? limit : error.bytes;
+      }
+    }
   }
 
   private async readReserved(agent: Agent, source: NativeLocation, sealed: boolean,
@@ -164,7 +187,7 @@ export class SessionReader {
     if (antigravity?.database) {
       try { snapshot = await this.paths.antigravity.read(antigravity.database, accountDatabase); }
       catch (error) {
-        if (antigravity.databaseOnly) throw error;
+        if (antigravity.databaseOnly || error instanceof NeedsLargerBudget) throw error;
         ensureActive(this.lifetime.signal);
       }
     }
@@ -172,9 +195,9 @@ export class SessionReader {
     if (antigravity?.databaseOnly) {
       if (!snapshot) throw new Error("Antigravity SQLite is unavailable");
       const cached = this.cache.peek(path);
-      const entry = cached && "fingerprint" in cached && cached.fingerprint === snapshot.fingerprint ? cached : (() => {
+      const entry = cached && "contentKey" in cached && cached.contentKey === snapshot.contentKey ? cached : (() => {
         const fold = foldDatabase(snapshot);
-        return { fold, fingerprint: snapshot.fingerprint, residentBytes: fold.residentBytes };
+        return { fold, contentKey: snapshot.contentKey, residentBytes: fold.residentBytes };
       })();
       this.cache.set(path, entry, entry.residentBytes);
       return { path, entry, residentBytes: entry.residentBytes, metadataOnly: true, bodies: async (ids, project) => {
@@ -200,7 +223,10 @@ export class SessionReader {
         const info = await file.stat();
         if (!info.isFile()) throw new Error("Session source is not a file");
         ensureActive(signal);
-        if (entry && (!await matchesPrefix(file, info, entry) || !sameMetadata(entry, snapshot))) {
+        const reuse = entry && await matchesPrefix(file, info, entry) && sameMetadata(entry, snapshot);
+        const offset = reuse ? entry!.offset : 0;
+        if (info.size > offset || sealed) account(info.size - offset + (reuse ? entry!.tail.length : 0));
+        if (entry && !reuse) {
           entry.valid = false;
           entry = undefined;
         }
@@ -209,9 +235,8 @@ export class SessionReader {
           locations: [], finalized: false, valid: true, mtimeMs: info.mtimeMs, ctimeMs: info.ctimeMs, residentBytes: 0,
           ...(agent.provider === "antigravity" ? { companion: { applied: [], bytes: 0 } } : {}),
         };
-        if (entry.companion) entry.companion.fingerprint = snapshot?.fingerprint;
+        if (entry.companion) entry.companion.contentKey = snapshot?.contentKey;
         const growing = info.size > entry.offset;
-        if (growing || sealed) account(info.size - entry.offset + entry.tail.length);
         const proof = !entry.boundary || growing ? await boundaries(file, info.size) : entry.boundary;
         if (growing) await this.scan(file, info.size, entry, signal, snapshot);
         const finalize = sealed && entry.tail.length > 0 && !entry.finalized;
@@ -234,8 +259,19 @@ export class SessionReader {
             + proof.head.length + proof.tail.length + (entry.companion?.bytes ?? 0);
         }
         this.cache.set(path, entry, entry.residentBytes);
-        return { path, entry, bodies: this.bodyReader({ path, entry }), residentBytes: entry.residentBytes };
+        const stable = { path, entry, revision: entry.fold.revision };
+        const bodies: ReadBodies = (ids, project) => this.readNodes(stable, ids, project);
+        const media: ReadMedia = async (id, index, maxBytes) => {
+          const found = await this.readNodes(stable, [id], (_id, _body, row) => {
+            const items = row?.media;
+            return Array.isArray(items) ? this.paths.image(agent, items[index], maxBytes) : null;
+          }, { raw: true, bytes: maxBytes * 4 });
+          return found.get(id) ?? null;
+        };
+        return { path, entry, bodies, residentBytes: entry.residentBytes,
+          ...(agent.provider === "antigravity" ? { media } : {}) };
       } catch (error) {
+        if (error instanceof NeedsLargerBudget) throw error;
         if (entry) entry.valid = false;
         this.cache.delete(path);
         if (!(error instanceof ChangedLog) || attempt > 0) throw error;
@@ -282,67 +318,77 @@ export class SessionReader {
     entry.tailOffset += line.length;
   }
 
-  private bodyReader({ path, entry }: { path: string; entry: Entry }, revision = entry.fold.revision): ReadBodies {
-    return async (ids, project) => {
-      const signal = this.lifetime.signal;
-      ensureActive(signal);
-      const sources = new Map<number, number[]>();
-      for (const id of new Set(ids)) {
-        const node = entry.fold.nodes[id];
-        if (!node) throw new Error("Context item is no longer available");
-        const group = sources.get(node.line);
-        if (group) group.push(id); else sources.set(node.line, [id]);
-      }
-      const result = new Map<number, ReturnType<typeof project>>();
-      if (!sources.size) return result;
+  private async readNodes<T>({ path, entry, revision }: { path: string; entry: Entry; revision: number },
+    ids: readonly number[], project: (id: number, body: string, row?: RecordValue) => T | Promise<T>,
+    options?: { raw: true; bytes: number }): Promise<Map<number, T>> {
+    const signal = this.lifetime.signal;
+    ensureActive(signal);
+    const sources = new Map<number, number[]>();
+    for (const id of new Set(ids)) {
+      const node = entry.fold.nodes[id];
+      if (!node) throw new Error("Context item is no longer available");
+      const group = sources.get(node.line);
+      if (group) group.push(id); else sources.set(node.line, [id]);
+    }
+    const result = new Map<number, T>();
+    if (!sources.size) return result;
+    if (!entry.valid || revision !== entry.fold.revision) throw new ChangedLog();
+    let bytes = MIB + (options?.bytes ?? 0);
+    for (const line of sources.keys()) bytes += logReadBytes(entry.locations[line - 1].length);
+    return this.budget.run(bytes, signal, async () => {
       if (!entry.valid || revision !== entry.fold.revision) throw new ChangedLog();
-      let bytes = MIB;
-      for (const line of sources.keys()) bytes += logReadBytes(entry.locations[line - 1].length);
-      return this.budget.run(bytes, signal, async () => {
-        if (!entry.valid || revision !== entry.fold.revision) throw new ChangedLog();
-        const file = await open(path, "r");
-        try {
-          const info = await file.stat();
-          if (!sameFile(entry, info)) throw new ChangedLog();
-          const canReuse = info.size === entry.offset && sameTimes(entry, info);
-          let reused = false;
-          for (const [line, group] of sources) {
-            ensureActive(signal);
-            const location = entry.locations[line - 1];
-            let messages: ReturnType<typeof messagesOf> | undefined;
-            for (const id of group) {
-              const node = entry.fold.nodes[id];
-              const key = `${entry.fold.epoch}:${line}:${node.block}:${location.digest}`;
-              let body = canReuse ? this.bodies.get(key) : undefined;
-              if (body !== undefined) reused = true;
-              else {
-                if (!messages) {
-                  const bytes = await readExactly(file, location.offset, location.length);
-                  ensureActive(signal);
-                  if (digest(bytes) !== location.digest) {
-                    entry.valid = false;
-                    if (this.cache.peek(path) === entry) this.cache.delete(path);
-                    throw new ChangedLog();
-                  }
-                  if (!entry.valid || revision !== entry.fold.revision) throw new ChangedLog();
-                  messages = messagesOf(JSON.parse(bytes.toString("utf8")), entry.fold.provider);
-                }
-                body = messages.find((message) => message.block === node.block)?.text ?? "";
-                const weight = stringBytes(body) + stringBytes(key) + 64;
-                if (weight <= BODY_MAX_BYTES) this.bodies.set(key, detachSlice(body), weight);
-              }
-              result.set(id, project(id, body));
-            }
-          }
-          const linked = await stat(path);
-          if (!sameFile(entry, linked) || reused && !sameTimes(info, linked) || !entry.valid || revision !== entry.fold.revision) {
-            throw new ChangedLog();
-          }
+      const file = await open(path, "r");
+      try {
+        const info = await file.stat();
+        if (!sameFile(entry, info)) throw new ChangedLog();
+        const canReuse = info.size === entry.offset && sameTimes(entry, info);
+        let reused = false;
+        for (const [line, group] of sources) {
           ensureActive(signal);
-          return result;
-        } finally { await file.close(); }
-      });
-    };
+          const location = entry.locations[line - 1];
+          let messages: ReturnType<typeof messagesOf> | undefined;
+          let row: RecordValue | undefined;
+          for (const id of group) {
+            const node = entry.fold.nodes[id];
+            const key = `${entry.fold.epoch}:${line}:${node.block}:${location.digest}`;
+            if (!options && canReuse) {
+              const cached = this.bodies.get(key);
+              if (cached !== undefined) {
+                reused = true;
+                result.set(id, await project(id, cached));
+                continue;
+              }
+            }
+            if (!row) {
+              const bytes = await readExactly(file, location.offset, location.length);
+              ensureActive(signal);
+              if (digest(bytes) !== location.digest) {
+                entry.valid = false;
+                if (this.cache.peek(path) === entry) this.cache.delete(path);
+                throw new ChangedLog();
+              }
+              if (!entry.valid || revision !== entry.fold.revision) throw new ChangedLog();
+              row = record(JSON.parse(bytes.toString("utf8")));
+            }
+            if (options?.raw) {
+              result.set(id, await project(id, "", row));
+              continue;
+            }
+            messages ??= messagesOf(row, entry.fold.provider);
+            const body = messages.find((message) => message.block === node.block)?.text ?? "";
+            const weight = stringBytes(body) + stringBytes(key) + 64;
+            if (weight <= BODY_MAX_BYTES) this.bodies.set(key, detachSlice(body), weight);
+            result.set(id, await project(id, body));
+          }
+        }
+        const linked = await stat(path);
+        if (!sameFile(entry, linked) || reused && !sameTimes(info, linked) || !entry.valid || revision !== entry.fold.revision) {
+          throw new ChangedLog();
+        }
+        ensureActive(signal);
+        return result;
+      } finally { await file.close(); }
+    });
   }
 
   async content(agent: Agent, nodeId: number): Promise<string> {

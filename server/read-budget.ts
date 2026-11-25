@@ -12,7 +12,7 @@ interface Waiter {
   reject: (error: Error) => void;
 }
 interface SignalQueue { waiters: Set<Waiter>; abort: () => void }
-export type AccountRead = (estimatedBytes: number) => void;
+export type AccountRead = (estimatedBytes: number, ifAvailable?: boolean) => boolean;
 
 /** Reservations encompass one read, including any companion data it opens. */
 export class ReadBudget {
@@ -21,7 +21,7 @@ export class ReadBudget {
   private active = 0;
   private used = 0;
 
-  constructor(private maxBytes = READ_BYTES, private maxReads = READ_CONCURRENCY) {}
+  constructor(readonly maxBytes = READ_BYTES, private maxReads = READ_CONCURRENCY) {}
 
   async run<T>(bytes: number, signal: AbortSignal, read: (account: AccountRead) => Promise<T>): Promise<T> {
     ensureActive(signal);
@@ -35,11 +35,13 @@ export class ReadBudget {
     });
     try {
       ensureActive(signal);
-      const result = await read((estimate) => {
+      const result = await read((estimate, ifAvailable) => {
         const next = this.weight(estimate);
-        if (next <= reserved) return;
+        if (next <= reserved) return true;
+        if (ifAvailable && this.used + next - reserved > this.maxBytes) return false;
         this.used += next - reserved;
         reserved = next;
+        return true;
       });
       ensureActive(signal);
       return result;
