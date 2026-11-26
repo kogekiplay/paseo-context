@@ -7,6 +7,7 @@ export function asPlainObject(value: unknown): Record<string, unknown> | null {
 }
 
 export function amountOf(value: unknown): number | null {
+  if (typeof value === 'string' && value.trim() === '') return null
   const n = typeof value === 'string' ? Number(value) : value
   return typeof n === 'number' && Number.isFinite(n) && n >= 0 ? n : null
 }

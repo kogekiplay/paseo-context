@@ -1,10 +1,10 @@
 import type { ReactElement } from 'react'
-import { IconBranchOutlineRegular, IconPlusOutlineRegular, IconCheckOutlineRegular, IconCopyOutlineRegular, IconCloseOutlineRegular, IconSettingsOutlineMedium, IconChevronDownOutlineMedium, IconChevronUpOutlineMedium, IconSearchOutlineRegular, IconShareOutlineRegular, IconDataOutlineRegular, IconDatabaseOutlineRegular, IconClockOutlineRegular, IconGaugeOutlineRegular, IconCompareSplitOutlineRegular, IconBrowseOutlineRegular, IconContextInjectionOutlineRegular, IconFolderOpenOutlineRegular, IconApiOutlineRegular, IconInspectOutlineRegular, IconPluginPinwheelOutlineRegular, IconSkillOutlineRegular, FileTypeIcon } from '../../web/vendor/ui/index.js'
+import { IconBranchOutlineRegular, IconPlusOutlineRegular, IconCheckOutlineRegular, IconCopyOutlineRegular, IconCloseOutlineRegular, IconSettingsOutlineMedium, IconChevronDownOutlineMedium, IconChevronUpOutlineMedium, IconSearchOutlineRegular, IconShareOutlineRegular, IconDataOutlineRegular, IconDatabaseOutlineRegular, IconClockOutlineRegular, IconGaugeOutlineRegular, IconCompareSplitOutlineRegular, IconBrowseOutlineRegular, IconFlatListOutlineRegular, IconAgentPresetOutlineRegular, IconFolderOpenOutlineRegular, IconWorkspaceTreeOutlineRegular, IconApiOutlineRegular, IconPluginPinwheelOutlineRegular, IconSkillOutlineRegular, IconSparkleRegular, FileTypeIcon } from '../../web/vendor/ui/index.js'
 import type { IconProps } from '../../web/vendor/ui/index.js'
 
 export type IconComponent = (props: IconProps) => ReactElement | null
 
-const ns = { IconBranchOutlineRegular, IconPlusOutlineRegular, IconCheckOutlineRegular, IconCopyOutlineRegular, IconCloseOutlineRegular, IconSettingsOutlineMedium, IconChevronDownOutlineMedium, IconChevronUpOutlineMedium, IconSearchOutlineRegular, IconShareOutlineRegular, IconDataOutlineRegular, IconDatabaseOutlineRegular, IconClockOutlineRegular, IconGaugeOutlineRegular, IconCompareSplitOutlineRegular, IconBrowseOutlineRegular, IconContextInjectionOutlineRegular, IconFolderOpenOutlineRegular, IconApiOutlineRegular, IconInspectOutlineRegular, IconPluginPinwheelOutlineRegular, IconSkillOutlineRegular, FileTypeIcon } as unknown as Record<string, unknown>
+const ns = { IconBranchOutlineRegular, IconPlusOutlineRegular, IconCheckOutlineRegular, IconCopyOutlineRegular, IconCloseOutlineRegular, IconSettingsOutlineMedium, IconChevronDownOutlineMedium, IconChevronUpOutlineMedium, IconSearchOutlineRegular, IconShareOutlineRegular, IconDataOutlineRegular, IconDatabaseOutlineRegular, IconClockOutlineRegular, IconGaugeOutlineRegular, IconCompareSplitOutlineRegular, IconBrowseOutlineRegular, IconFlatListOutlineRegular, IconAgentPresetOutlineRegular, IconFolderOpenOutlineRegular, IconWorkspaceTreeOutlineRegular, IconApiOutlineRegular, IconPluginPinwheelOutlineRegular, IconSkillOutlineRegular, IconSparkleRegular, FileTypeIcon } as unknown as Record<string, unknown>
 
 function exportOf(name: string, source: Record<string, unknown>): unknown {
   try {
@@ -34,12 +34,15 @@ export const IconDatabase = resolveIcon('IconDatabaseOutlineRegular')
 export const IconClock = resolveIcon('IconClockOutlineRegular')
 export const IconGauge = resolveIcon('IconGaugeOutlineRegular')
 export const IconBrowse = resolveIcon('IconBrowseOutlineRegular')
-export const IconContextInjection = resolveIcon('IconContextInjectionOutlineRegular')
+export const IconFlatList = resolveIcon('IconFlatListOutlineRegular')
+export const IconCompareSplit = resolveIcon('IconCompareSplitOutlineRegular')
+export const IconAgentPreset = resolveIcon('IconAgentPresetOutlineRegular')
 export const IconFolderOpen = resolveIcon('IconFolderOpenOutlineRegular')
+export const IconWorkspaceTree = resolveIcon('IconWorkspaceTreeOutlineRegular')
 export const IconApi = resolveIcon('IconApiOutlineRegular')
-export const IconInspect = resolveIcon('IconInspectOutlineRegular')
 export const IconPlugin = resolveIcon('IconPluginPinwheelOutlineRegular')
 export const IconSkill = resolveIcon('IconSkillOutlineRegular')
+export const IconSparkle = resolveIcon('IconSparkleRegular')
 
 interface FileGlyphProps {
   path?: string

@@ -1,4 +1,5 @@
 import type { FrameProps } from "./frame";
+import { preferenceSchema } from "../shared/contracts";
 import { uiRevision } from "../shared/generated/ui-revision";
 
 export type BridgeRpcFn = (input: { route: string; payload: unknown }) => Promise<unknown>;
@@ -117,7 +118,9 @@ export function createSettingsSaver<T extends Record<string, unknown>>(getLatest
         ? "defaultTrendMode"
         : field;
       if (!Object.hasOwn(current.values, targetField)) throw new Error("Unknown preference");
-      const value = typeof current.values[targetField] === "boolean" ? rawValue === "show" : rawValue;
+      const value = targetField === "balanceSource"
+        ? preferenceSchema.shape.balanceSource.unwrap().parse(rawValue)
+        : typeof current.values[targetField] === "boolean" ? rawValue === "show" : rawValue;
       const next = { ...current.values, [targetField]: value } as T;
       if (!await current.save(next, current.revision)) {
         throw new Error("Could not save preferences; reload and retry");

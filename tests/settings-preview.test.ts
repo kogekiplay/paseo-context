@@ -10,7 +10,16 @@ afterEach(() => { preview.clear(); vi.unstubAllGlobals(); vi.restoreAllMocks(); 
 
 test("old prompt preferences are ignored without resetting other values", () => {
   const legacy = { promptPrefix: "Old prefix", promptSuffix: "Old suffix", fleetTab: false, defaultTrendMode: "delta" };
-  expect(preferenceSchema.parse(legacy)).toEqual({ ...preferenceSchema.parse({}), fleetTab: false, defaultTrendMode: "delta" });
+  expect(preferenceSchema.parse(legacy)).toEqual({
+    ...preferenceSchema.parse({}), fleetTab: false, defaultTrendMode: "delta", balanceSource: "account",
+  });
+});
+
+test("balance source defaults to account, accepts api, and rejects other values", () => {
+  expect(preferenceSchema.parse({}).balanceSource).toBe("account");
+  expect(preferenceSchema.parse({ balanceSource: "account" }).balanceSource).toBe("account");
+  expect(preferenceSchema.parse({ balanceSource: "api" }).balanceSource).toBe("api");
+  expect(preferenceSchema.safeParse({ balanceSource: "auto" }).success).toBe(false);
 });
 
 test("all preview pages use the same sample sessions, with drill-down and no external reads", async () => {

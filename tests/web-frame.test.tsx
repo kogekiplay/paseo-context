@@ -2,6 +2,7 @@ import { act, create } from "react-test-renderer";
 import { createElement } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { preferenceSchema } from "../shared/contracts";
 
 const mocks = vi.hoisted(() => ({
   platform: { OS: "web" },
@@ -243,6 +244,53 @@ describe("WebFrame and shared bridge helpers", () => {
     });
     expect(mocks.copyText).toHaveBeenCalledWith("sample");
     expect(mocks.previewRpc).not.toHaveBeenCalled();
+  });
+
+  test("round-trips the balance source through the host preferences and rejects invalid frame writes", async () => {
+    mocks.settings.values = preferenceSchema.parse({ fleetTab: false });
+    const persist = async (next?: Record<string, unknown>, revision?: string) => {
+      if (revision !== mocks.settings.revision) return false;
+      mocks.settings.values = preferenceSchema.parse(next);
+      mocks.settings.revision = next?.balanceSource === "api" ? "rev-2" : "rev-3";
+      return true;
+    };
+    mocks.settings.save.mockImplementationOnce(persist).mockImplementationOnce(persist);
+    const { frameWindow } = await mount();
+    const nonce = /__PASEO_CONTEXT_NONCE__="([^"]+)"/.exec(createdBlobs[0].html)![1];
+    await act(async () => dispatchMessage(frameWindow, { type: "paseo-context:ready", nonce }));
+    expect(postMessageMock).toHaveBeenCalledWith(expect.objectContaining({
+      type: "paseo-context:init",
+      preferences: expect.objectContaining({ balanceSource: "account" }),
+    }), "*");
+    const setSource = async (id: number, value: unknown) => {
+      await act(async () => dispatchMessage(frameWindow, {
+        type: "paseo-context:rpc", nonce, id, route: "settings.set", payload: { field: "balanceSource", value },
+      }));
+    };
+    await setSource(1, "api");
+    await setSource(2, "unknown");
+    await setSource(3, undefined);
+    expect(mocks.settings.values).toMatchObject({ balanceSource: "api", fleetTab: false });
+    expect(mocks.settings.save).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ balanceSource: "api", fleetTab: false }), "rev-1",
+    );
+    expect(postMessageMock).toHaveBeenCalledWith(expect.objectContaining({
+      id: 1, value: expect.objectContaining({ balanceSource: "api" }),
+    }), "*");
+    for (const id of [2, 3]) {
+      expect(postMessageMock).toHaveBeenCalledWith(expect.objectContaining({
+        id, error: expect.stringContaining("Invalid option"),
+      }), "*");
+    }
+
+    await setSource(4, "account");
+    expect(mocks.settings.values).toMatchObject({ balanceSource: "account", fleetTab: false });
+    expect(mocks.settings.save).toHaveBeenLastCalledWith(
+      expect.objectContaining({ balanceSource: "account", fleetTab: false }), "rev-2",
+    );
+    expect(postMessageMock).toHaveBeenCalledWith(expect.objectContaining({
+      id: 4, value: expect.objectContaining({ balanceSource: "account" }),
+    }), "*");
   });
 
   test("shows slow-load reload control after 15s and fatal teardown with close/reload", async () => {

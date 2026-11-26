@@ -127,4 +127,38 @@ describe("PreferencesScreen", () => {
     await act(async () => alert.findByType("Pressable" as any).props.onPress());
     expect(settings.reload).toHaveBeenCalledOnce();
   });
+
+  test("selects the localized balance source and passes the saved preference to the active preview", async () => {
+    const settings = makeReadySettings({ fleetTab: false });
+    await act(async () => {
+      renderer = create(createElement(PreferencesScreen, { ...surfaceProps, settings } as any));
+    });
+    const pressTab = async (label: string) => {
+      const tab = renderer!.root.findAllByProps({ accessibilityRole: "tab" })
+        .find((tab) => tab.findByType("Text" as any).children.join("") === label)!;
+      await act(async () => tab.props.onPress());
+    };
+    const balanceSelect = () => renderer!.root.findAllByType("SettingsSelect" as any)
+      .find(({ props }) => props.label === "上下文洞察 · 余额来源")!;
+    await pressTab("视图默认值");
+    await pressTab("上下文洞察");
+    expect(balanceSelect().props).toMatchObject({
+      value: "account",
+      options: [
+        { value: "account", label: "DeepSeek账号余额" },
+        { value: "api", label: "DeepSeek API余额" },
+      ],
+    });
+
+    await act(async () => balanceSelect().props.onValueChange("api"));
+    const saved = { ...settings.values, balanceSource: "api" };
+    expect(settings.save).toHaveBeenCalledExactlyOnceWith(saved, "rev-1");
+    const persisted = makeReadySettings(preferenceSchema.parse(saved), { revision: "rev-2" });
+    await act(async () => renderer!.update(createElement(PreferencesScreen, { ...surfaceProps, settings: persisted } as any)));
+    expect(balanceSelect().props.value).toBe("api");
+    expect(mocks.frame).toHaveBeenLastCalledWith(expect.objectContaining({
+      mode: "insights",
+      preview: expect.objectContaining({ values: expect.objectContaining({ balanceSource: "api" }) }),
+    }), undefined);
+  });
 });

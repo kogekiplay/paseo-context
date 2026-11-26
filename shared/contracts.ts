@@ -165,6 +165,7 @@ export const preferenceSchema = z.object({
   defaultFileSort: z.enum(["count", "lines", "latest", "path", "name"]).default("latest"),
   defaultDurationCurve: z.boolean().default(true),
   overviewAutoSteps: z.enum(["off", "100", "200", "300"]).default("200"),
+  balanceSource: z.enum(["account", "api"]).default("account"),
 });
 export type Preferences = z.infer<typeof preferenceSchema>;
 export const preferences = defineSettings({ id: "context", scope: "host", version: 1, schema: preferenceSchema });

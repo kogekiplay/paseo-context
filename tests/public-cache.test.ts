@@ -1,12 +1,15 @@
-import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { URL } from "node:url";
 import { expect, test, vi } from "vitest";
 import { Pricing } from "../server/pricing";
 import { PublicCache } from "../server/public-cache";
 import { MAX_PUBLIC_JSON_BYTES, readPublicJson } from "../server/bounded-json";
 import { Metadata } from "../server/metadata";
 import { emptyUsage } from "../shared/contracts";
+import { RECOM_DATA_URL, recomsOfPayload } from "../shared/core/recoms";
+import { recommendations } from "../shared/recommendations";
 
 test("a new pricing instance uses the cached public catalog without network access", async () => {
   const root = await mkdtemp(join(tmpdir(), "paseo-pricing-"));
@@ -62,8 +65,44 @@ test("falls back when a provider advertises an oversized public catalog", async 
     await pricing.refresh();
     expect(pricing.revision).toBe(0);
     await expect(metadata.version()).resolves.toMatchObject({ failed: true });
-    await expect(metadata.recoms()).resolves.toMatchObject({ degraded: true });
+    await expect(metadata.recoms()).resolves.toMatchObject({ degraded: true, recoms: recommendations });
   } finally { pricing.clear(); metadata.clear(); vi.unstubAllGlobals(); }
+});
+
+test.each([
+  { status: 404, failed: false },
+  { status: 500, failed: true },
+])("cancels the unread body of an HTTP $status metadata response", async ({ status, failed }) => {
+  const metadata = new Metadata();
+  const response = new Response("Upstream error", { status });
+  const cancel = vi.spyOn(response.body!, "cancel");
+  vi.stubGlobal("fetch", vi.fn(async () => response));
+  try {
+    await expect(metadata.version()).resolves.toMatchObject({ failed });
+    expect(cancel).toHaveBeenCalledOnce();
+  } finally { metadata.clear(); vi.unstubAllGlobals(); }
+});
+
+test("the validated upstream recommendations match the offline fallback and survive a cache reopen", async () => {
+  const catalog = JSON.parse(await readFile(new URL("../data/recoms.json", import.meta.url), "utf8"));
+  expect(recommendations).toEqual(catalog);
+  expect(recomsOfPayload(catalog)).toEqual(recommendations);
+
+  const root = await mkdtemp(join(tmpdir(), "paseo-recommendations-"));
+  const cache = new PublicCache(root);
+  const first = new Metadata(cache), reopened = new Metadata(cache);
+  const fetch = vi.fn(async () => Response.json(catalog));
+  vi.stubGlobal("fetch", fetch);
+  try {
+    const expected = { recoms: recommendations, degraded: false };
+    await expect(first.recoms()).resolves.toMatchObject(expected);
+    await expect(reopened.recoms()).resolves.toMatchObject(expected);
+    expect(fetch).toHaveBeenCalledExactlyOnceWith(RECOM_DATA_URL, expect.objectContaining({ signal: expect.any(AbortSignal) }));
+  } finally {
+    first.clear(); reopened.clear(); await cache.clear();
+    vi.unstubAllGlobals();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("serializes publishers sharing a cache key and preserves the freshest readable version", async () => {

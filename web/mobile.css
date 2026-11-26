@@ -38,3 +38,14 @@
      changes size. Cards still use the original layout, palette and selection. */
   .lc-agents-compact .lc-agent-card { animation: none; }
 }
+
+.lc-bal-panel {
+  box-sizing: border-box;
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+}
+
+@container lc-ov (max-width: 640px) {
+  .lc-ov-balance { max-width: 100%; overflow: hidden; }
+  .lc-ov-balance-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+}

@@ -1,5 +1,7 @@
 import { isNewerRelease } from "../shared/core/version";
-import { recomsOfPayload } from "../shared/core/recoms";
+import { amountOf } from "../shared/core/decode";
+import { RECOM_DATA_URL, recomsOfPayload } from "../shared/core/recoms";
+import type { PlatformBalances } from "../shared/core/types";
 import { recommendations } from "../shared/recommendations";
 import { record, text } from "./value";
 import type { PublicCache } from "./public-cache";
@@ -32,8 +34,11 @@ export class Metadata {
     timer.unref();
     try {
       const response = await fetch(url, { signal: controller.signal, headers });
-      if (response.status === 404) return null;
-      if (!response.ok) throw new Error(`Metadata HTTP ${response.status}`);
+      if (!response.ok) {
+        void response.body?.cancel().catch(() => {});
+        if (response.status === 404) return null;
+        throw new Error(`Metadata HTTP ${response.status}`);
+      }
       return await readPublicJson(response);
     } finally { clearTimeout(timer); this.controllers.delete(controller); }
   }
@@ -57,7 +62,7 @@ export class Metadata {
         return { recoms: previous, degraded: false, expires: cached.at + ttl };
       }
       try {
-        const rows = recomsOfPayload(await this.json("https://raw.githubusercontent.com/bowenliang123/dsh-context/main/data/recoms.json"));
+        const rows = recomsOfPayload(await this.json(RECOM_DATA_URL));
         if (rows.length) {
           const at = Date.now();
           if (!this.closed) await this.publicCache?.write("recommendations", rows, at);
@@ -68,20 +73,23 @@ export class Metadata {
     });
     return { recoms, degraded, freshForMs: Math.max(0, expires - Date.now()) };
   }
-  balance() {
+  async balance(): Promise<PlatformBalances> {
     const key = process.env.DEEPSEEK_API_KEY;
-    if (!key) return Promise.resolve(null);
-    return this.cached("balance", 60_000, async () => {
+    if (!key) return { account: null, api: null };
+    const api = await this.cached("balance", 60_000, async () => {
       try {
         const data = record(await this.json("https://api.deepseek.com/user/balance", { Authorization: `Bearer ${key}` }));
         const balances = (Array.isArray(data.balance_infos) ? data.balance_infos : []).flatMap((row) => {
           const value = record(row), currency = text(value.currency);
-          const granted = Number(value.granted_balance), toppedUp = Number(value.topped_up_balance);
-          return currency && Number.isFinite(granted) && Number.isFinite(toppedUp) ? [{ currency, granted, toppedUp, total: granted + toppedUp }] : [];
+          const granted = amountOf(value.granted_balance), toppedUp = amountOf(value.topped_up_balance);
+          if (!currency || granted === null || toppedUp === null) return [];
+          const total = granted + toppedUp;
+          return Number.isFinite(total) ? [{ currency, granted, toppedUp, total }] : [];
         });
         return balances.length ? { isAvailable: data.is_available === true, balances } : null;
       } catch { return null; }
     });
+    return { account: null, api };
   }
   clear() {
     this.closed = true;

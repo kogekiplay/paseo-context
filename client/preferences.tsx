@@ -99,6 +99,7 @@ function PreferenceForm({ settings, copy, t, tab, setTab, ...props }: PluginSurf
           {select("defaultDeltaBase", "settings.deltaBase", options([["step", "browser.base.step"], ["turn", "browser.base.turn"]]))}
           {select("defaultToolSort", "settings.toolSort", options([["size", "tool.sort.size"], ["count", "tool.sort.count"], ["name", "tool.sort.name"]]))}
           {select("defaultFileSort", "settings.fileSort", options([["count", "files.sort.count"], ["lines", "files.sort.lines"], ["latest", "files.sort.latest"], ["path", "files.sort.path"], ["name", "files.sort.name"]]))}
+          {select("balanceSource", "settings.balanceSource", options([["account", "balance.account"], ["api", "balance.api"]]))}
         </SettingsCard></SettingsSection>}
       </View>
       <View style={{ minWidth: 0, flex: columns ? 3 : undefined }}>

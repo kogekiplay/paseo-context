@@ -1,6 +1,7 @@
 import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 import { previewAgentId } from "../shared/bridge";
 import type { Agent, Usage } from "../shared/contracts";
+import type { PlatformBalances } from "../shared/core/types";
 import { ContextFold } from "./fold";
 import { messagesOf } from "./normalize";
 import { Pricing } from "./pricing";
@@ -133,7 +134,8 @@ export class SettingsPreview {
   constructor(private now = Date.now) {}
   async handle(route: string, payload: unknown) {
     const name = route.replace(/^api\/paseo-context\//, "");
-    if (name === "version" || name === "balance") return { ok: true, value: null };
+    if (name === "version") return { ok: true, value: null };
+    if (name === "balance") return { ok: true, value: { account: null, api: null } satisfies PlatformBalances };
     if (name === "recom") return { ok: true, value: [] };
     if (name === "file.preview") {
       const path = record(payload).path;

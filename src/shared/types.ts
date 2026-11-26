@@ -173,6 +173,7 @@ export interface PluginSettings {
   overviewAutoSteps: OverviewAutoSteps
   defaultOverviewRange: DefaultOverviewRange
   fleetTab: FleetTab
+  balanceSource: BalanceSource
 }
 
 export type SettingsField = keyof PluginSettings
@@ -522,6 +523,13 @@ export interface PlatformBalanceEntry {
 export interface PlatformBalance {
   isAvailable: boolean
   balances: PlatformBalanceEntry[]
+}
+
+export type BalanceSource = 'account' | 'api'
+
+export interface PlatformBalances {
+  account: PlatformBalance | null
+  api: PlatformBalance | null
 }
 
 export interface BackfillSessionIssue {

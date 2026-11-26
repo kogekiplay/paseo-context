@@ -2,6 +2,8 @@
 
 This is a public GitHub fork of bowenliang123/dsh-context. The initial Paseo migration is based on `9e221195ac7c02cff9a21311dda6d61f50cf50d3` (v0.85.1 plus its next fix).
 
+Paseo Context v0.2.17 merges upstream `cfec4e4f9a13fc506cbf7a455a69b1d7cf52b03e` (v0.87.2). This update introduces the dual-source balance capsule (`PlatformBalances` with `account` / `api` arms, `useAnchoredPanel` popover positioning, and the `balanceSource` preference while omitting DSH-only `promptPrefix`/`promptSuffix`), refined UI primitive icons across Context Stats, Events, Files, Overview tallies, and Fleet views (all resolved through `web/vendor/ui/index.js`), timeline bar/duration rise animation replay keyed by `riseKeyOf`, stacked agent-graph inspector `box-sizing: border-box` width containment alongside Paseo's `forestLayout` clamp, and refreshed `data/recoms.json` catalog links.
+
 Paseo Context v0.2.14 uses upstream `fa98a621e7aabdebdb04fc935221a4ba5bf72883` (v0.87.1) as its baseline. This update brings Context Timeline, workflow milestones, and history pagination. `api/paseo-context/history` serves requests, events, milestones, nodes, archive, files, and timing spans from the same context projection as facts and detail. Sequence pages keep rows with the same sequence together. Workflow milestones use recorded tool calls, delegation, and task transitions. The settings bridge exposes `defaultTimelineMode` while preserving the stored `defaultTrendMode` preference.
 
 Both `history.live` and `facts.live` are `true` for Paseo's unified, revisioned projection, including idle and archived sessions. The client detail store uses `rev` to match and refresh pages. The agent's running state is reported separately in the session row.

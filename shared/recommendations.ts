@@ -1,10 +1,12 @@
-// Upstream recommendation data; no host runtime dependency.
+import type { Recom } from "./core/recoms";
+
+// Offline copy of upstream data/recoms.json.
 export const recommendations = [
   {
     "id": "deepseek-platform",
     "name": "DeepSeek",
-    "url": "https://platform.deepseek.com/",
-    "icon": "https://cdn.simpleicons.org/deepseek",
+    "url": "https://dsh-context.dev/c/deepseek-platform",
+    "icon": "https://dsh-context.dev/r/deepseek-platform",
     "slogan": {
       "zh": "探索未至之境。",
       "en": "Into the Unknown."
@@ -21,8 +23,8 @@ export const recommendations = [
   {
     "id": "zilliz-cloud",
     "name": "Zilliz Cloud",
-    "url": "https://cloud.zilliz.com.cn/signup?utm_source=dsh_context",
-    "icon": "https://cdn.simpleicons.org/zilliz",
+    "url": "https://dsh-context.dev/c/zilliz-cloud",
+    "icon": "https://dsh-context.dev/r/zilliz-cloud",
     "slogan": {
       "zh": "Milvus原厂，全能 AI 检索。",
       "en": "Original Milvus Creator, full AI search."
@@ -39,8 +41,8 @@ export const recommendations = [
   {
     "id": "powercontext",
     "name": "PowerContext",
-    "url": "https://github.com/oceanbase/powercontext",
-    "icon": "https://raw.githubusercontent.com/oceanbase/powercontext/master/desktop/src-tauri/icons/icon.png",
+    "url": "https://dsh-context.dev/c/powercontext",
+    "icon": "https://dsh-context.dev/r/powercontext",
     "slogan": {
       "zh": "OB开源 Agent 记忆及上下文引擎",
       "en": "OSS Agentic context engine"
@@ -54,4 +56,4 @@ export const recommendations = [
       "en": "Special thanks to PowerContext for providing open-source long-term memory and context management for AI agents. Preserve project decisions, task progress, and lessons learned, then recall relevant context on demand across sessions and agents. Reduce repeated explanations and exploration, keep tasks moving, and use tokens more efficiently. In tests on the public SWE-bench Pro dataset, PowerContext reduced cumulative input tokens by approximately 25% and peak per-task input tokens for high-consumption, long-tail tasks by over 75%."
     }
   }
-];
+] satisfies Recom[];

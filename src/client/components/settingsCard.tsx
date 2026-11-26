@@ -211,6 +211,16 @@ function PreferenceRows(props: { t: Translate; state: SettingsState; set?: Setti
           ]}
           onPick={(id) => { set?.('defaultFileSort', id) }}
         />
+        <PrefRow
+          label={t('settings.balanceSource')}
+          value={state.balanceSource}
+          disabled={disabled}
+          options={[
+            { id: 'account', label: t('balance.account') },
+            { id: 'api', label: t('balance.api') },
+          ]}
+          onPick={(id) => { set?.('balanceSource', id) }}
+        />
       </Group>
     </>
   )
